@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
 import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
@@ -10,6 +11,17 @@ import { isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
 import { extractFromPhotos, type ExtractionResult } from '../lib/extraction/anthropic';
 import { reviewExtraction } from '../lib/extraction/review';
 import { decideCatalogStatus, type CatalogDecision } from '../lib/extraction/confidence';
+
+type UserTier = 'free' | 'byok' | 'hosted';
+
+async function loadUserTier(sql: Sql, userId: string): Promise<UserTier> {
+  const row = await dbGet<{ tier: UserTier }>(
+    sql,
+    `SELECT tier FROM "user" WHERE id = $1 LIMIT 1`,
+    [userId],
+  );
+  return row?.tier ?? 'free';
+}
 
 export const extractionRoutes = new Hono<AppEnv>();
 
@@ -100,6 +112,23 @@ extractionRoutes.post('/extractions', ...auth, async (c) => {
   const userId = c.get('userId');
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
+
+  // Tier gate: only `hosted` users may run server-side vision. Free and
+  // BYOK users go through `/api/extractions/pre-extracted` with their
+  // on-device or own-key extraction result.
+  const tier = await loadUserTier(sql, userId);
+  if (tier !== 'hosted') {
+    return c.json(
+      {
+        ok: false,
+        error: {
+          code: 'wrong_tier',
+          message: `Server-side extraction is only available on the hosted tier (current tier: ${tier}). Use /api/extractions/pre-extracted from the iOS client.`,
+        },
+      },
+      402,
+    );
+  }
 
   const apiKey = c.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -245,6 +274,176 @@ extractionRoutes.post('/extractions', ...auth, async (c) => {
     },
   });
 });
+
+/**
+ * POST /api/extractions/pre-extracted
+ *
+ * For free + byok tiers — the client extracts on-device (Apple
+ * Foundation Models, OpenAI, Anthropic, etc.) and posts the result
+ * along with optional packet photos. The server runs no LLM call:
+ * it just persists the extraction, applies the catalog decision based
+ * on the client-supplied `self_confidence`, and (when confidence
+ * clears the bar) inserts a `catalog_seeds` row for the global catalog.
+ *
+ * Body: JSON
+ * ```
+ * {
+ *   "common_name": string | null,
+ *   "variety": string | null,
+ *   "company": string | null,
+ *   "instructions": string | null,
+ *   "self_confidence": number,            // 0..1, client's own rating
+ *   "model_id": string,                   // e.g. "apple.foundation.v1", "openai.gpt-4o", "anthropic.claude-sonnet-4-6"
+ *   "barcode"?: string,                   // optional UPC/EAN
+ *   "perceptual_hash"?: string,           // optional client-side pHash
+ *   "front_jpeg_b64"?: string,            // optional base64 packet photos
+ *   "back_jpeg_b64"?: string
+ * }
+ * ```
+ */
+const preExtractedSchema = z.object({
+  common_name: z.string().trim().max(120).nullable(),
+  variety: z.string().trim().max(120).nullable(),
+  company: z.string().trim().max(120).nullable(),
+  instructions: z.string().trim().max(4000).nullable(),
+  self_confidence: z.number().min(0).max(1),
+  model_id: z.string().trim().min(1).max(100),
+  barcode: z.string().trim().max(40).optional(),
+  perceptual_hash: z.string().trim().max(80).optional(),
+  front_jpeg_b64: z.string().optional(),
+  back_jpeg_b64: z.string().optional(),
+});
+
+extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
+  const userId = c.get('userId');
+  const householdId = c.get('householdId');
+  const sql = getSql(c.env);
+
+  // Free or BYOK only — hosted users get the server-side vision path.
+  const tier = await loadUserTier(sql, userId);
+  if (tier === 'hosted') {
+    return c.json(
+      {
+        ok: false,
+        error: {
+          code: 'wrong_tier',
+          message: 'Hosted-tier users should POST /api/extractions for server-side vision.',
+        },
+      },
+      400,
+    );
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = preExtractedSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
+  }
+  const input = parsed.data;
+
+  const extractionId = nanoid();
+  const now = Date.now();
+
+  // Upload optional packet photos to S3. Photos let us re-extract / curate
+  // the catalog later. Skipping them is allowed but not recommended.
+  const photoKeys: string[] = [];
+  if (input.front_jpeg_b64) {
+    const front = decodeBase64(input.front_jpeg_b64);
+    if (front) {
+      const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'front' });
+      await putPhoto(c.env, key, front, 'image/jpeg');
+      photoKeys.push(key);
+    }
+  }
+  if (input.back_jpeg_b64) {
+    const back = decodeBase64(input.back_jpeg_b64);
+    if (back) {
+      const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'back' });
+      await putPhoto(c.env, key, back, 'image/jpeg');
+      photoKeys.push(key);
+    }
+  }
+
+  // Build the extraction shape the rest of the pipeline expects.
+  const extraction: ExtractionResult = {
+    common_name: input.common_name,
+    variety: input.variety,
+    company: input.company,
+    instructions: input.instructions,
+    self_confidence: input.self_confidence,
+  };
+
+  // Pre-extracted submissions skip the server-side reviewer pass — the
+  // client is trusted to self-rate. We feed `self_confidence` in as the
+  // review score for the policy decision so the same `decideCatalogStatus`
+  // gate applies. Future hardening: run a cheap reviewer pass for
+  // submissions whose `self_confidence` is borderline.
+  const decision = decideCatalogStatus({
+    selfConfidence: input.self_confidence,
+    reviewScore: input.self_confidence,
+    extraction,
+  });
+
+  let catalogSeedId: string | null = null;
+  if (decision.status !== 'rejected') {
+    catalogSeedId = nanoid();
+    await persistDecision(
+      sql, catalogSeedId, decision, extraction,
+      input.barcode ?? null, input.perceptual_hash ?? null,
+      input.self_confidence, householdId, now,
+    );
+  }
+
+  // Always persist the catalog_extractions row for audit + future re-review.
+  await dbRun(
+    sql,
+    `INSERT INTO catalog_extractions (
+       id, catalog_seed_id, submitted_by_household, submitted_by_user,
+       vision_model_id, raw_extraction, source_photo_keys, status,
+       review_score, review_notes, created_at, reviewed_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reviewed', $8, $9, $10, $11)`,
+    [
+      extractionId,
+      catalogSeedId,
+      householdId,
+      userId,
+      input.model_id,
+      JSON.stringify({ extraction, source: 'client_pre_extracted' }),
+      JSON.stringify(photoKeys),
+      input.self_confidence,
+      `client self-confidence ${input.self_confidence.toFixed(2)} (no server review)`,
+      now,
+      now,
+    ],
+  );
+
+  return c.json({
+    ok: true,
+    data: {
+      extraction_id: extractionId,
+      catalog_seed_id: catalogSeedId,
+      decision,
+      extraction,
+      review: {
+        score: input.self_confidence,
+        notes: 'pre-extracted: self_confidence used as proxy',
+      },
+      photo_keys: photoKeys,
+    },
+  });
+});
+
+function decodeBase64(b64: string): Uint8Array | null {
+  try {
+    const cleaned = b64.replace(/^data:[^;]+;base64,/, '');
+    const bin = atob(cleaned);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * GET /api/extractions/:id — fetch the saved extraction.

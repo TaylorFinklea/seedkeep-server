@@ -32,6 +32,21 @@
 
 **Rationale**: Lowest-friction self-host story. A user clones the repo, copies `.env.example` to `.env`, runs `docker compose up`, and has a working Seedkeep server. Power users override individual env vars to point at their own Postgres or S3.
 
+## [2026-05-04] Pre-extracted route trusts `self_confidence` (no server-side LLM)
+
+**Context**: F2's pre-extracted path lets free + byok users contribute to the global catalog without the server paying for vision extraction. The previous catalog-decision pipeline always ran a server-side reviewer pass (Claude Haiku) over the extracted JSON.
+
+**Decision**: For pre-extracted submissions, skip the server-side reviewer pass. Use the client-supplied `self_confidence` as both `selfConfidence` and `reviewScore` when calling `decideCatalogStatus`. The threshold policy stays unchanged.
+
+**Alternatives considered**: Run the reviewer pass for everyone (server eats the LLM cost); skip the catalog decision entirely so every pre-extracted submission lands in `pending` for manual review; require BYOK users to also send a server-side reviewer call against their own key.
+
+**Rationale**: Free users are the long tail. Paying for a reviewer LLM call on every free-user upload turns Seedkeep into an unbounded server-side cost. Trusting `self_confidence` is acceptable because:
+- The on-device or BYOK model produces a real number (not a constant 1.0).
+- `decideCatalogStatus` already requires both confidence ≥ 0.85 AND `common_name` set, so spam can't slip through trivially.
+- Bad rows can be cleaned by a periodic batch reviewer or an admin UI later.
+
+When a user converts to hosted tier, their submissions automatically route through the full server-side flow with the real reviewer pass.
+
 ## [2026-05-04] Per-route middleware composition, not `subrouter.use('*')`
 
 **Context**: The Workers port had `subrouter.use('*', requireAuth(), requireHousehold())` at the top of each protected router. Discovered in F1e: when multiple subrouters mount under the same `/api` prefix and one declares `use('*')`, that middleware runs for **all** `/api/*` requests — including ones that route to sibling subrouters. POST `/api/households` was getting intercepted by `requireHousehold()` from the seeds router.

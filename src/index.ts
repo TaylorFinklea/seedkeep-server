@@ -12,6 +12,7 @@ import { randomRoutes } from './routes/random';
 import { photoRoutes } from './routes/photos';
 import { catalogRoutes } from './routes/catalog';
 import { extractionRoutes } from './routes/extractions';
+import { subscriptionRoutes } from './routes/subscriptions';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -67,6 +68,7 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', photoRoutes);
   app.route('/api', catalogRoutes);
   app.route('/api', extractionRoutes);
+  app.route('/api', subscriptionRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),

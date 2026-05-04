@@ -36,6 +36,10 @@ const schema = z.object({
   // AI providers (optional — extraction route gates on this)
   ANTHROPIC_API_KEY: z.string().optional().transform((v) => v?.trim() || undefined),
 
+  // Apple App Store shared secret (for IAP receipt validation). Optional —
+  // /api/subscriptions/verify returns 503 not_configured when missing.
+  APPLE_IAP_SHARED_SECRET: z.string().optional().transform((v) => v?.trim() || undefined),
+
   // Models
   DEFAULT_VISION_MODEL: z.string().default('claude-sonnet-4-6'),
   DEFAULT_REVIEW_MODEL: z.string().default('claude-haiku-4-5-20251001'),

@@ -18,14 +18,17 @@ Self-hostable backend for Seedkeep. Phase 1 ships per-household inventory + AI-c
 - [x] F1g: Dockerfile multi-stage + docker-compose with Postgres + MinIO + bootstrap bucket
 - [x] F1h: Handoff docs + final commit
 
-### Next (F2: tier + subscriptions)
-- [ ] Migration 0002: `users.tier` column + `subscriptions` table
-- [ ] `POST /api/subscriptions/verify` Apple IAP receipt validation
-- [ ] Branch `/api/extractions` on `users.tier` (free/byok pre-extracted JSON; hosted server-side vision)
+### Next (F2: tier + subscriptions — COMPLETE)
+- [x] Migration 0002: `users.tier` column + `subscriptions` table
+- [x] `POST /api/subscriptions/verify` Apple IAP receipt validation (auto-falls-back production → sandbox per Apple's recipe)
+- [x] `GET /api/subscriptions/me` for tier + current subscription state
+- [x] `POST /api/extractions` now requires `tier=hosted` (returns 402 `wrong_tier` for free/byok)
+- [x] `POST /api/extractions/pre-extracted` for free + byok — accepts client-extracted JSON + optional photos; persists to catalog using self_confidence as the review proxy
 
 ### Later
 - [ ] Production deploy automation (Fly/Railway scripts)
-- [ ] Catalog moderation admin UI
+- [ ] Catalog moderation admin UI (revisit the trust-the-self_confidence shortcut once we have real users)
+- [ ] App Store Server Notifications (S2S) for receipt revalidation cron
 - [ ] Phase 2 server features (garden plans, weather, extension calendars)
 
 ## Milestones

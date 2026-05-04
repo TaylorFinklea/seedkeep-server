@@ -22,12 +22,13 @@
 - `migrations/0001_initial.sql` applies cleanly against Postgres 16 (36 statements, 14 domain tables + `_seedkeep_migrations`).
 - `bun run test` → 13/13 vitest tests pass (randomPick + confidence policies).
 - `bun run dev` boots; `docker compose up db minio minio-bootstrap` brings up backing services.
-- **26/28 route smoke checks pass** against the new stack. The 2 photo-upload checks are blocked by host disk pressure (MinIO refuses writes when free space <1%) — environmental, not a code issue. Storage layer was verified earlier with a clean put/get/delete round-trip.
+- **28/28 route smoke checks pass** end-to-end (F1 fully verified after disk freed up).
+- F2 complete: tier + subscriptions schema live, IAP verify route works, extraction routes branch on tier.
 
 ## Blockers
 
-- **Host disk at 99% capacity** — MinIO threshold blocks photo writes. Requires user-side disk cleanup; nothing on the seedkeep side to fix.
-- `ANTHROPIC_API_KEY` unset in `.env`; the `/api/extractions` route correctly returns 503 `not_configured` when missing.
+- `ANTHROPIC_API_KEY` unset in `.env`; the `/api/extractions` route correctly returns 503 `not_configured` for hosted-tier requests until configured.
+- `APPLE_IAP_SHARED_SECRET` unset; `/api/subscriptions/verify` returns 503 until configured.
 
 ## Hono port-time gotcha (F1e learning)
 
@@ -35,8 +36,4 @@
 
 ## Next concrete step
 
-F2 — tier + subscriptions schema:
-
-1. Migration `0002_tier_and_subscriptions.sql`: add `users.tier` column (default `'free'`); create `subscriptions` table (Apple receipt fields, expires_at, original_transaction_id, last_verified_at).
-2. New `src/routes/subscriptions.ts` with `POST /api/subscriptions/verify` (calls Apple's verifyReceipt endpoint).
-3. Branch `/api/extractions` on `users.tier`: free/byok accept pre-extracted JSON from client; hosted runs server-side vision.
+F3 — iOS Server URL picker + on-device extraction. Bump the iOS deployment target to 18.1, add `Settings → Server` (URL field with `/api/health` validation), build an `OnDeviceExtractor` that wraps Apple Foundation Models, and update `ScanFlow` to call it then POST `/api/extractions/pre-extracted`.
