@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: seedkeep-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: seedkeep
+      POSTGRES_PASSWORD: dev-only
+      POSTGRES_DB: seedkeep
+    volumes:
+      - ./.dev-data/db:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seedkeep -d seedkeep"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: seedkeep-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: dev-only-secret
+    volumes:
+      - ./.dev-data/minio:/data
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # web console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Auto-create the seedkeep-photos bucket once MinIO is up.
+  minio-bootstrap:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minio dev-only-secret &&
+      (mc mb --ignore-existing local/seedkeep-photos) &&
+      echo 'MinIO bootstrap complete.'
+      "
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seedkeep-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override .env values that need container hostnames.
+      DATABASE_URL: postgres://seedkeep:dev-only@db:5432/seedkeep
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      db:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "8787:8787"
