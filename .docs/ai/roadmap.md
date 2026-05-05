@@ -33,11 +33,16 @@ Self-hostable backend for Seedkeep. Phase 1 ships per-household inventory + AI-c
 
 ## Milestones
 
-### M1: Phase 1 server complete
-- [ ] All 28 route checks pass against Postgres + MinIO
-- [ ] iOS app round-trips via Settings → Server URL switch
-- [ ] BYOK pre-extracted JSON path works end-to-end
-- [ ] Hosted-tier subscription gates server-side extraction
+### M1: Phase 1 server complete — ✅ achieved 2026-05-04
+- [x] All 28 route checks pass against Postgres + MinIO (F1)
+- [x] iOS app round-trips via Settings → Server URL switch (F3 in iOS repo)
+- [x] BYOK pre-extracted JSON path works end-to-end (smoke verified F5)
+- [x] Hosted-tier subscription gates server-side extraction (smoke verified F5: 402 wrong_tier for free, 503 not_configured-on-Anthropic for hosted)
+
+### M2: Phase 1 production-ready (post-Phase-1)
+- [ ] `APPLE_IAP_SHARED_SECRET` + `ANTHROPIC_API_KEY` configured in production env
+- [ ] Deployed to Fly.io / Railway / Docker on a VPS
+- [ ] App Store Connect products `app.seedkeep.hosted.{monthly,yearly}` registered + sandbox-tested with real iOS client
 
 ## Constraints
 
