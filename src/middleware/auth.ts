@@ -7,7 +7,6 @@ interface SessionRow {
   id: string;
   userId: string;
   token: string;
-  expiresAt: number;
 }
 
 /**
@@ -15,6 +14,11 @@ interface SessionRow {
  * Postgres. iOS clients send `Authorization: Bearer <token>` after a
  * `/api/auth/sign-in/social` round-trip; better-auth's cookie path is
  * unused on native.
+ *
+ * The expiry comparison happens in SQL against `NOW()` because session
+ * timestamps are TIMESTAMPTZ (better-auth's native shape) — bouncing
+ * them back to JS as numbers just to compare to Date.now() would invite
+ * timezone drift.
  */
 export const requireAuth = () =>
   createMiddleware<AppEnv>(async (c, next) => {
@@ -31,23 +35,17 @@ export const requireAuth = () =>
     const sql = getSql(c.env);
     const session = await dbGet<SessionRow>(
       sql,
-      `SELECT id, "userId", token, "expiresAt"::bigint AS "expiresAt"
+      `SELECT id, "userId", token
          FROM session
         WHERE token = $1
+          AND "expiresAt" > NOW()
         LIMIT 1`,
       [token],
     );
 
     if (!session) {
       return c.json(
-        { ok: false, error: { code: 'unauthorized', message: 'Invalid session token' } },
-        401,
-      );
-    }
-
-    if (Number(session.expiresAt) < Date.now()) {
-      return c.json(
-        { ok: false, error: { code: 'unauthorized', message: 'Session expired' } },
+        { ok: false, error: { code: 'unauthorized', message: 'Invalid or expired session token' } },
         401,
       );
     }

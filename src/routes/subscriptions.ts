@@ -150,11 +150,14 @@ subscriptionRoutes.post('/subscriptions/verify', authOnly, async (c) => {
   const desiredTier = status === 'active' ? 'hosted' : 'free';
   await dbRun(
     sql,
+    // "user"."updatedAt" is TIMESTAMPTZ (managed by better-auth's
+    // schema expectations), so write NOW() instead of the BIGINT
+    // `now` we use for our own domain tables.
     `UPDATE "user"
-        SET tier = $1, "updatedAt" = $2
-      WHERE id = $3
+        SET tier = $1, "updatedAt" = NOW()
+      WHERE id = $2
         AND tier <> 'byok'`,
-    [desiredTier, now, userId],
+    [desiredTier, userId],
   );
 
   return c.json({
