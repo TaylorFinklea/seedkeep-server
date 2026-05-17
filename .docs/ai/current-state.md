@@ -27,8 +27,8 @@
 
 ## Blockers
 
-- `ANTHROPIC_API_KEY` unset in `.env`; the `/api/extractions` route correctly returns 503 `not_configured` for hosted-tier requests until configured.
-- `APPLE_IAP_SHARED_SECRET` unset; `/api/subscriptions/verify` returns 503 until configured.
+- `ANTHROPIC_API_KEY` unset on Fly; `/api/extractions` returns 503 `not_configured` for hosted-tier requests until configured. Not urgent — Hosted is feature-flagged off in the iOS client (`AppPreferences.isHostedTierEnabled = false`), so no client will actually hit this until the flag is flipped.
+- `APPLE_IAP_SHARED_SECRET` unset on Fly; `/api/subscriptions/verify` returns 503 until configured. Same story — gated behind the iOS client flag.
 
 ## Hono port-time gotcha (F1e learning)
 
@@ -36,9 +36,13 @@
 
 ## Next concrete step
 
-Server side is feature-complete for the F1–F5 Phase 1 pivot. Production hand-off items:
+Server deployed to `https://seedkeep-server.fly.dev` (2026-05-16) on Fly's legacy Hobby plan: 1×shared-cpu-256MB app machine + 1×shared-cpu Postgres machine + R2 bucket `seedkeep-photos`. Migrations 0001 + 0002 applied. `/api/health` returns healthy. Free + BYOK paths work end-to-end against this server.
 
-1. Configure `APPLE_IAP_SHARED_SECRET` (App Store Connect → My Apps → App Information → App-Specific Shared Secret) so the `POST /api/subscriptions/verify` route can hit Apple's verifyReceipt successfully.
-2. Configure `ANTHROPIC_API_KEY` for production hosted-tier extractions.
-3. Deploy to a real host (Fly.io / Railway / Docker on a VPS). The `Dockerfile` + `docker-compose.yml` make this turn-key.
-4. Subsequent backlog items (post-Phase-1): catalog moderation admin UI, App Store Server Notifications (S2S) for receipt revalidation cron, Phase 2 server features (garden plans, weather, extension calendars).
+Hosted tier is shipped but feature-flagged off in the iOS client (`AppPreferences.isHostedTierEnabled`). To enable for v1.1:
+
+1. Flip `isHostedTierEnabled = true` in `seedkeep-ios/Seedkeep/Core/Preferences/AppPreferences.swift`.
+2. Register subscription products `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect.
+3. Set `APPLE_IAP_SHARED_SECRET` via `fly secrets set` (App Store Connect → My Apps → App Information → App-Specific Shared Secret).
+4. Set `ANTHROPIC_API_KEY` via `fly secrets set` so server-side extraction works.
+
+Backlog beyond Phase 1: catalog moderation admin UI, App Store Server Notifications (S2S) for receipt revalidation cron, Phase 2 server features (garden plans, weather, extension calendars).
