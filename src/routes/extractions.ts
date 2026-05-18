@@ -327,11 +327,15 @@ extractionRoutes.post('/extractions', ...auth, async (c) => {
  * ```
  */
 const preExtractedSchema = z.object({
-  common_name: z.string().trim().max(120).nullable(),
-  scientific_name: z.string().trim().max(120).nullable().optional(),
-  variety: z.string().trim().max(120).nullable(),
-  company: z.string().trim().max(120).nullable(),
-  instructions: z.string().trim().max(4000).nullable(),
+  // .nullish() == .nullable().optional() — accepts null, undefined, or a
+  // missing key. Swift's default JSONEncoder omits nil-valued Optional
+  // keys entirely, so .nullable() (which requires the key be present)
+  // breaks any extractor that returns nil for these fields.
+  common_name: z.string().trim().max(120).nullish(),
+  scientific_name: z.string().trim().max(120).nullish(),
+  variety: z.string().trim().max(120).nullish(),
+  company: z.string().trim().max(120).nullish(),
+  instructions: z.string().trim().max(4000).nullish(),
   // Horticultural data — all optional, all nullable; the on-device + BYOK
   // extractors fill in whatever the packet shows.
   days_to_germinate_min: z.number().int().min(0).max(365).nullable().optional(),
@@ -409,12 +413,14 @@ extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
   }
 
   // Build the extraction shape the rest of the pipeline expects.
+  // Coalesce undefined → null because .nullish() schema fields are typed
+  // `string | null | undefined` but ExtractionResult takes `string | null`.
   const extraction: ExtractionResult = {
-    common_name: input.common_name,
+    common_name: input.common_name ?? null,
     scientific_name: input.scientific_name ?? null,
-    variety: input.variety,
-    company: input.company,
-    instructions: input.instructions,
+    variety: input.variety ?? null,
+    company: input.company ?? null,
+    instructions: input.instructions ?? null,
     days_to_germinate_min: input.days_to_germinate_min ?? null,
     days_to_germinate_max: input.days_to_germinate_max ?? null,
     days_to_maturity_min: input.days_to_maturity_min ?? null,
