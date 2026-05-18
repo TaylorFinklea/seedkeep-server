@@ -16,16 +16,44 @@ interface CatalogSeedRow {
   barcode: string | null;
   perceptual_hash: string | null;
   common_name: string;
+  scientific_name: string | null;
   variety: string | null;
   company: string | null;
   instructions: string | null;
   viability_years: number | null;
+  days_to_germinate_min: number | null;
+  days_to_germinate_max: number | null;
+  days_to_maturity_min: number | null;
+  days_to_maturity_max: number | null;
+  soil_temp_min_f: number | null;
+  soil_temp_max_f: number | null;
+  seed_depth_inches: number | null;
+  plant_spacing_inches: number | null;
+  row_spacing_inches: number | null;
+  sun_requirement: 'full' | 'partial' | 'shade' | null;
+  frost_tolerance: 'tender' | 'half_hardy' | 'hardy' | null;
+  sow_method: 'direct' | 'transplant' | 'either' | null;
+  life_cycle: 'annual' | 'biennial' | 'perennial' | null;
+  hardiness_zone_min: number | null;
+  hardiness_zone_max: number | null;
   status: 'pending' | 'published' | 'rejected';
   confidence: number | null;
   created_at: number;
   updated_at: number;
   published_at: number | null;
 }
+
+const CATALOG_SELECT = `
+  id, barcode, perceptual_hash, common_name, scientific_name, variety, company,
+  instructions, viability_years,
+  days_to_germinate_min, days_to_germinate_max,
+  days_to_maturity_min, days_to_maturity_max,
+  soil_temp_min_f, soil_temp_max_f,
+  seed_depth_inches, plant_spacing_inches, row_spacing_inches,
+  sun_requirement, frost_tolerance, sow_method, life_cycle,
+  hardiness_zone_min, hardiness_zone_max,
+  status, confidence, created_at, updated_at, published_at
+`;
 
 /**
  * GET /api/catalog/lookup?barcode=<UPC|EAN>
@@ -42,9 +70,7 @@ catalogRoutes.get('/catalog/lookup', authOnly, async (c) => {
   const sql = getSql(c.env);
   const hit = await dbGet<CatalogSeedRow>(
     sql,
-    `SELECT id, barcode, perceptual_hash, common_name, variety, company,
-            instructions, viability_years, status, confidence,
-            created_at, updated_at, published_at
+    `SELECT ${CATALOG_SELECT}
        FROM catalog_seeds
       WHERE barcode = $1 AND status = 'published'
       ORDER BY published_at DESC
@@ -67,9 +93,7 @@ catalogRoutes.post('/catalog/lookup-hash', authOnly, async (c) => {
   const sql = getSql(c.env);
   const candidates = await dbAll<CatalogSeedRow>(
     sql,
-    `SELECT id, barcode, perceptual_hash, common_name, variety, company,
-            instructions, viability_years, status, confidence,
-            created_at, updated_at, published_at
+    `SELECT ${CATALOG_SELECT}
        FROM catalog_seeds
       WHERE perceptual_hash = $1 AND status = 'published'
       ORDER BY published_at DESC
@@ -87,9 +111,7 @@ catalogRoutes.get('/catalog/:id', authOnly, async (c) => {
   const sql = getSql(c.env);
   const seed = await dbGet<CatalogSeedRow>(
     sql,
-    `SELECT id, barcode, perceptual_hash, common_name, variety, company,
-            instructions, viability_years, status, confidence,
-            created_at, updated_at, published_at
+    `SELECT ${CATALOG_SELECT}
        FROM catalog_seeds WHERE id = $1 AND status = 'published' LIMIT 1`,
     [id],
   );
