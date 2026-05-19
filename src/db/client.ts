@@ -34,6 +34,17 @@ export function getSql(env: Env): Sql {
         serialize: (x: number | bigint) => String(x),
         parse: (x: string) => Number(x),
       },
+      // NUMERIC (OID 1700) — postgres.js returns strings by default to
+      // preserve precision. Our NUMERIC columns are bounded physical
+      // measurements (e.g. seed_depth_inches NUMERIC(3,2), bed/event
+      // *_feet NUMERIC(5,2)) that fit comfortably in f64. Parse as Number
+      // so the JSON wire format matches the iOS client's Double.
+      numeric: {
+        to: 1700,
+        from: [1700],
+        serialize: (x: number) => String(x),
+        parse: (x: string) => Number(x),
+      },
     },
     onnotice: () => { /* silence Postgres NOTICE messages */ },
   });
