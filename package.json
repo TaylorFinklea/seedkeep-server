@@ -10,7 +10,8 @@
     "migrate": "bun run src/db/migrate.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build:zip-dataset": "bun run scripts/build-zip-dataset.ts"
+    "build:zip-dataset": "bun run scripts/build-zip-dataset.ts",
+    "seed:zip": "bun run scripts/seed-zip-locations.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.700.0",
