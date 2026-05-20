@@ -4,9 +4,25 @@ import type { ExtractionResult } from '../anthropic';
 
 const goodExtraction: ExtractionResult = {
   common_name: 'Tomato',
+  scientific_name: null,
   variety: 'Cherokee Purple',
   company: 'Baker Creek',
   instructions: 'Sow indoors 6–8 weeks before last frost…',
+  days_to_germinate_min: null,
+  days_to_germinate_max: null,
+  days_to_maturity_min: null,
+  days_to_maturity_max: null,
+  soil_temp_min_f: null,
+  soil_temp_max_f: null,
+  seed_depth_inches: null,
+  plant_spacing_inches: null,
+  row_spacing_inches: null,
+  sun_requirement: null,
+  frost_tolerance: null,
+  sow_method: null,
+  life_cycle: null,
+  hardiness_zone_min: null,
+  hardiness_zone_max: null,
   self_confidence: 0.9,
 };
 
