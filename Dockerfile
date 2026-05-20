@@ -15,6 +15,8 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
 COPY scripts ./scripts
+# zip_locations.csv is needed by the seed:zip script run on the deployed image.
+COPY data ./data
 
 # (Optional) Bun build to a single bundled file. We skip for now since
 # Bun runs TS sources natively and we want stack traces to point at
@@ -33,6 +35,7 @@ COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/scripts ./scripts
+COPY --from=builder /app/data ./data
 
 EXPOSE 8787
 

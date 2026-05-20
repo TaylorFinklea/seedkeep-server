@@ -8,6 +8,11 @@ primary_region = 'iad'
 
 [build]
 
+[deploy]
+  # Applies pending migrations on a temporary machine before the new
+  # release serves traffic. The migration runner is idempotent.
+  release_command = "bun run migrate"
+
 [processes]
   app = "bun run src/server.ts"
   worker = "bun run src/worker.ts"
