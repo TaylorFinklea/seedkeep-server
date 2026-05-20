@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   const sessionId2 = `smoke-sess-2-${nanoid12()}`;
   const catalogSeedId = `smoke-cat-${nanoid12()}`;
   let insertedCatalogSeed = false;
+  // Declared at function scope so the cleanup `finally` block can see it.
+  let targetCatalogId = '';
 
   console.log('\n── recommendations smoke test ──────────────────────────────────────\n');
 
@@ -178,7 +180,6 @@ async function main(): Promise<void> {
     }
 
     // ── find or insert a catalog_seeds row with full horticultural data ───────
-    let targetCatalogId: string;
     const existingRows = await sql.unsafe<{ id: string }[]>(
       `SELECT id FROM catalog_seeds
         WHERE frost_tolerance IS NOT NULL
