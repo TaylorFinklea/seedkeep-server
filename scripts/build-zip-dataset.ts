@@ -151,7 +151,7 @@ async function main() {
   console.log(`  Gazetteer ZIPs: ${gazetteer.size}`);
 
   // Step 2: Fetch USDA zones from phzmapi.org for all gazetteer ZIPs
-  const allZips = [...gazetteer.keys()].sort();
+  const allZips = Array.from(gazetteer.keys()).sort();
   console.log(`\nFetching USDA hardiness zones for ${allZips.length} ZIPs from phzmapi.org...`);
   console.log('(This may take 2-5 minutes with 80 concurrent requests)\n');
 
@@ -161,7 +161,6 @@ async function main() {
   // Step 3: Build output rows
   const rows: OutputRow[] = [];
   let skipped = 0;
-  let zoneFallbackCount = 0;
   let frostFallbackCount = 0;
 
   for (const zip of allZips) {
@@ -239,4 +238,7 @@ async function main() {
   console.log('\nDone.');
 }
 
-await main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
