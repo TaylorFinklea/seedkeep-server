@@ -89,7 +89,11 @@ export function computeRuleBaseline(
 
   // Confidence: full data = 1.0, each missing key input subtracts.
   let confidence = 1.0;
-  if (cat.frost_tolerance == null) confidence -= 0.20;
+  // frost_tolerance is the single most load-bearing input — it sets the
+  // earliest-plant offset directly — so its absence is penalized hardest.
+  // 0.25 (not 0.20) also keeps "missing frost_tolerance + soil temp" at
+  // 0.55, cleanly below CONFIDENCE_THRESHOLD rather than exactly on it.
+  if (cat.frost_tolerance == null) confidence -= 0.25;
   if (cat.soil_temp_min_f == null) confidence -= 0.20;
   if (cat.sow_method == null) confidence -= 0.15;
   if (cat.days_to_maturity_max == null && cat.days_to_maturity_min == null) confidence -= 0.10;

@@ -47,7 +47,7 @@ describe('computeRuleBaseline', () => {
       { ...FULL_TENDER_DIRECT, frost_tolerance: null, soil_temp_min_f: null },
       ZONE_7A, 2026,
     );
-    expect(b.confidence).toBeLessThanOrEqual(CONFIDENCE_THRESHOLD);
+    expect(b.confidence).toBeLessThan(CONFIDENCE_THRESHOLD);
   });
 
   it('records which inputs contributed', () => {
