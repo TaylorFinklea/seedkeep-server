@@ -46,6 +46,17 @@ const createHouseholdSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
 });
 
+const LocationBody = z.object({ zip: z.string().regex(/^\d{5}$/) });
+
+interface ZipLocationRow {
+  zip: string;
+  latitude: number;
+  longitude: number;
+  usda_zone: string;
+  avg_last_frost: string;
+  avg_first_frost: string;
+}
+
 /**
  * POST /api/households
  *
@@ -238,4 +249,50 @@ householdRoutes.post('/invites/:code/accept', authOnly, async (c) => {
       role: 'member',
     },
   });
+});
+
+/**
+ * PUT /api/households/me/location — set home ZIP and denormalize location data.
+ *
+ * Looks up the ZIP in zip_locations and writes lat/lon, USDA zone, and frost
+ * dates onto the household row for use by the recommendation engine.
+ */
+householdRoutes.put('/households/me/location', ...auth, async (c) => {
+  const householdId = c.get('householdId');
+  const sql = getSql(c.env);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = LocationBody.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ ok: false, error: { code: 'invalid_zip', message: 'ZIP must be 5 digits' } }, 400);
+  }
+
+  const loc = await dbGet<ZipLocationRow>(
+    sql,
+    `SELECT zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost
+       FROM zip_locations WHERE zip = $1 LIMIT 1`,
+    [parsed.data.zip],
+  );
+  if (!loc) {
+    return c.json({ ok: false, error: { code: 'unknown_zip', message: 'ZIP not found in dataset' } }, 404);
+  }
+
+  const now = Date.now();
+  await dbRun(
+    sql,
+    `UPDATE households
+        SET home_zip = $1, latitude = $2, longitude = $3, usda_zone = $4,
+            avg_last_frost = $5, avg_first_frost = $6, updated_at = $7
+      WHERE id = $8`,
+    [loc.zip, loc.latitude, loc.longitude, loc.usda_zone, loc.avg_last_frost, loc.avg_first_frost, now, householdId],
+  );
+
+  return c.json({ ok: true, data: {
+    zip: loc.zip,
+    latitude: loc.latitude,
+    longitude: loc.longitude,
+    usdaZone: loc.usda_zone,
+    avgLastFrost: loc.avg_last_frost,
+    avgFirstFrost: loc.avg_first_frost,
+  } });
 });
