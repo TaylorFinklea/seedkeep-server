@@ -56,4 +56,7 @@ async function main() {
   await closeDb();
 }
 
-await main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
