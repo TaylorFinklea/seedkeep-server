@@ -14,3 +14,9 @@ build/
 
 # Bun
 bun-debug.log
+
+# Git worktrees
+.worktrees/
+
+# ZIP dataset source files (only the joined output is committed)
+data/sources/
