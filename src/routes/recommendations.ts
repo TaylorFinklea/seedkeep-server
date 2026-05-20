@@ -180,7 +180,7 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
             loc, year);
           if (ai) {
             cache = await writeCache(sql, catalogSeedId, signature, 'ai',
-              ai.confidence, ai, ai.reasoning, ruleBase.inputsUsed);
+              ai.confidence, ai, ai.reasoning, ['ai_fallback']);
           }
         } catch {
           // fall through to the rule baseline below
@@ -228,19 +228,36 @@ recommendationRoutes.post('/recommendations/bulk', ...auth, async (c) => {
         cache = await writeCache(sql, id, signature, 'rule',
           ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed);
       } else {
+        // Low-confidence: enqueue job and return an unknown stub. Do NOT
+        // write the cache — a stale rule-based entry would prevent the worker
+        // from ever being the source of truth.
         await dbRun(
           sql,
           `INSERT INTO recommendation_jobs (id, catalog_seed_id, location_signature, created_at)
            VALUES ($1,$2,$3,$4)
-           ON CONFLICT (catalog_seed_id, location_signature) DO NOTHING`,
+           ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE
+             SET status = 'pending', attempts = 0, last_error = NULL
+             WHERE recommendation_jobs.status IN ('done', 'failed')`,
           [nanoid(), id, signature, Date.now()],
         );
         pending.push(id);
-        cache = await writeCache(sql, id, signature, 'rule',
-          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed);
+        recommendations.push({
+          catalogSeedId: id,
+          locationSignature: signature,
+          computedAt: Date.now(),
+          source: 'rule',
+          confidence: ruleBase.confidence,
+          verdict: 'unknown',
+          recommendedRange: null,
+          indoorRange: null,
+          dailyScores: { anchorDate: todayStr(), scores: new Array(60).fill(0) },
+          reasoning: null,
+          inputsUsed: ruleBase.inputsUsed,
+        });
+        continue;
       }
     }
-    recommendations.push(assembleRecommendation(id, signature, cache));
+    recommendations.push(assembleRecommendation(id, signature, cache!));
   }
 
   return c.json({ ok: true, data: { recommendations, pending } });
