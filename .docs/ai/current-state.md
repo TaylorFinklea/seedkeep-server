@@ -8,27 +8,32 @@
 
 ## Last Session Summary
 
-**Date**: 2026-05-04
+**Date**: 2026-05-20 — Phase A: smart planting window (server)
 
-- F1, F2, F3, F4, F5 of the F1–F5 architecture-pivot sequence all complete in one session.
-- Server side (this repo): F1 (Bun + Hono + Postgres + S3 bootstrap, 11 routes, 13 unit tests) and F2 (tier column + subscriptions table + IAP receipt validation route + tier-branched extraction).
-- iOS side (`~/git/seedkeep-ios`): F3 (Server URL picker, AI provider picker, OnDeviceExtractor over Vision OCR + FoundationModels) and F4 (BYOK keys in Keychain, BYOKExtractor for direct Anthropic / OpenAI vision calls, StoreKit 2 SubscriptionManager + receipt validation against this server).
-- F5 verification: ran an end-to-end smoke against the live server with a seeded user. Verified — `/api/me`, `POST /api/households`, `/api/subscriptions/me` returns tier=free, `POST /api/subscriptions/verify` correctly returns 503 not_configured (no shared secret yet), `POST /api/extractions` returns 402 wrong_tier for free user, `POST /api/extractions/pre-extracted` succeeds + publishes a `catalog_seeds` row, tier promotion to `hosted` flips both gates correctly, post-promotion `/api/extractions` returns 503 not_configured (no Anthropic key yet — same shape as future success).
-- The prior Workers attempt is preserved at `~/git/seedkeep` tagged `phase-1-workers-attempt`.
+- Built the **Phase A server side of the smart-planting-window feature** (iOS 0.2.0). Plan: `.docs/ai/plans/2026-05-20-smart-planting-window-server.md`. Design spec: `~/git/seedkeep/.docs/ai/specs/2026-05-20-smart-planting-window-design.md`. Executed as 10 tasks via subagent-driven development on branch `smart-planting-window`, merged to `main` (commit `6863d34`).
+- **Migration 0007** — `zip_locations` reference table + 6 household location columns (`home_zip`, `latitude`, `longitude`, `usda_zone`, `avg_last_frost`, `avg_first_frost`).
+- **Migration 0008** — `recommendation_cache` + `recommendation_jobs` tables + two Postgres invalidation triggers (catalog horticultural change, household location change).
+- **ZIP dataset** — `data/zip_locations.csv` (33,751 rows: real USDA zones + Census ZCTA centroids; frost dates are zone-estimated — see Blockers). Built by `scripts/build-zip-dataset.ts`, loaded by `scripts/seed-zip-locations.ts` (`bun run seed:zip`).
+- **Routes** — `PUT /api/households/me/location` (ZIP → resolves zone/lat-lon/frost), `GET /api/recommendations/:catalogSeedId` (single, synchronous AI fallback), `POST /api/recommendations/bulk` (batch, enqueues async AI jobs, returns `verdict:unknown` stubs for low-confidence misses).
+- **Engine** — `src/lib/recommendation/`: pure `engine.ts` (rule baseline), `projection.ts` (window→verdict+60-day scores), `aiFallback.ts` (Anthropic call for low confidence), `locationSignature.ts` (cache key).
+- **Worker** — `src/worker.ts`, a separate Fly process (`fly.toml` `[processes]` now has `app` + `worker`) draining `recommendation_jobs`.
+- Verified: `bun run typecheck` clean, **39/39 unit tests pass**, `scripts/recommendations-smoke.ts` **9/9 end-to-end checks pass** against a local server.
+
+**Earlier (2026-05-04, F1–F5 architecture pivot)**: Bun+Hono+Postgres+S3 bootstrap, tier system + IAP receipt validation. The prior Workers attempt is preserved at `~/git/seedkeep` tag `phase-1-workers-attempt`. (Phase 2A/B/C garden-bed work shipped on iOS; server schema for beds/planting-events landed in migrations 0005/0006.)
 
 ## Build Status
 
-- All F1–F5 server-side work complete. Repo has: `package.json`, `tsconfig`, `vitest.config`, `.gitignore`, `.env.example`, `README.md`, `Dockerfile`, `docker-compose.yml`.
-- `src/` carries env loader, db client + helpers + migration runner, S3 storage layer, envelope/auth/household middleware, all 12 route groups (health, auth, households, locations, tags, seeds, random, photos, catalog, extractions, subscriptions), better-auth instance, Apple receipt validation library.
-- Migrations apply cleanly: `0001_initial.sql` (14 domain tables) + `0002_tier_and_subscriptions.sql` (`users.tier` + `subscriptions` table).
-- `bun test` → **13/13 unit tests pass** (randomPick + confidence policies).
-- `bun run dev` boots; `docker compose up db minio minio-bootstrap` brings up backing services.
-- **F1 28/28 route smoke checks pass** + **F5 7/7 tier-aware smoke checks pass** (subscription state, tier gating both directions, catalog row creation).
+- 8 migrations apply cleanly (`0001`–`0008`). `bun run migrate` idempotent.
+- `bun run test` → **39/39 unit tests pass** (randomPick, confidence, projection, engine, aiFallback, locationSignature, worker).
+- `bun run typecheck` clean. `bun run dev` boots. `docker compose up db` brings up Postgres.
+- New scripts: `build:zip-dataset`, `seed:zip`. New smoke script: `scripts/recommendations-smoke.ts`.
 
 ## Blockers
 
-- `ANTHROPIC_API_KEY` unset on Fly; `/api/extractions` returns 503 `not_configured` for hosted-tier requests until configured. Not urgent — Hosted is feature-flagged off in the iOS client (`AppPreferences.isHostedTierEnabled = false`), so no client will actually hit this until the flag is flipped.
-- `APPLE_IAP_SHARED_SECRET` unset on Fly; `/api/subscriptions/verify` returns 503 until configured. Same story — gated behind the iOS client flag.
+- **`main` is not pushed to origin** — Phase A is merged locally only. `git -C ~/git/seedkeep-server push origin main` when ready (the branch was merged fast-forward; ~21 commits ahead of `origin/main`).
+- **Not yet deployed** — the `recommendation` routes + the new `worker` process are on local `main` only. Fly deploy needed; the `worker` process must be provisioned on Fly (the `[processes]` block adds it, but Fly needs the deploy + likely a machine for it).
+- **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
+- `ANTHROPIC_API_KEY` unset on Fly — the recommendation AI fallback and the worker degrade gracefully (rule baseline stands; jobs fail after 3 attempts, verdict stays `unknown`). `/api/extractions` still 503s for hosted tier. `APPLE_IAP_SHARED_SECRET` also unset — both gated behind the iOS feature flag.
 
 ## Hono port-time gotcha (F1e learning)
 
@@ -36,13 +41,7 @@
 
 ## Next concrete step
 
-Server deployed to `https://seedkeep-server.fly.dev` (2026-05-16) on Fly's legacy Hobby plan: 1×shared-cpu-256MB app machine + 1×shared-cpu Postgres machine + R2 bucket `seedkeep-photos`. Migrations 0001 + 0002 applied. `/api/health` returns healthy. Free + BYOK paths work end-to-end against this server.
+1. **Deploy Phase A** — push `main` to origin, `fly deploy`, run migrations 0007 + 0008 against the Fly Postgres, run `seed:zip` to load `zip_locations` there, and provision the `worker` process on Fly. Then smoke `PUT /households/me/location` + `GET /recommendations/:id` against `seedkeep-server.fly.dev`.
+2. **Plan 2 — iOS** — write the Phase B implementation plan (`seedkeep-ios`: SeedkeepKit DTOs, ZIP-entry Settings screen, `WeatherKitRefiner`, `RecommendationStore`, `RecommendationPanel`, the four UI surfaces). The design spec's "Phase B" section is the input. Write it against the deployed API.
 
-Hosted tier is shipped but feature-flagged off in the iOS client (`AppPreferences.isHostedTierEnabled`). To enable for v1.1:
-
-1. Flip `isHostedTierEnabled = true` in `seedkeep-ios/Seedkeep/Core/Preferences/AppPreferences.swift`.
-2. Register subscription products `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect.
-3. Set `APPLE_IAP_SHARED_SECRET` via `fly secrets set` (App Store Connect → My Apps → App Information → App-Specific Shared Secret).
-4. Set `ANTHROPIC_API_KEY` via `fly secrets set` so server-side extraction works.
-
-Backlog beyond Phase 1: catalog moderation admin UI, App Store Server Notifications (S2S) for receipt revalidation cron, Phase 2 server features (garden plans, weather, extension calendars).
+Older follow-ups: Hosted-tier unflag (register `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect, set `APPLE_IAP_SHARED_SECRET` + `ANTHROPIC_API_KEY` via `fly secrets set`, flip `isHostedTierEnabled`). Backlog: catalog moderation admin UI, S2S receipt-revalidation cron, real NOAA frost data for `zip_locations`.

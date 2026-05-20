@@ -56,3 +56,23 @@ When a user converts to hosted tier, their submissions automatically route throu
 **Alternatives considered**: Path-scoped `use('/locations*', ...)`; mount-order shuffling; one consolidated wrapper subrouter that mounts every household-scoped router under itself.
 
 **Rationale**: Per-route composition is unambiguous and tooling-friendly (easy to grep "which routes need which auth?"). Path-scoped `use()` calls would need maintenance every time a new path is added. Consolidation with a wrapper would still have the leak problem if any inner router itself used `use('*')`.
+
+## [2026-05-20] Smart-planting-window recommendation engine
+
+**Context**: iOS 0.2.0 needs per-variety planting-window recommendations. Phase A is the server side: a recommendation API consumed by the iOS client. Full design: `~/git/seedkeep/.docs/ai/specs/2026-05-20-smart-planting-window-design.md`.
+
+**Decision**: A hybrid engine. `src/lib/recommendation/engine.ts` computes a deterministic window from catalog horticultural fields + the household's frost dates; when its confidence is below `CONFIDENCE_THRESHOLD` (0.6) the route (synchronously) or the worker (async) calls an Anthropic fallback. `recommendation_cache` stores only the **season-stable baseline** (window dates, confidence) — the date-relative `verdict` + 60-day score curve are projected per-request by `projection.ts`, so the cache never goes stale as days pass and is invalidated only by Postgres triggers on catalog/household changes. The async AI fill-in runs in a **separate `worker` Fly process** (`src/worker.ts`) to keep the web process stateless.
+
+**Alternatives considered**: Rules-only (rejected — catalog rows are often sparse); AI-only (rejected — cost + latency + non-determinism on the hot path); caching the verdict (rejected — would need daily cache-wide recompute); in-process job loop (rejected — violates the stateless-server constraint).
+
+**Rationale**: Rules handle well-populated catalog rows cheaply and deterministically (unit-tested like `randomPick`/`decideCatalogStatus`); AI covers the sparse tail. Separating the season-stable baseline from the per-read projection is the load-bearing idea — it makes the cache durable for a whole season. The `frost_tolerance` confidence penalty is 0.25 (not 0.20 like the others) so "missing frost_tolerance + soil temp" lands at 0.55, cleanly below the 0.6 AI-fallback gate rather than exactly on it.
+
+## [2026-05-20] ZIP location dataset uses zone-estimated frost dates
+
+**Context**: The engine needs each household's USDA zone + average frost dates, resolved from a home ZIP. `zip_locations` bundles a static ZIP → (lat, lon, zone, last frost, first frost) dataset.
+
+**Decision**: USDA zones (phzmapi.org) and lat/lon centroids (Census ZCTA) are real authoritative data. Frost dates are **zone-estimated** via a 17-entry zone→frost lookup in `scripts/build-zip-dataset.ts` — no clean per-ZIP NOAA dataset was obtainable. All 33,751 rows currently use the zone estimate.
+
+**Alternatives considered**: Real per-ZIP NOAA freeze/frost climatology (not readily available as a bulk join-able file); a third-party geocoding/climate API (rejected — breaks the self-hostable, no-proprietary-API-in-the-path constraint).
+
+**Rationale**: Zone-estimated frost dates are accurate to ~±1–2 weeks — good enough for a planting-*window* feature that already presents ranges, not exact days. Real NOAA data is a clean future upgrade: re-run the build script with a NOAA source, re-seed `zip_locations`; no schema or code change. The trade-off is documented so it isn't mistaken for authoritative data.
