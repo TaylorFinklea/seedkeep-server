@@ -1,0 +1,126 @@
+// Standalone worker process: drains recommendation_jobs by calling the
+// AI fallback for low-confidence planting windows. Run with `bun run worker`.
+// Deployed as a separate Fly process so the web process stays stateless.
+
+import { loadEnv } from './env';
+import { getSql, closeDb } from './db/client';
+import { dbGet, dbRun } from './db/helpers';
+import { fetchAiBaseline } from './lib/recommendation/aiFallback';
+import type { HouseholdLocation } from './lib/recommendation/engine';
+
+const POLL_INTERVAL_MS = 5_000;
+const MAX_ATTEMPTS = 3;
+
+interface JobRow {
+  id: string;
+  catalog_seed_id: string;
+  location_signature: string;
+  attempts: number;
+}
+
+interface CatalogRow {
+  common_name: string;
+  variety: string | null;
+  instructions: string | null;
+}
+
+// location_signature is "<zone>:<lat>,<lon>". Recover the engine inputs.
+function parseSignature(sig: string): { zone: string; lat: number; lon: number } {
+  const [zone, coords] = sig.split(':');
+  const [lat, lon] = coords.split(',').map(Number);
+  return { zone, lat, lon };
+}
+
+async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
+  const sql = getSql(env);
+  const job = await dbGet<JobRow>(
+    sql,
+    `SELECT id, catalog_seed_id, location_signature, attempts
+       FROM recommendation_jobs
+      WHERE status = 'pending'
+      ORDER BY created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED`,
+    [],
+  );
+  if (!job) return false;
+
+  await dbRun(sql, `UPDATE recommendation_jobs SET status = 'running' WHERE id = $1`, [job.id]);
+
+  try {
+    const apiKey = env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+
+    const cat = await dbGet<CatalogRow>(
+      sql, `SELECT common_name, variety, instructions FROM catalog_seeds WHERE id = $1 LIMIT 1`,
+      [job.catalog_seed_id],
+    );
+    if (!cat) throw new Error('catalog seed gone');
+
+    const { zone } = parseSignature(job.location_signature);
+    const frost = await dbGet<{ avg_last_frost: string; avg_first_frost: string }>(
+      sql, `SELECT avg_last_frost, avg_first_frost FROM households
+              WHERE usda_zone = $1 AND avg_last_frost IS NOT NULL LIMIT 1`,
+      [zone],
+    );
+    if (!frost) throw new Error('no frost data for zone');
+
+    const loc: HouseholdLocation = {
+      usdaZone: zone, avgLastFrost: frost.avg_last_frost, avgFirstFrost: frost.avg_first_frost,
+    };
+    const year = new Date().getUTCFullYear();
+    const ai = await fetchAiBaseline(apiKey, env.DEFAULT_REVIEW_MODEL,
+      { commonName: cat.common_name, variety: cat.variety, instructions: cat.instructions },
+      loc, year);
+    if (!ai) throw new Error('AI returned no usable baseline');
+
+    await dbRun(
+      sql,
+      `INSERT INTO recommendation_cache
+         (catalog_seed_id, location_signature, computed_at, source, confidence,
+          window_start, window_end, indoor_start, indoor_end, reasoning, inputs_used)
+       VALUES ($1,$2,$3,'ai',$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
+         computed_at = EXCLUDED.computed_at, source = 'ai',
+         confidence = EXCLUDED.confidence, window_start = EXCLUDED.window_start,
+         window_end = EXCLUDED.window_end, indoor_start = EXCLUDED.indoor_start,
+         indoor_end = EXCLUDED.indoor_end, reasoning = EXCLUDED.reasoning,
+         inputs_used = EXCLUDED.inputs_used`,
+      [job.catalog_seed_id, job.location_signature, Date.now(), ai.confidence,
+       ai.windowStart, ai.windowEnd, ai.indoorStart, ai.indoorEnd,
+       ai.reasoning, JSON.stringify(['ai_fallback'])],
+    );
+    await dbRun(sql, `UPDATE recommendation_jobs SET status = 'done' WHERE id = $1`, [job.id]);
+  } catch (err) {
+    const attempts = job.attempts + 1;
+    const status = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    await dbRun(
+      sql,
+      `UPDATE recommendation_jobs SET status = $1, attempts = $2, last_error = $3 WHERE id = $4`,
+      [status, attempts, String(err), job.id],
+    );
+  }
+  return true;
+}
+
+async function main() {
+  const env = loadEnv();
+  console.log('[worker] recommendation fill-in worker started');
+  let running = true;
+  process.on('SIGTERM', () => { running = false; });
+  process.on('SIGINT', () => { running = false; });
+
+  while (running) {
+    let didWork = false;
+    try {
+      didWork = await processOne(env);
+    } catch (err) {
+      console.error('[worker] poll error', err);
+    }
+    if (!didWork) await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  await closeDb();
+  console.log('[worker] stopped');
+}
+
+void main();

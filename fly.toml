@@ -8,6 +8,10 @@ primary_region = 'iad'
 
 [build]
 
+[processes]
+  app = "bun run src/server.ts"
+  worker = "bun run src/worker.ts"
+
 [http_service]
   internal_port = 8787
   force_https = true
