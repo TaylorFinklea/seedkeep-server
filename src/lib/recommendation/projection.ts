@@ -54,6 +54,11 @@ export function projectWindow(window: WindowInput, today: string): Projection {
   else if (now <= end) verdict = 'late';
   else verdict = 'too_late';
 
+  // For short windows (< 2 * RAMP_DAYS) the ramps would overlap and the
+  // peak score would never reach 1.0. Use the smaller of RAMP_DAYS and
+  // half the window length so the midpoint always scores 1.0.
+  const effectiveRamp = Math.min(RAMP_DAYS, windowLen / 2);
+
   const scores: number[] = [];
   for (let i = 0; i < SCORE_DAYS; i++) {
     const day = addDays(anchor, i);
@@ -63,8 +68,8 @@ export function projectWindow(window: WindowInput, today: string): Projection {
     }
     const fromStart = daysBetween(start, day);
     const toEnd = daysBetween(day, end);
-    const rampUp = Math.min(1, fromStart / RAMP_DAYS);
-    const rampDown = Math.min(1, toEnd / RAMP_DAYS);
+    const rampUp = Math.min(1, fromStart / effectiveRamp);
+    const rampDown = Math.min(1, toEnd / effectiveRamp);
     scores.push(Math.min(rampUp, rampDown));
   }
 

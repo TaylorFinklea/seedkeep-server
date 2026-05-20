@@ -332,10 +332,10 @@ async function main(): Promise<void> {
       try {
         await sql.unsafe(
           `UPDATE catalog_seeds SET soil_temp_min_f = COALESCE(soil_temp_min_f, 1) - 1 WHERE id = $1`,
-          [catalogSeedId],
+          [targetCatalogId],
         );
       } catch {
-        // May not apply if we used an existing row — skip silently
+        // May not apply if we did not reach check 8 — skip silently
       }
     }
 

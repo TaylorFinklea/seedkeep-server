@@ -41,4 +41,12 @@ describe('projectWindow', () => {
     expect(p.dailyScores.scores[7]).toBeCloseTo(1);   // 7 days in = full ramp
     expect(p.dailyScores.scores.every((s) => s >= 0 && s <= 1)).toBe(true);
   });
+
+  it('short window (~6 days) peaks at 1.0 at the midpoint', () => {
+    // Window: 2026-05-20 to 2026-05-26 (6-day window, midpoint = day 3)
+    const p = projectWindow({ windowStart: '2026-05-20', windowEnd: '2026-05-26' }, '2026-05-20');
+    // Midpoint is day 3 from anchor (today = start)
+    expect(p.dailyScores.scores[3]).toBeCloseTo(1, 5);
+    expect(p.dailyScores.scores.every((s) => s >= 0 && s <= 1)).toBe(true);
+  });
 });
