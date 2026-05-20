@@ -5,13 +5,15 @@
 import { loadEnv } from './env';
 import { getSql, closeDb } from './db/client';
 import { dbGet, dbRun } from './db/helpers';
+import type { Sql } from 'postgres';
 import { fetchAiBaseline } from './lib/recommendation/aiFallback';
+import type { AiBaseline } from './lib/recommendation/aiFallback';
 import type { HouseholdLocation } from './lib/recommendation/engine';
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_ATTEMPTS = 3;
 
-interface JobRow {
+export interface JobRow {
   id: string;
   catalog_seed_id: string;
   location_signature: string;
@@ -31,22 +33,79 @@ function parseSignature(sig: string): { zone: string; lat: number; lon: number }
   return { zone, lat, lon };
 }
 
+// Exported for unit-testing: applies the outcome of a completed (or failed)
+// AI call back to the database. Pure-ish — takes an injectable sql handle so
+// tests can pass a real tx or a fake.
+export async function applyJobOutcome(
+  sql: Sql,
+  job: JobRow,
+  result: { ok: true; ai: AiBaseline } | { ok: false; err: unknown },
+): Promise<void> {
+  if (result.ok) {
+    const { ai } = result;
+    await dbRun(
+      sql,
+      `INSERT INTO recommendation_cache
+         (catalog_seed_id, location_signature, computed_at, source, confidence,
+          window_start, window_end, indoor_start, indoor_end, reasoning, inputs_used)
+       VALUES ($1,$2,$3,'ai',$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
+         computed_at = EXCLUDED.computed_at, source = 'ai',
+         confidence = EXCLUDED.confidence, window_start = EXCLUDED.window_start,
+         window_end = EXCLUDED.window_end, indoor_start = EXCLUDED.indoor_start,
+         indoor_end = EXCLUDED.indoor_end, reasoning = EXCLUDED.reasoning,
+         inputs_used = EXCLUDED.inputs_used`,
+      [job.catalog_seed_id, job.location_signature, Date.now(), ai.confidence,
+       ai.windowStart, ai.windowEnd, ai.indoorStart, ai.indoorEnd,
+       ai.reasoning, JSON.stringify(['ai_fallback'])],
+    );
+    await dbRun(sql, `UPDATE recommendation_jobs SET status = 'done' WHERE id = $1`, [job.id]);
+  } else {
+    const attempts = job.attempts + 1;
+    const status = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    await dbRun(
+      sql,
+      `UPDATE recommendation_jobs SET status = $1, attempts = $2, last_error = $3 WHERE id = $4`,
+      [status, attempts, String(result.err), job.id],
+    );
+  }
+}
+
+// Exported for unit-testing: the pure decision of what status results from an
+// error given the current attempt count. No I/O.
+export function outcomeStatus(attempts: number, maxAttempts: number): 'pending' | 'failed' {
+  return attempts + 1 >= maxAttempts ? 'failed' : 'pending';
+}
+
 async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
   const sql = getSql(env);
-  const job = await dbGet<JobRow>(
-    sql,
-    `SELECT id, catalog_seed_id, location_signature, attempts
-       FROM recommendation_jobs
-      WHERE status = 'pending'
-      ORDER BY created_at
-      LIMIT 1
-      FOR UPDATE SKIP LOCKED`,
-    [],
-  );
+
+  // Claim a job atomically: the SELECT ... FOR UPDATE SKIP LOCKED and the
+  // status='running' UPDATE must be in the same transaction so the row lock
+  // is held across both statements. Without a transaction the lock releases
+  // immediately after the SELECT and two workers can claim the same job.
+  const job = await sql.begin(async (tx) => {
+    const rows = await tx.unsafe<JobRow[]>(
+      `SELECT id, catalog_seed_id, location_signature, attempts
+         FROM recommendation_jobs
+        WHERE status = 'pending'
+        ORDER BY created_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED`,
+      [],
+    );
+    const claimed = rows[0] as JobRow | undefined;
+    if (!claimed) return null;
+    await tx.unsafe(
+      `UPDATE recommendation_jobs SET status = 'running' WHERE id = $1`,
+      [claimed.id],
+    );
+    return claimed;
+  });
+
   if (!job) return false;
 
-  await dbRun(sql, `UPDATE recommendation_jobs SET status = 'running' WHERE id = $1`, [job.id]);
-
+  let result: { ok: true; ai: AiBaseline } | { ok: false; err: unknown };
   try {
     const apiKey = env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
@@ -73,33 +132,12 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
       { commonName: cat.common_name, variety: cat.variety, instructions: cat.instructions },
       loc, year);
     if (!ai) throw new Error('AI returned no usable baseline');
-
-    await dbRun(
-      sql,
-      `INSERT INTO recommendation_cache
-         (catalog_seed_id, location_signature, computed_at, source, confidence,
-          window_start, window_end, indoor_start, indoor_end, reasoning, inputs_used)
-       VALUES ($1,$2,$3,'ai',$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
-         computed_at = EXCLUDED.computed_at, source = 'ai',
-         confidence = EXCLUDED.confidence, window_start = EXCLUDED.window_start,
-         window_end = EXCLUDED.window_end, indoor_start = EXCLUDED.indoor_start,
-         indoor_end = EXCLUDED.indoor_end, reasoning = EXCLUDED.reasoning,
-         inputs_used = EXCLUDED.inputs_used`,
-      [job.catalog_seed_id, job.location_signature, Date.now(), ai.confidence,
-       ai.windowStart, ai.windowEnd, ai.indoorStart, ai.indoorEnd,
-       ai.reasoning, JSON.stringify(['ai_fallback'])],
-    );
-    await dbRun(sql, `UPDATE recommendation_jobs SET status = 'done' WHERE id = $1`, [job.id]);
+    result = { ok: true, ai };
   } catch (err) {
-    const attempts = job.attempts + 1;
-    const status = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
-    await dbRun(
-      sql,
-      `UPDATE recommendation_jobs SET status = $1, attempts = $2, last_error = $3 WHERE id = $4`,
-      [status, attempts, String(err), job.id],
-    );
+    result = { ok: false, err };
   }
+
+  await applyJobOutcome(sql, job, result);
   return true;
 }
 
@@ -123,4 +161,7 @@ async function main() {
   console.log('[worker] stopped');
 }
 
-void main();
+// Only start the polling loop when executed directly (not when imported by tests).
+if (import.meta.main) {
+  void main();
+}
