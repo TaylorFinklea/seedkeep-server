@@ -19,6 +19,7 @@
 - **Worker** — `src/worker.ts`, a separate Fly process (`fly.toml` `[processes]` now has `app` + `worker`) draining `recommendation_jobs`.
 - Verified: `bun run typecheck` clean, **39/39 unit tests pass**, `scripts/recommendations-smoke.ts` **9/9 end-to-end checks pass** against a local server.
 - **Deploy-prepped** (commit `0cc328a`) — `Dockerfile` copies `data/` into the image (so `seed:zip` can run on Fly), and `fly.toml` runs `bun run migrate` as a `release_command` so migrations 0007/0008 apply automatically on deploy. `main` is pushed to origin.
+- **Deployed to Fly** (2026-05-20) — `fly deploy --ha=false` shipped release **v9**; the `release_command` applied migrations 0007/0008 to the prod Postgres. `bun run seed:zip` loaded all 33,751 `zip_locations` rows. `worker` scaled to 0 (parked until `ANTHROPIC_API_KEY` is set). Smoke: `/api/health` → 200; the three recommendation routes return 401 unauthenticated (deployed + auth-gated correctly).
 
 **Earlier (2026-05-04, F1–F5 architecture pivot)**: Bun+Hono+Postgres+S3 bootstrap, tier system + IAP receipt validation. The prior Workers attempt is preserved at `~/git/seedkeep` tag `phase-1-workers-attempt`. (Phase 2A/B/C garden-bed work shipped on iOS; server schema for beds/planting-events landed in migrations 0005/0006.)
 
@@ -31,9 +32,8 @@
 
 ## Blockers
 
-- **Not yet deployed** — `main` is pushed to origin and deploy-prepped, but no `fly deploy` has run. The `recommendation` routes + the `worker` process are not live; the `worker` machine must be provisioned on Fly by the deploy (the `[processes]` block adds it, but Fly needs the deploy + likely a machine for it).
 - **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
-- `ANTHROPIC_API_KEY` unset on Fly — the recommendation AI fallback and the worker degrade gracefully (rule baseline stands; jobs fail after 3 attempts, verdict stays `unknown`). `/api/extractions` still 503s for hosted tier. `APPLE_IAP_SHARED_SECRET` also unset — both gated behind the iOS feature flag.
+- `ANTHROPIC_API_KEY` unset on Fly — the recommendation AI fallback degrades gracefully (rule baseline stands; bulk AI jobs stay `verdict:unknown`). The `worker` process is **scaled to 0** until the key is set — `fly secrets set ANTHROPIC_API_KEY=… && fly scale count worker=1` to enable AI fallback. `/api/extractions` still 503s for hosted tier. `APPLE_IAP_SHARED_SECRET` also unset — both gated behind the iOS feature flag.
 
 ## Hono port-time gotcha (F1e learning)
 
@@ -41,7 +41,11 @@
 
 ## Next concrete step
 
-1. **Deploy Phase A** — `fly deploy --ha=false` (the `release_command` auto-applies migrations 0007/0008 to the Fly Postgres), then `fly ssh console -C "bun run seed:zip"` to load `zip_locations`, and `fly scale count worker=0` until `ANTHROPIC_API_KEY` is set. Smoke `curl …/api/health` + `PUT /households/me/location` + `GET /recommendations/:id` against `seedkeep-server.fly.dev`.
-2. **Phase B (iOS) is already built** — the design spec's Phase B is fully implemented and merged in `seedkeep-ios` `main` (commit `666ac46`): SeedkeepKit DTOs, ZIP-entry screen, `WeatherKitRefiner`, `RecommendationStore`, `RecommendationPanel`, four UI surfaces. It is deploy-gated — once the server is live, push `seedkeep-ios` `main`, enable WeatherKit for `app.seedkeep.ios`, and cut the 0.2.0 TestFlight build.
+Phase A is **deployed** (Fly release v9, 2026-05-20: migrations applied, `zip_locations` seeded, `/api/health` 200). The remaining 0.2.0 release work is iOS-side and lives in `seedkeep-ios`:
+
+1. **Enable WeatherKit** for App ID `app.seedkeep.ios` in the Apple Developer portal (Identifiers → WeatherKit).
+2. **Ship the iOS build** — Phase B is built + merged in `seedkeep-ios` `main` (commit `666ac46`) but deploy-gated. Push `seedkeep-ios` `main`, bump `CURRENT_PROJECT_VERSION`, cut a 0.2.0 TestFlight build, and verify the planting-window surfaces on a real device against `seedkeep-server.fly.dev`.
+
+Server-side follow-up: `fly secrets set ANTHROPIC_API_KEY=…` + `fly scale count worker=1` turns on AI fallback (the rule baseline works without it).
 
 Older follow-ups: Hosted-tier unflag (register `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect, set `APPLE_IAP_SHARED_SECRET` + `ANTHROPIC_API_KEY` via `fly secrets set`, flip `isHostedTierEnabled`). Backlog: catalog moderation admin UI, S2S receipt-revalidation cron, real NOAA frost data for `zip_locations`.
