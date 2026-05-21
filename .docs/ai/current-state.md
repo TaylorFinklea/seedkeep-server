@@ -18,6 +18,7 @@
 - **Engine** — `src/lib/recommendation/`: pure `engine.ts` (rule baseline), `projection.ts` (window→verdict+60-day scores), `aiFallback.ts` (Anthropic call for low confidence), `locationSignature.ts` (cache key).
 - **Worker** — `src/worker.ts`, a separate Fly process (`fly.toml` `[processes]` now has `app` + `worker`) draining `recommendation_jobs`.
 - Verified: `bun run typecheck` clean, **39/39 unit tests pass**, `scripts/recommendations-smoke.ts` **9/9 end-to-end checks pass** against a local server.
+- **Deploy-prepped** (commit `0cc328a`) — `Dockerfile` copies `data/` into the image (so `seed:zip` can run on Fly), and `fly.toml` runs `bun run migrate` as a `release_command` so migrations 0007/0008 apply automatically on deploy. `main` is pushed to origin.
 
 **Earlier (2026-05-04, F1–F5 architecture pivot)**: Bun+Hono+Postgres+S3 bootstrap, tier system + IAP receipt validation. The prior Workers attempt is preserved at `~/git/seedkeep` tag `phase-1-workers-attempt`. (Phase 2A/B/C garden-bed work shipped on iOS; server schema for beds/planting-events landed in migrations 0005/0006.)
 
@@ -30,8 +31,7 @@
 
 ## Blockers
 
-- **`main` is not pushed to origin** — Phase A is merged locally only. `git -C ~/git/seedkeep-server push origin main` when ready (the branch was merged fast-forward; ~21 commits ahead of `origin/main`).
-- **Not yet deployed** — the `recommendation` routes + the new `worker` process are on local `main` only. Fly deploy needed; the `worker` process must be provisioned on Fly (the `[processes]` block adds it, but Fly needs the deploy + likely a machine for it).
+- **Not yet deployed** — `main` is pushed to origin and deploy-prepped, but no `fly deploy` has run. The `recommendation` routes + the `worker` process are not live; the `worker` machine must be provisioned on Fly by the deploy (the `[processes]` block adds it, but Fly needs the deploy + likely a machine for it).
 - **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
 - `ANTHROPIC_API_KEY` unset on Fly — the recommendation AI fallback and the worker degrade gracefully (rule baseline stands; jobs fail after 3 attempts, verdict stays `unknown`). `/api/extractions` still 503s for hosted tier. `APPLE_IAP_SHARED_SECRET` also unset — both gated behind the iOS feature flag.
 
@@ -41,7 +41,7 @@
 
 ## Next concrete step
 
-1. **Deploy Phase A** — push `main` to origin, `fly deploy`, run migrations 0007 + 0008 against the Fly Postgres, run `seed:zip` to load `zip_locations` there, and provision the `worker` process on Fly. Then smoke `PUT /households/me/location` + `GET /recommendations/:id` against `seedkeep-server.fly.dev`.
-2. **Plan 2 — iOS** — write the Phase B implementation plan (`seedkeep-ios`: SeedkeepKit DTOs, ZIP-entry Settings screen, `WeatherKitRefiner`, `RecommendationStore`, `RecommendationPanel`, the four UI surfaces). The design spec's "Phase B" section is the input. Write it against the deployed API.
+1. **Deploy Phase A** — `fly deploy --ha=false` (the `release_command` auto-applies migrations 0007/0008 to the Fly Postgres), then `fly ssh console -C "bun run seed:zip"` to load `zip_locations`, and `fly scale count worker=0` until `ANTHROPIC_API_KEY` is set. Smoke `curl …/api/health` + `PUT /households/me/location` + `GET /recommendations/:id` against `seedkeep-server.fly.dev`.
+2. **Phase B (iOS) is already built** — the design spec's Phase B is fully implemented and merged in `seedkeep-ios` `main` (commit `666ac46`): SeedkeepKit DTOs, ZIP-entry screen, `WeatherKitRefiner`, `RecommendationStore`, `RecommendationPanel`, four UI surfaces. It is deploy-gated — once the server is live, push `seedkeep-ios` `main`, enable WeatherKit for `app.seedkeep.ios`, and cut the 0.2.0 TestFlight build.
 
 Older follow-ups: Hosted-tier unflag (register `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect, set `APPLE_IAP_SHARED_SECRET` + `ANTHROPIC_API_KEY` via `fly secrets set`, flip `isHostedTierEnabled`). Backlog: catalog moderation admin UI, S2S receipt-revalidation cron, real NOAA frost data for `zip_locations`.
