@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "build:zip-dataset": "bun run scripts/build-zip-dataset.ts",
     "seed:zip": "bun run scripts/seed-zip-locations.ts",
+    "seed:calendars": "bun run scripts/seed-extension-calendars.ts",
     "worker": "bun run src/worker.ts"
   },
   "dependencies": {
