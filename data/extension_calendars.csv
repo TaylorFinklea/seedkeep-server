@@ -1,0 +1,27 @@
+region_id,crop_key,sow_method,window_start,window_end,indoor_start,indoor_end,source,source_attribution
+VA,tomato,transplant,05-05,06-20,03-15,04-05,bundled,Virginia Cooperative Extension
+VA,pepper,transplant,05-10,06-15,03-15,04-05,bundled,Virginia Cooperative Extension
+VA,basil,transplant,05-10,07-01,04-01,04-20,bundled,Virginia Cooperative Extension
+VA,lettuce,direct,03-15,05-01,,,bundled,Virginia Cooperative Extension
+VA,carrot,direct,03-20,05-15,,,bundled,Virginia Cooperative Extension
+VA,snap bean,direct,05-01,07-01,,,bundled,Virginia Cooperative Extension
+VA,cucumber,direct,05-05,06-30,,,bundled,Virginia Cooperative Extension
+VA,pea,direct,03-01,04-10,,,bundled,Virginia Cooperative Extension
+VA,spinach,direct,03-01,04-15,,,bundled,Virginia Cooperative Extension
+VA,radish,direct,03-10,05-01,,,bundled,Virginia Cooperative Extension
+VA,kale,direct,03-15,05-01,,,bundled,Virginia Cooperative Extension
+VA,beet,direct,03-20,05-15,,,bundled,Virginia Cooperative Extension
+VA,zucchini,direct,05-05,06-30,,,bundled,Virginia Cooperative Extension
+CA,tomato,transplant,03-15,05-15,01-15,02-15,bundled,UC Cooperative Extension
+CA,pepper,transplant,04-01,05-20,02-01,03-01,bundled,UC Cooperative Extension
+CA,basil,transplant,04-15,06-15,03-01,03-20,bundled,UC Cooperative Extension
+CA,lettuce,direct,02-01,04-15,,,bundled,UC Cooperative Extension
+CA,carrot,direct,02-15,05-01,,,bundled,UC Cooperative Extension
+CA,snap bean,direct,04-01,07-01,,,bundled,UC Cooperative Extension
+CA,cucumber,direct,04-01,06-15,,,bundled,UC Cooperative Extension
+CA,pea,direct,01-15,03-01,,,bundled,UC Cooperative Extension
+CA,spinach,direct,01-15,03-15,,,bundled,UC Cooperative Extension
+CA,radish,direct,02-01,05-01,,,bundled,UC Cooperative Extension
+CA,kale,direct,02-01,04-01,,,bundled,UC Cooperative Extension
+CA,beet,direct,02-01,04-15,,,bundled,UC Cooperative Extension
+CA,zucchini,direct,04-01,06-15,,,bundled,UC Cooperative Extension
