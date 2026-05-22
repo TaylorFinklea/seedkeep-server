@@ -33,7 +33,7 @@
 ## Blockers
 
 - **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
-- `ANTHROPIC_API_KEY` unset on Fly — the recommendation AI fallback degrades gracefully (rule baseline stands; bulk AI jobs stay `verdict:unknown`). The `worker` process is **scaled to 0** until the key is set — `fly secrets set ANTHROPIC_API_KEY=… && fly scale count worker=1` to enable AI fallback. `/api/extractions` still 503s for hosted tier. `APPLE_IAP_SHARED_SECRET` also unset — both gated behind the iOS feature flag.
+- `ANTHROPIC_API_KEY` is set on Fly and the `worker` process is scaled to 1 (release v10) — the recommendation AI fallback is **live**: low-confidence seeds get an AI-generated verdict instead of `verdict:unknown`. `APPLE_IAP_SHARED_SECRET` is still unset and `/api/extractions` still 503s — the Hosted tier stays feature-flagged off (deferred).
 
 ## Hono port-time gotcha (F1e learning)
 
