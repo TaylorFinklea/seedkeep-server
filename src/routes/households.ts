@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { dbAll, dbBatch, dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
+import { zipToRegion } from '../lib/recommendation/region';
 
 export const householdRoutes = new Hono<AppEnv>();
 
@@ -278,13 +279,14 @@ householdRoutes.put('/households/me/location', ...auth, async (c) => {
   }
 
   const now = Date.now();
+  const regionId = zipToRegion(loc.zip);
   await dbRun(
     sql,
     `UPDATE households
         SET home_zip = $1, latitude = $2, longitude = $3, usda_zone = $4,
-            avg_last_frost = $5, avg_first_frost = $6, updated_at = $7
-      WHERE id = $8`,
-    [loc.zip, loc.latitude, loc.longitude, loc.usda_zone, loc.avg_last_frost, loc.avg_first_frost, now, householdId],
+            avg_last_frost = $5, avg_first_frost = $6, region_id = $7, updated_at = $8
+      WHERE id = $9`,
+    [loc.zip, loc.latitude, loc.longitude, loc.usda_zone, loc.avg_last_frost, loc.avg_first_frost, regionId, now, householdId],
   );
 
   return c.json({ ok: true, data: {
@@ -294,5 +296,6 @@ householdRoutes.put('/households/me/location', ...auth, async (c) => {
     usdaZone: loc.usda_zone,
     avgLastFrost: loc.avg_last_frost,
     avgFirstFrost: loc.avg_first_frost,
+    regionId,
   } });
 });
