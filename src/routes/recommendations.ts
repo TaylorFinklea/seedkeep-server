@@ -10,6 +10,8 @@ import type { CatalogHorticultural, HouseholdLocation } from '../lib/recommendat
 import { fetchAiBaseline } from '../lib/recommendation/aiFallback';
 import { projectWindow } from '../lib/recommendation/projection';
 import { locationSignature } from '../lib/recommendation/locationSignature';
+import { lookupExtensionEntry } from '../lib/recommendation/extensionLookup';
+import { resolveExtensionBaseline } from '../lib/recommendation/extensionBaseline';
 
 export const recommendationRoutes = new Hono<AppEnv>();
 const auth = [requireAuth(), requireHousehold()] as const;
@@ -20,6 +22,7 @@ interface HouseholdLocationRow {
   usda_zone: string | null;
   avg_last_frost: string | null;
   avg_first_frost: string | null;
+  region_id: string | null;
 }
 
 interface CatalogRow extends CatalogHorticultural {
@@ -30,7 +33,7 @@ interface CatalogRow extends CatalogHorticultural {
 }
 
 interface CacheRow {
-  source: 'rule' | 'ai';
+  source: 'rule' | 'ai' | 'extension';
   confidence: number;
   window_start: string | null;
   window_end: string | null;
@@ -49,6 +52,19 @@ const CATALOG_HORT_SELECT = `id, common_name, variety, instructions,
 
 function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Try the extension calendar before the rule engine. Returns a baseline
+// ready to cache (source 'extension', confidence 1.0) or null on a miss.
+async function tryExtensionBaseline(
+  sql: ReturnType<typeof getSql>,
+  regionId: string | null,
+  commonName: string,
+  sowMethod: string | null,
+  currentYear: number,
+) {
+  const entry = await lookupExtensionEntry(sql, regionId, commonName, sowMethod);
+  return entry ? resolveExtensionBaseline(entry, currentYear) : null;
 }
 
 function assembleRecommendation(
@@ -78,10 +94,10 @@ function assembleRecommendation(
 }
 
 async function loadLocation(sql: ReturnType<typeof getSql>, householdId: string)
-  : Promise<(HouseholdLocation & { latitude: number; longitude: number }) | null> {
+  : Promise<(HouseholdLocation & { latitude: number; longitude: number; regionId: string | null }) | null> {
   const row = await dbGet<HouseholdLocationRow>(
     sql,
-    `SELECT latitude, longitude, usda_zone, avg_last_frost, avg_first_frost
+    `SELECT latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, region_id
        FROM households WHERE id = $1 LIMIT 1`,
     [householdId],
   );
@@ -95,6 +111,7 @@ async function loadLocation(sql: ReturnType<typeof getSql>, householdId: string)
     avgFirstFrost: row.avg_first_frost,
     latitude: row.latitude,
     longitude: row.longitude,
+    regionId: row.region_id,
   };
 }
 
@@ -117,21 +134,22 @@ async function writeCache(
   base: { windowStart: string | null; windowEnd: string | null;
           indoorStart: string | null; indoorEnd: string | null },
   reasoning: string | null, inputsUsed: string[],
+  regionId: string | null,
 ): Promise<CacheRow> {
   const computedAt = Date.now();
   await dbRun(
     sql,
     `INSERT INTO recommendation_cache
-       (catalog_seed_id, location_signature, computed_at, source, confidence,
+       (catalog_seed_id, location_signature, region_id, computed_at, source, confidence,
         window_start, window_end, indoor_start, indoor_end, reasoning, inputs_used)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
-       computed_at = EXCLUDED.computed_at, source = EXCLUDED.source,
-       confidence = EXCLUDED.confidence, window_start = EXCLUDED.window_start,
-       window_end = EXCLUDED.window_end, indoor_start = EXCLUDED.indoor_start,
-       indoor_end = EXCLUDED.indoor_end, reasoning = EXCLUDED.reasoning,
-       inputs_used = EXCLUDED.inputs_used`,
-    [catalogSeedId, signature, computedAt, source, confidence,
+       region_id = EXCLUDED.region_id, computed_at = EXCLUDED.computed_at,
+       source = EXCLUDED.source, confidence = EXCLUDED.confidence,
+       window_start = EXCLUDED.window_start, window_end = EXCLUDED.window_end,
+       indoor_start = EXCLUDED.indoor_start, indoor_end = EXCLUDED.indoor_end,
+       reasoning = EXCLUDED.reasoning, inputs_used = EXCLUDED.inputs_used`,
+    [catalogSeedId, signature, regionId, computedAt, source, confidence,
      base.windowStart, base.windowEnd, base.indoorStart, base.indoorEnd,
      reasoning, JSON.stringify(inputsUsed)],
   );
@@ -167,10 +185,47 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
 
   if (!cache) {
     const year = new Date().getUTCFullYear();
+
+    // Extension calendar takes priority over the rule engine.
+    const ext = await tryExtensionBaseline(
+      sql, loc.regionId, cat.common_name, cat.sow_method, year,
+    );
+    if (ext) {
+      await dbRun(
+        sql,
+        `INSERT INTO recommendation_cache
+           (catalog_seed_id, location_signature, region_id, computed_at, source,
+            confidence, window_start, window_end, indoor_start, indoor_end,
+            reasoning, inputs_used)
+         VALUES ($1,$2,$3,$4,'extension',$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
+           region_id = EXCLUDED.region_id, computed_at = EXCLUDED.computed_at,
+           source = EXCLUDED.source, confidence = EXCLUDED.confidence,
+           window_start = EXCLUDED.window_start, window_end = EXCLUDED.window_end,
+           indoor_start = EXCLUDED.indoor_start, indoor_end = EXCLUDED.indoor_end,
+           reasoning = EXCLUDED.reasoning, inputs_used = EXCLUDED.inputs_used`,
+        [catalogSeedId, signature, loc.regionId, Date.now(),
+         ext.confidence, ext.windowStart, ext.windowEnd, ext.indoorStart,
+         ext.indoorEnd, ext.reasoning, JSON.stringify(['extension_calendar'])],
+      );
+      const extCache: CacheRow = {
+        source: 'extension',
+        confidence: ext.confidence,
+        window_start: ext.windowStart,
+        window_end: ext.windowEnd,
+        indoor_start: ext.indoorStart,
+        indoor_end: ext.indoorEnd,
+        reasoning: ext.reasoning,
+        inputs_used: JSON.stringify(['extension_calendar']),
+        computed_at: Date.now(),
+      };
+      return c.json({ ok: true, data: assembleRecommendation(catalogSeedId, signature, extCache) });
+    }
+
     const ruleBase = computeRuleBaseline(cat, loc, year);
     if (ruleBase.confidence >= CONFIDENCE_THRESHOLD) {
       cache = await writeCache(sql, catalogSeedId, signature, 'rule',
-        ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed);
+        ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed, loc.regionId);
     } else {
       const apiKey = c.env.ANTHROPIC_API_KEY;
       if (apiKey) {
@@ -180,7 +235,7 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
             loc, year);
           if (ai) {
             cache = await writeCache(sql, catalogSeedId, signature, 'ai',
-              ai.confidence, ai, ai.reasoning, ['ai_fallback']);
+              ai.confidence, ai, ai.reasoning, ['ai_fallback'], loc.regionId);
           }
         } catch {
           // fall through to the rule baseline below
@@ -188,7 +243,7 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
       }
       if (!cache) {
         cache = await writeCache(sql, catalogSeedId, signature, 'rule',
-          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed);
+          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed, loc.regionId);
       }
     }
   }
@@ -223,10 +278,48 @@ recommendationRoutes.post('/recommendations/bulk', ...auth, async (c) => {
         sql, `SELECT ${CATALOG_HORT_SELECT} FROM catalog_seeds WHERE id = $1 LIMIT 1`, [id],
       );
       if (!cat) continue;
+
+      // Extension calendar takes priority over the rule engine.
+      const ext = await tryExtensionBaseline(
+        sql, loc.regionId, cat.common_name, cat.sow_method, year,
+      );
+      if (ext) {
+        await dbRun(
+          sql,
+          `INSERT INTO recommendation_cache
+             (catalog_seed_id, location_signature, region_id, computed_at, source,
+              confidence, window_start, window_end, indoor_start, indoor_end,
+              reasoning, inputs_used)
+           VALUES ($1,$2,$3,$4,'extension',$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE SET
+             region_id = EXCLUDED.region_id, computed_at = EXCLUDED.computed_at,
+             source = EXCLUDED.source, confidence = EXCLUDED.confidence,
+             window_start = EXCLUDED.window_start, window_end = EXCLUDED.window_end,
+             indoor_start = EXCLUDED.indoor_start, indoor_end = EXCLUDED.indoor_end,
+             reasoning = EXCLUDED.reasoning, inputs_used = EXCLUDED.inputs_used`,
+          [id, signature, loc.regionId, Date.now(),
+           ext.confidence, ext.windowStart, ext.windowEnd, ext.indoorStart,
+           ext.indoorEnd, ext.reasoning, JSON.stringify(['extension_calendar'])],
+        );
+        const extCache: CacheRow = {
+          source: 'extension',
+          confidence: ext.confidence,
+          window_start: ext.windowStart,
+          window_end: ext.windowEnd,
+          indoor_start: ext.indoorStart,
+          indoor_end: ext.indoorEnd,
+          reasoning: ext.reasoning,
+          inputs_used: JSON.stringify(['extension_calendar']),
+          computed_at: Date.now(),
+        };
+        recommendations.push(assembleRecommendation(id, signature, extCache));
+        continue;
+      }
+
       const ruleBase = computeRuleBaseline(cat, loc, year);
       if (ruleBase.confidence >= CONFIDENCE_THRESHOLD) {
         cache = await writeCache(sql, id, signature, 'rule',
-          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed);
+          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed, loc.regionId);
       } else {
         // Low-confidence: enqueue job and return an unknown stub. Do NOT
         // write the cache — a stale rule-based entry would prevent the worker
