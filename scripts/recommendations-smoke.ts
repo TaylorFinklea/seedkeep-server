@@ -80,6 +80,13 @@ async function main(): Promise<void> {
   // Declared at function scope so the cleanup `finally` block can see it.
   let targetCatalogId = '';
 
+  // Extension-calendar test fixtures
+  const userId3 = `smoke-user-3-${nanoid12()}`;
+  const householdId3 = `smoke-hh-3-${nanoid12()}`;
+  const token3 = `smoke-token-3-${nanoid12()}`;
+  const sessionId3 = `smoke-sess-3-${nanoid12()}`;
+  const extCatalogSeedId = `smoke-ext-${nanoid12()}`;
+
   console.log('\n── recommendations smoke test ──────────────────────────────────────\n');
 
   try {
@@ -126,6 +133,38 @@ async function main(): Promise<void> {
       `INSERT INTO memberships (household_id, user_id, role, joined_at) VALUES ($1, $2, 'owner', $3)`,
       [householdId2, userId2, now],
     );
+
+    // User 3 (VA location — for extension-calendar checks 10-11)
+    await sql.unsafe(
+      `INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+       VALUES ($1, $2, $3, FALSE, $4, $4)`,
+      [userId3, 'Smoke Test User 3', `smoke3-${nanoid12()}@test.invalid`, now],
+    );
+    await sql.unsafe(
+      `INSERT INTO session (id, "expiresAt", token, "createdAt", "updatedAt", "userId")
+       VALUES ($1, $2, $3, $4, $4, $5)`,
+      [sessionId3, expiresAt, token3, now, userId3],
+    );
+    await sql.unsafe(
+      `INSERT INTO households (id, name, created_at, updated_at) VALUES ($1, $2, $3, $3)`,
+      [householdId3, 'Smoke Household 3', now],
+    );
+    await sql.unsafe(
+      `INSERT INTO memberships (household_id, user_id, role, joined_at) VALUES ($1, $2, 'owner', $3)`,
+      [householdId3, userId3, now],
+    );
+
+    // Extension catalog seed: Tomato transplant — matches VA,tomato,transplant bundled entry
+    await sql.unsafe(
+      `INSERT INTO catalog_seeds
+         (id, common_name, variety, status, frost_tolerance, sow_method,
+          soil_temp_min_f, soil_temp_max_f, days_to_maturity_min, days_to_maturity_max,
+          hardiness_zone_min, hardiness_zone_max, created_at, updated_at)
+       VALUES ($1,'Tomato','Smoke Extension Tomato','published','tender','transplant',
+               60,85,70,90,5,10,$2,$2)`,
+      [extCatalogSeedId, now],
+    );
+    console.log(`  info  Inserted extension test catalog_seeds row: ${extCatalogSeedId}`);
 
     // ── check 1: PUT /households/me/location valid ZIP ────────────────────────
     {
@@ -186,8 +225,9 @@ async function main(): Promise<void> {
           AND sow_method IS NOT NULL
           AND soil_temp_min_f IS NOT NULL
           AND days_to_maturity_max IS NOT NULL
+          AND id != $1
         LIMIT 1`,
-      [],
+      [extCatalogSeedId],
     );
 
     if (existingRows.length > 0) {
@@ -320,6 +360,57 @@ async function main(): Promise<void> {
       );
     }
 
+    // ── check 10: extension-covered seed reports source 'extension' ──────────
+    {
+      // Set household 3's location to a VA ZIP (23220 → region_id 'VA')
+      await api('PUT', '/households/me/location', {
+        token: token3,
+        body: { zip: '23220' },
+      });
+
+      const { status, body } = await api('GET', `/recommendations/${extCatalogSeedId}`, {
+        token: token3,
+      });
+      const b = body as {
+        ok: boolean;
+        data?: { source?: string; recommendedRange?: { start?: string; end?: string } };
+      };
+      check(
+        'Check 10: extension-covered seed has source=extension and correct window start',
+        status === 200 && b.ok === true
+          && b.data?.source === 'extension'
+          && typeof b.data?.recommendedRange?.start === 'string'
+          && b.data.recommendedRange.start.endsWith('-05-05'),
+        `status=${status} source=${b.data?.source} rangeStart=${b.data?.recommendedRange?.start}`,
+      );
+    }
+
+    // ── check 11: changing a calendar entry invalidates the region's cache ───
+    {
+      await sql.unsafe(
+        `UPDATE extension_calendar_entries
+            SET window_start = '05-12'
+          WHERE region_id = 'VA' AND crop_key = 'tomato' AND sow_method = 'transplant'`,
+        [],
+      );
+      const cached = await sql.unsafe<{ catalog_seed_id: string }[]>(
+        `SELECT catalog_seed_id FROM recommendation_cache WHERE catalog_seed_id = $1`,
+        [extCatalogSeedId],
+      );
+      check(
+        'Check 11: calendar change cleared the region cache',
+        cached.length === 0,
+        `cached.length=${cached.length}`,
+      );
+      // Restore the original window_start
+      await sql.unsafe(
+        `UPDATE extension_calendar_entries
+            SET window_start = '05-05'
+          WHERE region_id = 'VA' AND crop_key = 'tomato' AND sow_method = 'transplant'`,
+        [],
+      );
+    }
+
   } finally {
     // ── cleanup ───────────────────────────────────────────────────────────────
     console.log('\n── cleanup ─────────────────────────────────────────────────────────\n');
@@ -340,12 +431,16 @@ async function main(): Promise<void> {
       }
     }
 
+    // Delete extension test catalog seed
+    await sql.unsafe(`DELETE FROM catalog_seeds WHERE id = $1`, [extCatalogSeedId]);
+    console.log('  Deleted extension test catalog_seeds row');
+
     // Delete sessions (cascade not guaranteed — explicit delete)
-    await sql.unsafe(`DELETE FROM session WHERE id IN ($1, $2)`, [sessionId1, sessionId2]);
+    await sql.unsafe(`DELETE FROM session WHERE id IN ($1, $2, $3)`, [sessionId1, sessionId2, sessionId3]);
     // Delete memberships and households (CASCADE removes memberships)
-    await sql.unsafe(`DELETE FROM households WHERE id IN ($1, $2)`, [householdId1, householdId2]);
+    await sql.unsafe(`DELETE FROM households WHERE id IN ($1, $2, $3)`, [householdId1, householdId2, householdId3]);
     // Delete users (CASCADE removes sessions, memberships via FK)
-    await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [userId1, userId2]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2, $3)`, [userId1, userId2, userId3]);
 
     console.log('  Deleted smoke test fixtures');
 
