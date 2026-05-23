@@ -19,6 +19,8 @@
 - Verified: `bun run typecheck` clean, **53/53 unit tests pass**, `scripts/recommendations-smoke.ts` **11/11 checks pass** (added checks 10 + 11 for the extension hit and the calendar-change cache invalidation).
 - Implemented as 10 commits in a worktree on branch `extension-calendars-server`, reviewed task-by-task (spec + code quality), merged fast-forward to `main` and pushed to origin.
 - v1 schema is community-ready (`source`, `status`, `submitted_by`, review fields), but the community submission + AI-moderation pipeline, succession planting, regional crop discovery, and iOS Phase B (`sourceAttribution` DTO + `RecommendationPanel` credit line) are follow-on specs.
+- **Polish** (`1b737d3`): widened `writeCache.source` type to admit `'extension'`; added `PR`, `GU`, `AP` regions to `regions.csv`.
+- **Deployed to Fly** as release **v11**: `fly deploy --ha=false` applied migration 0009 via the `release_command`; `fly ssh console -C "bun run seed:calendars"` seeded **53 regions + 30 crop_aliases + 26 calendar entries** (VA + CA bundled coverage). Smoke: `/api/health` 200; all three recommendation routes return 401 unauthenticated (deployed + auth-gated).
 
 **Date**: 2026-05-20 — Phase A: smart planting window (server)
 
@@ -44,7 +46,6 @@
 
 ## Blockers
 
-- **Extension Calendars v1 not yet deployed to Fly.** Migration 0009 + the bundled dataset + the engine integration are on `main` and pushed to origin, but the prod Postgres still has only migrations 0001–0008 applied. Deploy: `fly deploy --ha=false` (the `release_command` applies 0009 automatically), then `fly ssh console -C "bun run seed:calendars"` to load the bundled dataset.
 - **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
 - `ANTHROPIC_API_KEY` is set on Fly and the `worker` process is scaled to 1 (release v10) — the recommendation AI fallback is **live**: low-confidence seeds get an AI-generated verdict instead of `verdict:unknown`. `APPLE_IAP_SHARED_SECRET` is still unset and `/api/extractions` still 503s — the Hosted tier stays feature-flagged off (deferred).
 
@@ -54,10 +55,9 @@
 
 ## Next concrete step
 
-Smart planting window (0.2.0) is done server-side — deployed as Fly v9 (now v10 with the AI-fallback key set) and shipped to iOS TestFlight (build 17). Extension Calendars v1 (foundation + Authority consumer) is merged on `main` but not yet deployed.
+Smart planting window (0.2.0) and Extension Calendars v1 (foundation + Authority) are both **live on Fly** (releases v10 and v11). The recommendation engine consults extension calendars before the rule engine on every request. The remaining server-paired work is iOS Phase B for Extension Calendars.
 
-1. **Deploy Extension Calendars v1** — `fly deploy --ha=false` (the `release_command` applies migration 0009), then `fly ssh console -C "bun run seed:calendars"` to load the bundled dataset (regions, crop_aliases, 26 calendar entries for VA + CA). Smoke against `seedkeep-server.fly.dev`: a household with a VA ZIP requesting a tomato/transplant recommendation should report `source: extension`.
-2. **Phase B (iOS) for Extension Calendars** — own spec + plan. Tiny: add `sourceAttribution` to the `Recommendation` DTO and a one-line "Per Virginia Cooperative Extension" credit in `RecommendationPanel` when `source == 'extension'`. Write against the deployed API.
+1. **Phase B (iOS) for Extension Calendars** — own spec + plan. Tiny: add `sourceAttribution` to the `Recommendation` DTO in SeedkeepKit and a one-line "Per Virginia Cooperative Extension" credit in `RecommendationPanel` when `source == 'extension'`. Write against the now-live API.
 
 Follow-on specs (each its own spec → plan → build cycle):
 - **Community submission + AI-moderation pipeline** — the v1 schema is already community-ready; the submission flow is the immediate fast-follow.
