@@ -8,6 +8,18 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-22 — Extension Calendars v1 (foundation + Authority) implemented + merged to main
+
+- Brainstormed → design spec → 10-task plan → subagent-driven execution. Spec: `~/git/seedkeep/.docs/ai/specs/2026-05-21-extension-calendars-design.md`. Plan: `.docs/ai/plans/2026-05-21-extension-calendars-server.md`.
+- **Migration 0009** — `regions`, `extension_calendar_entries`, `crop_aliases` tables; `region_id` columns on `households` + `recommendation_cache`; `source` CHECK widened to admit `'extension'`; calendar-change invalidation trigger + extended household-change trigger.
+- **Pure libs** (`src/lib/recommendation/`): `region.ts` (`zipToRegion` — ZIP3 → state, 50 states), `cropMatch.ts` (`normalizeCropKey`), `extensionBaseline.ts` (`resolveExtensionBaseline` — MM-DD → dated baseline, `confidence = 1.0`), `extensionLookup.ts` (DB lookup with alias resolution + sow_method precedence). 14 new unit tests.
+- **Bundled dataset** — `data/regions.csv` (50 states), `data/crop_aliases.csv` (30 aliases), `data/extension_calendars.csv` (26 entries for VA + CA starter coverage). Loaded by new `scripts/seed-extension-calendars.ts` (`bun run seed:calendars`).
+- **Engine integration** — `recommendations.ts` consults extension calendars *before* the rule engine in both `GET` and `POST /bulk`; on hit, caches with `source = 'extension'`, `confidence = 1.0`, region-scoped invalidation.
+- **Household location** — `PUT /api/households/me/location` now resolves + stores `region_id` via `zipToRegion`.
+- Verified: `bun run typecheck` clean, **53/53 unit tests pass**, `scripts/recommendations-smoke.ts` **11/11 checks pass** (added checks 10 + 11 for the extension hit and the calendar-change cache invalidation).
+- Implemented as 10 commits in a worktree on branch `extension-calendars-server`, reviewed task-by-task (spec + code quality), merged fast-forward to `main` and pushed to origin.
+- v1 schema is community-ready (`source`, `status`, `submitted_by`, review fields), but the community submission + AI-moderation pipeline, succession planting, regional crop discovery, and iOS Phase B (`sourceAttribution` DTO + `RecommendationPanel` credit line) are follow-on specs.
+
 **Date**: 2026-05-20 — Phase A: smart planting window (server)
 
 - Built the **Phase A server side of the smart-planting-window feature** (iOS 0.2.0). Plan: `.docs/ai/plans/2026-05-20-smart-planting-window-server.md`. Design spec: `~/git/seedkeep/.docs/ai/specs/2026-05-20-smart-planting-window-design.md`. Executed as 10 tasks via subagent-driven development on branch `smart-planting-window`, merged to `main` (commit `6863d34`).
@@ -25,13 +37,14 @@
 
 ## Build Status
 
-- 8 migrations apply cleanly (`0001`–`0008`). `bun run migrate` idempotent.
-- `bun run test` → **39/39 unit tests pass** (randomPick, confidence, projection, engine, aiFallback, locationSignature, worker).
+- 9 migrations apply cleanly (`0001`–`0009`). `bun run migrate` idempotent.
+- `bun run test` → **53/53 unit tests pass** (adds `region`, `cropMatch`, `extensionBaseline` to the existing `randomPick`, `confidence`, `projection`, `engine`, `aiFallback`, `locationSignature`, `worker`).
 - `bun run typecheck` clean. `bun run dev` boots. `docker compose up db` brings up Postgres.
-- New scripts: `build:zip-dataset`, `seed:zip`. New smoke script: `scripts/recommendations-smoke.ts`.
+- Scripts: `build:zip-dataset`, `seed:zip`, `seed:calendars`. Smoke script `scripts/recommendations-smoke.ts` now runs **11/11** checks.
 
 ## Blockers
 
+- **Extension Calendars v1 not yet deployed to Fly.** Migration 0009 + the bundled dataset + the engine integration are on `main` and pushed to origin, but the prod Postgres still has only migrations 0001–0008 applied. Deploy: `fly deploy --ha=false` (the `release_command` applies 0009 automatically), then `fly ssh console -C "bun run seed:calendars"` to load the bundled dataset.
 - **`zip_locations` frost dates are zone-estimated**, not real per-ZIP NOAA data — accuracy ~±1–2 weeks. Real NOAA freeze/frost climatology is a clean future upgrade (no schema change). USDA zones + lat/lon ARE real.
 - `ANTHROPIC_API_KEY` is set on Fly and the `worker` process is scaled to 1 (release v10) — the recommendation AI fallback is **live**: low-confidence seeds get an AI-generated verdict instead of `verdict:unknown`. `APPLE_IAP_SHARED_SECRET` is still unset and `/api/extractions` still 503s — the Hosted tier stays feature-flagged off (deferred).
 
@@ -41,11 +54,16 @@
 
 ## Next concrete step
 
-Phase A is **deployed** (Fly release v9, 2026-05-20: migrations applied, `zip_locations` seeded, `/api/health` 200). The remaining 0.2.0 release work is iOS-side and lives in `seedkeep-ios`:
+Smart planting window (0.2.0) is done server-side — deployed as Fly v9 (now v10 with the AI-fallback key set) and shipped to iOS TestFlight (build 17). Extension Calendars v1 (foundation + Authority consumer) is merged on `main` but not yet deployed.
 
-1. **Enable WeatherKit** for App ID `app.seedkeep.ios` in the Apple Developer portal (Identifiers → WeatherKit).
-2. **Ship the iOS build** — Phase B is built + merged in `seedkeep-ios` `main` (commit `666ac46`) but deploy-gated. Push `seedkeep-ios` `main`, bump `CURRENT_PROJECT_VERSION`, cut a 0.2.0 TestFlight build, and verify the planting-window surfaces on a real device against `seedkeep-server.fly.dev`.
+1. **Deploy Extension Calendars v1** — `fly deploy --ha=false` (the `release_command` applies migration 0009), then `fly ssh console -C "bun run seed:calendars"` to load the bundled dataset (regions, crop_aliases, 26 calendar entries for VA + CA). Smoke against `seedkeep-server.fly.dev`: a household with a VA ZIP requesting a tomato/transplant recommendation should report `source: extension`.
+2. **Phase B (iOS) for Extension Calendars** — own spec + plan. Tiny: add `sourceAttribution` to the `Recommendation` DTO and a one-line "Per Virginia Cooperative Extension" credit in `RecommendationPanel` when `source == 'extension'`. Write against the deployed API.
 
-Server-side follow-up: `fly secrets set ANTHROPIC_API_KEY=…` + `fly scale count worker=1` turns on AI fallback (the rule baseline works without it).
+Follow-on specs (each its own spec → plan → build cycle):
+- **Community submission + AI-moderation pipeline** — the v1 schema is already community-ready; the submission flow is the immediate fast-follow.
+- **Succession planting** — new repeated-planting model + engine + UI.
+- **Regional crop discovery** — standalone "what grows here, when" browse view.
 
-Older follow-ups: Hosted-tier unflag (register `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect, set `APPLE_IAP_SHARED_SECRET` + `ANTHROPIC_API_KEY` via `fly secrets set`, flip `isHostedTierEnabled`). Backlog: catalog moderation admin UI, S2S receipt-revalidation cron, real NOAA frost data for `zip_locations`.
+Non-blocking polish from the final review: collapse the duplicated extension cache-insert SQL by routing through `writeCache` (widen its `source` type to include `'extension'`); add PR/GU/AP entries to `regions.csv`; replace the naïve `split(',')` in `seed:calendars` with a proper CSV parser before community submissions land.
+
+Older follow-ups: Hosted-tier unflag (register `app.seedkeep.ios.hosted.{monthly,yearly}` in App Store Connect, set `APPLE_IAP_SHARED_SECRET` via `fly secrets set`, flip `isHostedTierEnabled`). Backlog: catalog moderation admin UI, S2S receipt-revalidation cron, real NOAA frost data for `zip_locations`.
