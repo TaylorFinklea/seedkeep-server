@@ -130,7 +130,7 @@ async function readCache(sql: ReturnType<typeof getSql>, catalogSeedId: string, 
 async function writeCache(
   sql: ReturnType<typeof getSql>,
   catalogSeedId: string, signature: string,
-  source: 'rule' | 'ai', confidence: number,
+  source: 'rule' | 'ai' | 'extension', confidence: number,
   base: { windowStart: string | null; windowEnd: string | null;
           indoorStart: string | null; indoorEnd: string | null },
   reasoning: string | null, inputsUsed: string[],
