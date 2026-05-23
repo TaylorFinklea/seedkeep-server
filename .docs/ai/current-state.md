@@ -8,6 +8,17 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-23 — Extension Calendars: Kansas added (38 entries, 3 states); Fly v12
+
+- User reported they're in ZIP 66109 (eastern KS, zone 6a) and wanted to actually test extension calendars against their own garden — VA + CA bundled coverage didn't help them.
+- **Sourced from K-State Research and Extension MF315** (*Vegetable Garden Planting Guide*, revised February 2023, Upham + McMahon) — the canonical state-extension publication. Read the PDF via the Read tool's PDF support.
+- **Added 12 KS calendar entries** (`data/extension_calendars.csv`, commit `f0a9a25`): tomato, pepper, lettuce, carrot, snap bean, cucumber, pea, spinach, radish, kale, beet, zucchini. Sourced from MF315's page-2 calendar (primary windows only — "most of Kansas" recommendation, the right conservative call for a state-level v1 entry). Indoor ranges for tomato + pepper derived from MF315's own "4–8 weeks indoors" rule (pages 3-4) applied to the outdoor primary start.
+- **Basil excluded** — MF315 is vegetable-only, no herb coverage. Basil seeds in KS fall through to the rule-engine baseline. Future revision could source basil from a separate KSU herb publication or a community submission.
+- Verified locally: `bun run seed:calendars` upserted **38 entries** (was 26), `zipToRegion('66109') → KS` returns the expected tomato window (May 1 – Jun 15 outdoor, Mar 5 – Apr 5 indoor). `bun run typecheck` clean, **53/53 unit tests pass**.
+- **Deployed to Fly as release v12** (user ran the deploy + re-seed themselves). `/api/health` 200. KS rows live on prod.
+- **Coverage now**: VA (13) + CA (13) + KS (12) = **38 calendar entries across 3 states**. Total dataset: 53 regions + 30 crop_aliases + 38 calendar entries.
+- Companion iOS work — see `seedkeep-ios/.docs/ai/current-state.md` for build 18 (DatePicker out-of-window warning on the Plan event screen).
+
 **Date**: 2026-05-22 — Extension Calendars v1 (foundation + Authority) implemented + merged to main
 
 - Brainstormed → design spec → 10-task plan → subagent-driven execution. Spec: `~/git/seedkeep/.docs/ai/specs/2026-05-21-extension-calendars-design.md`. Plan: `.docs/ai/plans/2026-05-21-extension-calendars-server.md`.
