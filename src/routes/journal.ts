@@ -119,11 +119,16 @@ journalRoutes.get('/retrospective', ...auth, async (c) => {
     [householdId, window],
   );
 
-  // Group by year. Empty years are omitted (the iOS card hides itself when
-  // the years array is empty — a first-year gardener with zero history).
+  // Group by year, excluding the current year — the retrospective surfaces
+  // what was happening on this MM-DD in *prior* years. The current year's
+  // entry (if any) already shows in the main feed. Empty years are omitted
+  // (the iOS card hides itself when the years array is empty — a first-year
+  // gardener with zero history).
+  const currentYear = new Date().getUTCFullYear();
   const byYear = new Map<number, ReturnType<typeof rowToDto>[]>();
   for (const r of rows) {
     const year = parseInt(r.occurred_on.slice(0, 4), 10);
+    if (year >= currentYear) continue;
     if (!byYear.has(year)) byYear.set(year, []);
     byYear.get(year)!.push(rowToDto(r));
   }
