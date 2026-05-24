@@ -12,11 +12,13 @@ import { projectWindow } from '../lib/recommendation/projection';
 import { locationSignature } from '../lib/recommendation/locationSignature';
 import { lookupExtensionEntry } from '../lib/recommendation/extensionLookup';
 import { resolveExtensionBaseline } from '../lib/recommendation/extensionBaseline';
+import { zipToRegion } from '../lib/recommendation/region';
 
 export const recommendationRoutes = new Hono<AppEnv>();
 const auth = [requireAuth(), requireHousehold()] as const;
 
 interface HouseholdLocationRow {
+  home_zip: string | null;
   latitude: number | null;
   longitude: number | null;
   usda_zone: string | null;
@@ -97,7 +99,7 @@ async function loadLocation(sql: ReturnType<typeof getSql>, householdId: string)
   : Promise<(HouseholdLocation & { latitude: number; longitude: number; regionId: string | null }) | null> {
   const row = await dbGet<HouseholdLocationRow>(
     sql,
-    `SELECT latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, region_id
+    `SELECT home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, region_id
        FROM households WHERE id = $1 LIMIT 1`,
     [householdId],
   );
@@ -105,13 +107,34 @@ async function loadLocation(sql: ReturnType<typeof getSql>, householdId: string)
       row.avg_first_frost == null || row.latitude == null || row.longitude == null) {
     return null;
   }
+
+  // Self-heal: migration 0009 added region_id but didn't backfill for
+  // households whose location was set pre-extension. If region_id is null
+  // but home_zip is known, derive + persist on read so this household's
+  // next request (and every cached row it ever writes) is region-aware.
+  // The UPDATE fires the household-change trigger and wipes any stale
+  // cache rows for the household's zone, so the next read does a fresh
+  // compute through extension lookup. Idempotent: a backfilled household
+  // skips this branch entirely on subsequent loads.
+  let regionId = row.region_id;
+  if (!regionId && row.home_zip) {
+    regionId = zipToRegion(row.home_zip);
+    if (regionId) {
+      await dbRun(
+        sql,
+        `UPDATE households SET region_id = $1 WHERE id = $2 AND region_id IS NULL`,
+        [regionId, householdId],
+      );
+    }
+  }
+
   return {
     usdaZone: row.usda_zone,
     avgLastFrost: row.avg_last_frost,
     avgFirstFrost: row.avg_first_frost,
     latitude: row.latitude,
     longitude: row.longitude,
-    regionId: row.region_id,
+    regionId,
   };
 }
 
