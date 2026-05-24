@@ -7,7 +7,8 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { validateAtMostOneAttach } from '../lib/journal/validation';
 import { retrospectiveMmDdWindow, validateMmDd } from '../lib/journal/retrospective';
-import { deletePhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
+import { deletePhoto, getPhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
+import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
 
 const auth = [requireAuth(), requireHousehold()] as const;
 
@@ -41,40 +42,59 @@ function rowToDto(r: EntryRow) {
 
 export const journalRoutes = new Hono<AppEnv>();
 
-// GET /api/journal — paginated chronological feed
+// GET /api/journal?since=<ms>&limit=<n>&seed_id=&bed_id=&planting_event_id=&from_date=&to_date=
+//
+// Delta-sync friendly listing. When `since=0`, soft-deletes are hidden;
+// any non-zero `since` includes deletes so clients can purge.
+//
+// Entity filters (seed_id/bed_id/planting_event_id) and date range
+// (from_date/to_date on occurred_on) are optional and combine with AND.
+// ORDER BY updated_at ASC matches the sync convention; clients re-sort
+// for UI display.
 journalRoutes.get('/', ...auth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
-  const seedId = c.req.query('seed_id');
-  const bedId = c.req.query('bed_id');
-  const eventId = c.req.query('planting_event_id');
-  const fromDate = c.req.query('from_date');
-  const toDate = c.req.query('to_date');
-  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 200);
+  const url = new URL(c.req.url);
+  const query = parseDeltaQuery(url.searchParams);
+  const seedId = url.searchParams.get('seed_id');
+  const bedId = url.searchParams.get('bed_id');
+  const eventId = url.searchParams.get('planting_event_id');
+  const fromDate = url.searchParams.get('from_date');
+  const toDate = url.searchParams.get('to_date');
 
-  const conditions: string[] = ['household_id = $1', 'deleted_at IS NULL'];
-  const params: unknown[] = [householdId];
-  let p = 2;
+  const wheres: string[] = ['household_id = $1', 'updated_at > $2'];
+  const params: unknown[] = [householdId, query.since];
+  let p = 3;
+  if (query.since === 0) wheres.push('deleted_at IS NULL');
+  if (seedId) { wheres.push(`seed_id = $${p++}`); params.push(seedId); }
+  if (bedId) { wheres.push(`bed_id = $${p++}`); params.push(bedId); }
+  if (eventId) { wheres.push(`planting_event_id = $${p++}`); params.push(eventId); }
+  if (fromDate) { wheres.push(`occurred_on >= $${p++}`); params.push(fromDate); }
+  if (toDate) { wheres.push(`occurred_on <= $${p++}`); params.push(toDate); }
 
-  if (seedId) { conditions.push(`seed_id = $${p++}`); params.push(seedId); }
-  if (bedId) { conditions.push(`bed_id = $${p++}`); params.push(bedId); }
-  if (eventId) { conditions.push(`planting_event_id = $${p++}`); params.push(eventId); }
-  if (fromDate) { conditions.push(`occurred_on >= $${p++}`); params.push(fromDate); }
-  if (toDate) { conditions.push(`occurred_on <= $${p++}`); params.push(toDate); }
-
-  params.push(limit);
+  params.push(query.limit);
   const rows = await dbAll<EntryRow>(
     sql,
     `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
             planting_event_id, created_at, updated_at, deleted_at
        FROM journal_entries
-      WHERE ${conditions.join(' AND ')}
-      ORDER BY occurred_on DESC, id DESC
+      WHERE ${wheres.join(' AND ')}
+      ORDER BY updated_at ASC
       LIMIT $${p}`,
     params,
   );
 
-  return c.json({ ok: true, data: { entries: rows.map(rowToDto) } });
+  // `buildDeltaPayload` requires items with snake_case `updated_at`, so we
+  // wrap the raw rows then DTO-shape inside the payload.
+  const payload = buildDeltaPayload(rows, query);
+  return c.json({
+    ok: true,
+    data: {
+      items: payload.items.map(rowToDto),
+      cursor: payload.cursor,
+      has_more: payload.has_more,
+    },
+  });
 });
 
 // GET /api/journal/retrospective?on=MM-DD — year-grouped entries near anchor
@@ -112,6 +132,52 @@ journalRoutes.get('/retrospective', ...auth, async (c) => {
     .map(([year, entries]) => ({ year, entries }));
 
   return c.json({ ok: true, data: { anchor, years } });
+});
+
+// GET /api/journal/:id/photos — list photos for an entry. Mirrors the
+// seed-photos pattern; lists children even when the parent entry is
+// soft-deleted so client cleanup flows can resolve attached photos.
+journalRoutes.get('/:id/photos', ...auth, async (c) => {
+  const householdId = c.get('householdId') as string;
+  const entryId = c.req.param('id');
+  const sql = getSql(c.env);
+  const owner = await dbGet<{ id: string }>(
+    sql,
+    `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2`,
+    [entryId, householdId],
+  );
+  if (!owner) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  }
+  const photos = await dbAll<PhotoRow>(
+    sql,
+    `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
+       FROM journal_entry_photos WHERE entry_id = $1 ORDER BY sort_order ASC, created_at ASC`,
+    [entryId],
+  );
+  return c.json({ ok: true, data: { photos: photos.map(photoToDto) } });
+});
+
+// GET /api/journal/:id/checklist — list checklist items for an entry.
+journalRoutes.get('/:id/checklist', ...auth, async (c) => {
+  const householdId = c.get('householdId') as string;
+  const entryId = c.req.param('id');
+  const sql = getSql(c.env);
+  const owner = await dbGet<{ id: string }>(
+    sql,
+    `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2`,
+    [entryId, householdId],
+  );
+  if (!owner) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  }
+  const items = await dbAll<ChecklistRow>(
+    sql,
+    `SELECT id, entry_id, text, completed, sort_order, updated_at
+       FROM journal_checklist_items WHERE entry_id = $1 ORDER BY sort_order ASC`,
+    [entryId],
+  );
+  return c.json({ ok: true, data: { items: items.map(checklistToDto) } });
 });
 
 // POST /api/journal — create an entry
@@ -332,6 +398,34 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
     [id],
   );
   return c.json({ ok: true, data: { photo: photoToDto(row!) } });
+});
+
+// GET /api/journal/photos/:photoId — fetch the photo binary. Mirrors
+// the seed-photos download endpoint.
+journalRoutes.get('/photos/:photoId', ...auth, async (c) => {
+  const householdId = c.get('householdId') as string;
+  const photoId = c.req.param('photoId');
+  const sql = getSql(c.env);
+  const photo = await dbGet<{ storage_key: string }>(
+    sql,
+    `SELECT storage_key FROM journal_entry_photos
+      WHERE id = $1 AND household_id = $2 LIMIT 1`,
+    [photoId, householdId],
+  );
+  if (!photo) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'photo not found' } }, 404);
+  }
+  const obj = await getPhoto(c.env, photo.storage_key);
+  if (!obj) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'photo data missing' } }, 404);
+  }
+  return new Response(obj.bytes, {
+    status: 200,
+    headers: {
+      'Content-Type': obj.contentType,
+      'Cache-Control': 'private, max-age=3600',
+    },
+  });
 });
 
 // DELETE /api/journal/photos/:photoId — remove a photo (storage + row).
