@@ -8,6 +8,17 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-23 (evening) — Cache invalidation bug fix + Fly v13
+
+- User tested 66109 + a pepper seed and saw no change after KS deploy. Root cause: pre-extension cached rule-engine rows masked the new extension lookup. Two layered defects:
+  1. `location_signature` was `zone:lat,lon` with no region segment, so adding extension data didn't change the cache key → primary-key lookup still returned the old row.
+  2. The calendar-change trigger used `DELETE … WHERE region_id IN (OLD, NEW)` — SQL three-valued logic means `IN (NULL, 'KS')` doesn't match `region_id IS NULL` rows, so legacy rule rows (region_id null since migration 0009 didn't backfill) silently survived.
+- **One-shot prod cleanup**: ran `DELETE FROM recommendation_cache WHERE region_id IS NULL` via `fly ssh console` — 2 stale rows wiped (Taylor's pepper + one other, both at signature `6b:39.0,-95.0`).
+- **`locationSignature` now takes `regionId`** and emits `zone:lat,lon:regionId` (`:none` when null). Two new unit tests assert the region-different invariant. Total tests: **55/55** (was 53).
+- **Migration 0010** makes the calendar trigger NULL-safe (`region_id IS NULL OR = OLD OR = NEW`) and re-runs the prod DELETE as a defensive idempotent step (matters for staging + future self-hosts).
+- Commit `9e5c20a` on `seedkeep-server` main. **Deployed as Fly release v13**; migration applied via `release_command`. `/api/health` 200. Both `app` and `worker` machines refreshed.
+- Belt + suspenders: signature includes region (cache miss when extension comes online) + trigger handles NULL (active invalidation when calendar rows change). Either one alone would catch the bug; both together are robust.
+
 **Date**: 2026-05-23 — Extension Calendars: Kansas added (38 entries, 3 states); Fly v12
 
 - User reported they're in ZIP 66109 (eastern KS, zone 6a) and wanted to actually test extension calendars against their own garden — VA + CA bundled coverage didn't help them.
