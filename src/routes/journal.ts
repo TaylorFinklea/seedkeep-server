@@ -6,6 +6,7 @@ import { dbGet, dbAll, dbRun } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { validateAtMostOneAttach } from '../lib/journal/validation';
+import { retrospectiveMmDdWindow, validateMmDd } from '../lib/journal/retrospective';
 import { deletePhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
 
 const auth = [requireAuth(), requireHousehold()] as const;
@@ -74,6 +75,43 @@ journalRoutes.get('/', ...auth, async (c) => {
   );
 
   return c.json({ ok: true, data: { entries: rows.map(rowToDto) } });
+});
+
+// GET /api/journal/retrospective?on=MM-DD — year-grouped entries near anchor
+journalRoutes.get('/retrospective', ...auth, async (c) => {
+  const sql = getSql(c.env);
+  const householdId = c.get('householdId') as string;
+  const anchor = c.req.query('on');
+  if (!anchor || !validateMmDd(anchor)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'on=MM-DD required' } }, 400);
+  }
+
+  const window = retrospectiveMmDdWindow(anchor);
+  const rows = await dbAll<EntryRow>(
+    sql,
+    `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
+            planting_event_id, created_at, updated_at, deleted_at
+       FROM journal_entries
+      WHERE household_id = $1
+        AND deleted_at IS NULL
+        AND to_char(occurred_on, 'MM-DD') = ANY($2)
+      ORDER BY occurred_on DESC, id DESC`,
+    [householdId, window],
+  );
+
+  // Group by year. Empty years are omitted (the iOS card hides itself when
+  // the years array is empty — a first-year gardener with zero history).
+  const byYear = new Map<number, ReturnType<typeof rowToDto>[]>();
+  for (const r of rows) {
+    const year = parseInt(r.occurred_on.slice(0, 4), 10);
+    if (!byYear.has(year)) byYear.set(year, []);
+    byYear.get(year)!.push(rowToDto(r));
+  }
+  const years = Array.from(byYear.entries())
+    .sort(([a], [b]) => b - a)
+    .map(([year, entries]) => ({ year, entries }));
+
+  return c.json({ ok: true, data: { anchor, years } });
 });
 
 // POST /api/journal — create an entry
