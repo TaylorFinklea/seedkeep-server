@@ -37,10 +37,14 @@ function getClient(env: Env): S3Client {
 export interface PhotoKeyParts {
   householdId: string;
   // 'seeds' for photos tied to a seed row, 'extractions' for catalog
-  // extraction inputs that may not yet be associated with a seed.
-  scope: 'seeds' | 'extractions';
-  ownerId: string; // seed id or extraction id
-  role: 'front' | 'back' | 'extra';
+  // extraction inputs that may not yet be associated with a seed,
+  // 'journal' for photos attached to a journal entry.
+  scope: 'seeds' | 'extractions' | 'journal';
+  ownerId: string; // seed id, extraction id, or journal entry id
+  // Path segment for the object key. Seed photos use front/back/extra to
+  // mark packet faces; journal photos have no face semantics so they use
+  // 'photo'.
+  role: 'front' | 'back' | 'extra' | 'photo';
 }
 
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/heic']);
