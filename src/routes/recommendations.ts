@@ -180,7 +180,7 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
     return c.json({ ok: false, error: { code: 'not_found', message: 'Catalog seed not found' } }, 404);
   }
 
-  const signature = locationSignature(loc.usdaZone, loc.latitude, loc.longitude);
+  const signature = locationSignature(loc.usdaZone, loc.latitude, loc.longitude, loc.regionId);
   let cache = await readCache(sql, catalogSeedId, signature);
 
   if (!cache) {
@@ -266,7 +266,7 @@ recommendationRoutes.post('/recommendations/bulk', ...auth, async (c) => {
       message: 'Set a home ZIP to get planting recommendations' } }, 409);
   }
 
-  const signature = locationSignature(loc.usdaZone, loc.latitude, loc.longitude);
+  const signature = locationSignature(loc.usdaZone, loc.latitude, loc.longitude, loc.regionId);
   const year = new Date().getUTCFullYear();
   const recommendations: unknown[] = [];
   const pending: string[] = [];
