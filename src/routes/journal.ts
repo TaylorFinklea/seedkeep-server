@@ -323,3 +323,150 @@ journalRoutes.delete('/photos/:photoId', ...auth, async (c) => {
   );
   return c.json({ ok: true, data: { id: photoId } });
 });
+
+interface ChecklistRow {
+  id: string;
+  entry_id: string;
+  text: string;
+  completed: boolean;
+  sort_order: number;
+  updated_at: number;
+}
+
+function checklistToDto(c: ChecklistRow) {
+  return {
+    id: c.id, entryId: c.entry_id, text: c.text, completed: c.completed,
+    sortOrder: c.sort_order, updatedAt: c.updated_at,
+  };
+}
+
+// POST /api/journal/:id/checklist — add an item
+journalRoutes.post('/:id/checklist', ...auth, async (c) => {
+  const sql = getSql(c.env);
+  const householdId = c.get('householdId') as string;
+  const entryId = c.req.param('id');
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body.text !== 'string' || !body.text.trim()) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'text required' } }, 400);
+  }
+
+  const owner = await dbGet<{ id: string }>(
+    sql,
+    `SELECT id FROM journal_entries
+      WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
+    [entryId, householdId],
+  );
+  if (!owner) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  }
+
+  const maxRow = await dbGet<{ max: number | null }>(
+    sql,
+    `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`,
+    [entryId],
+  );
+  const sortOrder = (maxRow?.max ?? -1) + 1;
+  const id = nanoid();
+  const now = Date.now();
+
+  await dbRun(
+    sql,
+    `INSERT INTO journal_checklist_items
+       (id, entry_id, text, completed, sort_order, updated_at)
+     VALUES ($1,$2,$3,FALSE,$4,$5)`,
+    [id, entryId, body.text.trim(), sortOrder, now],
+  );
+  await dbRun(
+    sql,
+    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
+    [now, entryId, householdId],
+  );
+
+  const row = await dbGet<ChecklistRow>(
+    sql,
+    `SELECT id, entry_id, text, completed, sort_order, updated_at
+       FROM journal_checklist_items WHERE id = $1`,
+    [id],
+  );
+  return c.json({ ok: true, data: { item: checklistToDto(row!) } });
+});
+
+// PATCH /api/journal/checklist/:itemId — toggle completed or edit text
+journalRoutes.patch('/checklist/:itemId', ...auth, async (c) => {
+  const sql = getSql(c.env);
+  const householdId = c.get('householdId') as string;
+  const itemId = c.req.param('itemId');
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== 'object') {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'JSON body required' } }, 400);
+  }
+
+  // Confirm the item belongs to a household-owned, non-deleted entry.
+  const owner = await dbGet<{ entry_id: string }>(
+    sql,
+    `SELECT ci.entry_id FROM journal_checklist_items ci
+       JOIN journal_entries je ON je.id = ci.entry_id
+      WHERE ci.id = $1 AND je.household_id = $2 AND je.deleted_at IS NULL`,
+    [itemId, householdId],
+  );
+  if (!owner) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
+  }
+
+  const sets: string[] = ['updated_at = $1'];
+  const params: unknown[] = [Date.now()];
+  let p = 2;
+  if ('text' in body && typeof body.text === 'string' && body.text.trim()) {
+    sets.push(`text = $${p++}`); params.push(body.text.trim());
+  }
+  if ('completed' in body && typeof body.completed === 'boolean') {
+    sets.push(`completed = $${p++}`); params.push(body.completed);
+  }
+  if ('sort_order' in body && typeof body.sort_order === 'number') {
+    sets.push(`sort_order = $${p++}`); params.push(body.sort_order);
+  }
+  params.push(itemId);
+  await dbRun(
+    sql,
+    `UPDATE journal_checklist_items SET ${sets.join(', ')} WHERE id = $${p}`,
+    params,
+  );
+  await dbRun(
+    sql,
+    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
+    [Date.now(), owner.entry_id, householdId],
+  );
+
+  const row = await dbGet<ChecklistRow>(
+    sql,
+    `SELECT id, entry_id, text, completed, sort_order, updated_at
+       FROM journal_checklist_items WHERE id = $1`,
+    [itemId],
+  );
+  return c.json({ ok: true, data: { item: checklistToDto(row!) } });
+});
+
+// DELETE /api/journal/checklist/:itemId
+journalRoutes.delete('/checklist/:itemId', ...auth, async (c) => {
+  const sql = getSql(c.env);
+  const householdId = c.get('householdId') as string;
+  const itemId = c.req.param('itemId');
+
+  const owner = await dbGet<{ entry_id: string }>(
+    sql,
+    `SELECT ci.entry_id FROM journal_checklist_items ci
+       JOIN journal_entries je ON je.id = ci.entry_id
+      WHERE ci.id = $1 AND je.household_id = $2`,
+    [itemId, householdId],
+  );
+  if (!owner) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
+  }
+  await dbRun(sql, `DELETE FROM journal_checklist_items WHERE id = $1`, [itemId]);
+  await dbRun(
+    sql,
+    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
+    [Date.now(), owner.entry_id, householdId],
+  );
+  return c.json({ ok: true, data: { id: itemId } });
+});
