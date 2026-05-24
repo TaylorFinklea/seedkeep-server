@@ -8,6 +8,14 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-24 (early AM) — `region_id` backfill + self-heal in `loadLocation` + Fly v14
+
+- After Fly v13 shipped the cache-key fix, Taylor's pepper still returned rule-engine dates. Diagnosed by direct DB query (read-only): cache row showed `sig: "6b:39.0,-95.0:none"` — the `:none` suffix from the new signature code WAS active, but `regionId` came in NULL at signature time. Traced upstream: `households.region_id` was NULL on his row because migration 0009 added the column but never backfilled existing households, and `PUT /api/households/me/location` only resolves region on ZIP *change*, never on read.
+- **One-shot prod backfill** via `fly ssh`: `UPDATE households SET region_id = zipToRegion(home_zip) WHERE region_id IS NULL` — 1 household updated (Taylor, `66109 → KS`). UPDATE fired the household-change trigger, wiping all his stale cache rows. Net cache rows: 0.
+- **Self-healing patch** in `src/routes/recommendations.ts` `loadLocation()`: if `region_id IS NULL` and `home_zip IS NOT NULL`, derive via `zipToRegion()` and persist with a conditional UPDATE (`… WHERE region_id IS NULL` so it's idempotent). The persist fires the household-change trigger which invalidates the household's stale cache rows; the very next `readCache()` misses → fresh compute → extension lookup wins. Lazy migration: self-heals any future user in the same gap on their first recommendation request, no scheduled backfill needed.
+- Commit `899fe64`. **Deployed as Fly v14**. Tests still 55/55, typecheck clean.
+- **Pattern lesson**: Migration 0009 added three columns (`households.region_id`, `recommendation_cache.region_id`, `recommendation_cache.source CHECK`) and backfilled zero of them. Each gap surfaced as a separate symptom over the same session — stale rule rows surviving the trigger (fixed by 0010 + signature change), region_id null on cache writes (downstream of next), region_id null on the household (fixed here). Future schema migrations that add a column AND require its value for downstream behavior must either backfill or add a NOT NULL constraint that forces backfill — neither was done in 0009.
+
 **Date**: 2026-05-23 (evening) — Cache invalidation bug fix + Fly v13
 
 - User tested 66109 + a pepper seed and saw no change after KS deploy. Root cause: pre-extension cached rule-engine rows masked the new extension lookup. Two layered defects:
