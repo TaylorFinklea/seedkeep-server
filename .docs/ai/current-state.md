@@ -8,6 +8,16 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-25 — Phase 3 (Journal) server foundation deployed (Fly v15)
+
+- Subagent-driven implementation of the 10-task plan at `.docs/ai/plans/2026-05-24-phase-3-journal-server.md`. All 9 build commits executed on worktree branch `phase-3-journal-server` (one task per commit, two-stage review per task), fast-forward merged to main, pushed to origin, deployed.
+- **Migration 0011** — `journal_entries`, `journal_entry_photos`, `journal_checklist_items` tables + 7 indexes + at-most-one polymorphic CHECK + data migration converting legacy `planting_events.kind='note'` rows into journal_entries + soft-delete of the legacy rows + drop of `'note'` from the planting_events kind CHECK. Per the migration-backfill-required rule, the schema add + data backfill ride in the same transaction. `idx_journal_entries_household_occurred` is partial (`WHERE deleted_at IS NULL`) to match the project-wide active-list idiom; `idx_journal_entries_household_updated` is non-partial because delta-sync needs tombstones.
+- **Pure libs** (`src/lib/journal/`): `retrospectiveMmDdWindow` (MM-DD ±3 fuzz with year-boundary wrap, uses 2023 reference year to avoid Feb 29) + `validateAtMostOneAttach` (pre-SQL-CHECK validation for cleaner 400s). 11 new unit tests; total **66/66** (was 55).
+- **Routes** — 10 new routes under `/api/journal/*`: GET feed (delta-sync envelope via `parseDeltaQuery`/`buildDeltaPayload`), POST/PATCH/DELETE entry, POST/DELETE photo, POST/PATCH/DELETE checklist item, GET `/:id/photos`, GET `/:id/checklist`, GET `/photos/:photoId` (binary fetch), GET `/retrospective?on=MM-DD` (year-grouped, **excludes the current year + future**). Reuses the existing `seed_photos` direct-bytes upload pattern + the `newPhotoKey`/`putPhoto`/`getPhoto`/`deletePhoto` storage helpers (extended scope+role unions to admit `'journal'` + `'photo'`).
+- **Smoke + verify** — `scripts/journal-smoke.ts` (11/11 checks) + `scripts/lib/verify-migration-0011.sql` for the data-migration check. Recommendations smoke (regression gate) still 11/11.
+- **Deployed to Fly as release v15**. Migration applied via `release_command`. Prod verify: all 3 journal tables present; legacy/preserved/unsoftdeleted counts = 0/0/0 (no pre-existing kind='note' rows on prod, expected); `/api/health` 200.
+- **Pattern improvement noted during T4/T7**: my plan prescribed multipart upload + a unified `/api/sync` envelope, but the codebase uses direct-bytes upload + per-entity sync-friendly listings. Plan was wrong; implementation followed the codebase. Worth recording so future plans don't repeat the same wrong assumption.
+
 **Date**: 2026-05-24 (early AM) — `region_id` backfill + self-heal in `loadLocation` + Fly v14
 
 - After Fly v13 shipped the cache-key fix, Taylor's pepper still returned rule-engine dates. Diagnosed by direct DB query (read-only): cache row showed `sig: "6b:39.0,-95.0:none"` — the `:none` suffix from the new signature code WAS active, but `regionId` came in NULL at signature time. Traced upstream: `households.region_id` was NULL on his row because migration 0009 added the column but never backfilled existing households, and `PUT /api/households/me/location` only resolves region on ZIP *change*, never on read.
