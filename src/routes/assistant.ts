@@ -575,6 +575,16 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
     let model_used: string | undefined;
     let usage: { input_tokens?: number; output_tokens?: number } | undefined;
 
+    // Insert a placeholder assistant_message row now so tool_calls inserted
+    // during the stream can reference it via FK. We'll UPDATE it with the
+    // final content_json + model + usage at message_stop.
+    const placeholderNow = Date.now();
+    await dbRun(sql,
+      `INSERT INTO assistant_messages
+         (id, thread_id, role, content_json, created_at)
+       VALUES ($1, $2, 'assistant', '[]', $3)`,
+      [assistantMessageId, threadId, placeholderNow]);
+
     const events = streamAnthropic({ apiKey, model, system, messages, tools });
 
     for await (const ev of events) {
@@ -784,10 +794,17 @@ async function persistAssistantMessage(
   usage: { input_tokens?: number; output_tokens?: number } | undefined,
 ): Promise<void> {
   const now = Date.now();
+  // The placeholder row was inserted at message-start; UPDATE with the final
+  // accumulated content. Use UPSERT semantics so the function works whether
+  // a placeholder exists or not (defensive).
   await dbRun(sql,
     `INSERT INTO assistant_messages
        (id, thread_id, role, content_json, model, usage_json, created_at)
-     VALUES ($1, $2, 'assistant', $3, $4, $5, $6)`,
+     VALUES ($1, $2, 'assistant', $3, $4, $5, $6)
+     ON CONFLICT (id) DO UPDATE SET
+       content_json = EXCLUDED.content_json,
+       model        = EXCLUDED.model,
+       usage_json   = EXCLUDED.usage_json`,
     [id, threadId, JSON.stringify(blocks), model ?? null,
       usage ? JSON.stringify(usage) : null, now]);
   // Bump the thread's updated_at so it surfaces in the feed.
