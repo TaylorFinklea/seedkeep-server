@@ -17,6 +17,7 @@ import { bedRoutes } from './routes/beds';
 import { plantingEventRoutes } from './routes/planting-events';
 import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
+import { assistantRoutes } from './routes/assistant';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -77,6 +78,7 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', plantingEventRoutes);
   app.route('/api', recommendationRoutes);
   app.route('/api/journal', journalRoutes);
+  app.route('/api/assistant', assistantRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),
