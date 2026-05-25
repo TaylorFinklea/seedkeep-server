@@ -8,6 +8,21 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-25 (afternoon) — Phase 4 (Sprout) server foundation deployed (Fly v17)
+
+- Inline-executed the 11-task plan at `.docs/ai/plans/2026-05-25-phase-4-sprout-server.md` on worktree branch `phase-4-sprout-server`. Single persistent agent (no subagent dispatch) — applied the lesson from Phase 3.
+- **Migration 0012** — 4 new tables (`assistant_keys`, `assistant_threads`, `assistant_messages`, `assistant_tool_calls`) + indexes + status CHECK + partial proposed-index.
+- **AES-256-GCM BYOK encryption** (`src/lib/assistant/keyEncryption.ts`) — node:crypto, no new deps. Master key in `ASSISTANT_KEY_MASTER` Fly secret. Per-row IV + auth tag; tamper-detected on decrypt. 8 unit tests.
+- **Tool registry** (`src/lib/assistant/tools.ts`) — 24 tools with zod schemas + `requires_confirmation` flags. Uses zod 4's `z.toJSONSchema()` for the Anthropic input_schema. 17 unit tests.
+- **Tool executor** (`src/lib/assistant/executor.ts`) — direct SQL handlers for all 24 tools. Confirm-required tools compute Was→Becomes diffs via `applyPatch`; deferred apply via `executeProposedChange`. 8 unit tests on the pure parts; DB-touching paths covered by smoke.
+- **Anthropic streaming client** (`src/lib/assistant/anthropicStream.ts`) — raw fetch to `api.anthropic.com/v1/messages` with `stream:true`; ReadableStream-based SSE parser; mockable via `MOCK_ANTHROPIC_URL` env. 9 SSE parser tests (including chunk-boundary splits, comment heartbeats, malformed-JSON resilience).
+- **Sprout persona** (`src/lib/assistant/prompt.ts`) — system-prompt builder with household snapshot + page context. 9 unit tests.
+- **5 new routes** (`src/routes/assistant.ts` + extension to `src/routes/households.ts`): thread CRUD, streaming endpoint with tool orchestration loop + proposed-change pause, `/confirm` + `/cancel`, key PUT/DELETE/GET. Hono `streamSSE` helper for the SSE writes.
+- **Orchestration loop**: anthropic call → tool dispatch → DB write → re-call until natural stop OR proposed-change pause. Hard cap MAX_TURNS=10. Placeholder assistant_message row inserted at message_start to satisfy the tool_calls FK during streaming.
+- **Smoke** (`scripts/assistant-smoke.ts`) — 18/18 checks. Spawns a mock Anthropic SSE server on port 14040 that returns canned events keyed by `MOCK:<scenario>` markers; exercises text-only, tool_use auto-execute, invalid args, unknown tool, proposed_change pause, awaiting-confirmation 409 gate, confirm + cancel paths with DB verification.
+- Total tests: 117/117 unit (was 66) + 18/18 smoke. Plus regression: journal + recommendations smokes still 11/11 each.
+- **`ASSISTANT_KEY_MASTER` set on Fly** (32-byte random base64, generated via `openssl rand -base64 32`). Migration applied via `release_command`. `/api/assistant/threads` + `/api/households/me/assistant_key` return 401 unauthed (deployed + auth-gated).
+
 **Date**: 2026-05-25 — Phase 3 (Journal) server foundation deployed (Fly v15)
 
 - Subagent-driven implementation of the 10-task plan at `.docs/ai/plans/2026-05-24-phase-3-journal-server.md`. All 9 build commits executed on worktree branch `phase-3-journal-server` (one task per commit, two-stage review per task), fast-forward merged to main, pushed to origin, deployed.
