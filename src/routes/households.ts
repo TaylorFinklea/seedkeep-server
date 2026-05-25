@@ -299,3 +299,112 @@ householdRoutes.put('/households/me/location', ...auth, async (c) => {
     regionId,
   } });
 });
+
+// ─── Sprout (AI assistant) — BYOK key management ───────────────────────────
+//
+// The user pastes their Anthropic API key once into Settings; we encrypt
+// it with AES-256-GCM under `ASSISTANT_KEY_MASTER` and store the ciphertext
+// + IV + auth tag. The key is never echoed back to the client; iOS only
+// learns "configured: true/false" so it can show the right Settings state.
+
+const SetAssistantKeyBody = z.object({
+  provider: z.literal('anthropic'),
+  key: z.string().min(8, 'key looks too short').max(512, 'key looks too long'),
+});
+
+interface AssistantKeyRow {
+  household_id: string;
+  provider: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * PUT /api/households/me/assistant_key
+ *
+ * Body: `{ provider: 'anthropic', key: string }`. Server encrypts + UPSERTs.
+ * Returns `{ provider, configured: true, updatedAt }`. Never echoes the key.
+ *
+ * 503 not_configured when `ASSISTANT_KEY_MASTER` is missing on the server.
+ */
+householdRoutes.put('/households/me/assistant_key', ...auth, async (c) => {
+  const householdId = c.get('householdId');
+  const sql = getSql(c.env);
+
+  if (!c.env.ASSISTANT_KEY_MASTER) {
+    return c.json({ ok: false, error: { code: 'not_configured',
+      message: 'Server is missing ASSISTANT_KEY_MASTER' } }, 503);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = SetAssistantKeyBody.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ ok: false, error: { code: 'bad_request',
+      message: parsed.error.issues.map((i) => i.message).join('; ') } }, 400);
+  }
+
+  const { provider, key } = parsed.data;
+  const { encryptApiKey } = await import('../lib/assistant/keyEncryption');
+  const enc = encryptApiKey(key, c.env.ASSISTANT_KEY_MASTER);
+
+  const now = Date.now();
+  await dbRun(
+    sql,
+    `INSERT INTO assistant_keys
+       (household_id, provider, encrypted_key, key_iv, key_tag, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $6)
+     ON CONFLICT (household_id, provider) DO UPDATE SET
+       encrypted_key = EXCLUDED.encrypted_key,
+       key_iv        = EXCLUDED.key_iv,
+       key_tag       = EXCLUDED.key_tag,
+       updated_at    = EXCLUDED.updated_at`,
+    [householdId, provider, enc.ciphertext, enc.iv, enc.tag, now],
+  );
+
+  return c.json({ ok: true, data: { provider, configured: true, updatedAt: now } });
+});
+
+/**
+ * DELETE /api/households/me/assistant_key?provider=anthropic
+ *
+ * Revoke the BYOK key for a provider. Idempotent — returns 200 even if
+ * no key was configured.
+ */
+householdRoutes.delete('/households/me/assistant_key', ...auth, async (c) => {
+  const householdId = c.get('householdId');
+  const sql = getSql(c.env);
+  const provider = c.req.query('provider') ?? 'anthropic';
+  if (provider !== 'anthropic') {
+    return c.json({ ok: false, error: { code: 'bad_request',
+      message: 'provider must be anthropic' } }, 400);
+  }
+  await dbRun(
+    sql,
+    `DELETE FROM assistant_keys WHERE household_id = $1 AND provider = $2`,
+    [householdId, provider],
+  );
+  return c.json({ ok: true, data: { provider, configured: false } });
+});
+
+/**
+ * GET /api/households/me/assistant_key
+ *
+ * Returns the configured-state for each provider known to the server. Never
+ * exposes the encrypted bytes or the plaintext.
+ */
+householdRoutes.get('/households/me/assistant_key', ...auth, async (c) => {
+  const householdId = c.get('householdId');
+  const sql = getSql(c.env);
+  const rows = await dbAll<AssistantKeyRow>(
+    sql,
+    `SELECT household_id, provider, created_at, updated_at
+       FROM assistant_keys WHERE household_id = $1`,
+    [householdId],
+  );
+  const providers = rows.map((r) => ({
+    provider: r.provider,
+    configured: true,
+    updatedAt: r.updated_at,
+  }));
+  return c.json({ ok: true, data: { providers } });
+});

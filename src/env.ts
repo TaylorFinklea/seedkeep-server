@@ -40,6 +40,12 @@ const schema = z.object({
   // /api/subscriptions/verify returns 503 not_configured when missing.
   APPLE_IAP_SHARED_SECRET: z.string().optional().transform((v) => v?.trim() || undefined),
 
+  // AES-256-GCM master key for encrypting users' BYOK Anthropic API keys.
+  // Must decode to exactly 32 bytes (base64-encoded). Generate with:
+  //   openssl rand -base64 32
+  // Optional at boot — /api/households/me/assistant_key routes 503 when missing.
+  ASSISTANT_KEY_MASTER: z.string().optional().transform((v) => v?.trim() || undefined),
+
   // Models
   DEFAULT_VISION_MODEL: z.string().default('claude-sonnet-4-6'),
   DEFAULT_REVIEW_MODEL: z.string().default('claude-haiku-4-5-20251001'),
