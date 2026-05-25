@@ -8,6 +8,16 @@
  * Prerequisites:
  *   - `bun run dev` is running (default port 8787)
  *   - Local Postgres is running with journal migrations applied
+ *
+ * NOTE: This smoke does NOT verify migration 0011's data preservation
+ * (kind='note' planting_events → journal_entries). That verification is
+ * a one-shot SQL check at deploy time:
+ *
+ *   docker exec seedkeep-db psql -U seedkeep -d seedkeep \
+ *     -f scripts/lib/verify-migration-0011.sql
+ *
+ * Run that SQL against any DB upgraded from a pre-0011 state before
+ * relying on this smoke for end-to-end confidence.
  */
 
 import postgres from 'postgres';
