@@ -18,6 +18,7 @@ import { plantingEventRoutes } from './routes/planting-events';
 import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
 import { assistantRoutes } from './routes/assistant';
+import { mcpRoutes } from './routes/mcp';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -79,6 +80,13 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', recommendationRoutes);
   app.route('/api/journal', journalRoutes);
   app.route('/api/assistant', assistantRoutes);
+
+  // MCP token-management routes live under /api/mcp/tokens; the bare
+  // /mcp endpoint inside the same router is the MCP wire protocol.
+  // Hono's `app.route('/api', ...)` would prefix every path — so we
+  // mount the router twice at the root: it carries both paths inside.
+  app.route('/api', mcpRoutes);
+  app.route('/', mcpRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),
