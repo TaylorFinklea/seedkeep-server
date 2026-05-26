@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
+import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
-import { dbAll, dbGet } from '../db/helpers';
+import { requireHousehold } from '../middleware/household';
+import { dbAll, dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
 
 export const catalogRoutes = new Hono<AppEnv>();
@@ -119,4 +122,61 @@ catalogRoutes.get('/catalog/:id', authOnly, async (c) => {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Catalog entry not found' } }, 404);
   }
   return c.json({ ok: true, data: { catalog_seed: seed } });
+});
+
+// ─── Catalog feedback ────────────────────────────────────────────────
+// Phase 4 D · community-catalog correction collection. Users can submit
+// free-form feedback about a catalog entry; reviewers process the queue
+// out of band (no in-app review yet). Stored in `catalog_feedback`.
+
+const feedbackAuth = [requireAuth(), requireHousehold()] as const;
+
+const FeedbackBody = z.object({
+  body: z.string().min(1).max(2000),
+  // Optional pointer to the specific field the user was looking at —
+  // e.g. "days_to_maturity_max" or "instructions".
+  field_hint: z.string().max(64).optional(),
+});
+
+/**
+ * POST /api/catalog/:id/feedback
+ * Records a user-submitted correction / observation about a catalog
+ * entry. Always returns the created feedback id on success.
+ */
+catalogRoutes.post('/catalog/:id/feedback', ...feedbackAuth, async (c) => {
+  const catalogId = c.req.param('id');
+  const sql = getSql(c.env);
+
+  const exists = await dbGet<{ id: string }>(
+    sql,
+    `SELECT id FROM catalog_seeds WHERE id = $1 LIMIT 1`,
+    [catalogId],
+  );
+  if (!exists) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Catalog entry not found' } }, 404);
+  }
+
+  let parsed: z.infer<typeof FeedbackBody>;
+  try {
+    const raw = await c.req.json();
+    parsed = FeedbackBody.parse(raw);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Invalid body';
+    return c.json({ ok: false, error: { code: 'bad_request', message } }, 400);
+  }
+
+  const householdId = c.get('householdId') as string;
+  const userId = c.get('userId') as string;
+  const now = Date.now();
+  const id = `cf_${nanoid(12)}`;
+
+  await dbRun(
+    sql,
+    `INSERT INTO catalog_feedback
+        (id, catalog_seed_id, household_id, user_id, body, field_hint, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7)`,
+    [id, catalogId, householdId, userId, parsed.body, parsed.field_hint ?? null, now],
+  );
+
+  return c.json({ ok: true, data: { id } });
 });

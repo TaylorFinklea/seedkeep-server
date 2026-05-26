@@ -291,6 +291,14 @@ assistantRoutes.delete('/threads/:id', ...auth, async (c) => {
 //   5. On natural stop (no pending tool call): persist final assistant message,
 //      emit `done`, close stream.
 
+/// Optional image attachment on a Sprout message. Base64-encoded
+/// JPEG/PNG bytes — the iOS composer resizes + encodes before sending.
+/// Capped at ~4 MB base64 (≈3 MB raw) to stay under Anthropic's limit.
+const ImageAttachment = z.object({
+  media_type: z.enum(['image/jpeg', 'image/png', 'image/webp', 'image/gif']),
+  data: z.string().min(1).max(4 * 1024 * 1024),
+});
+
 const StreamBody = z.object({
   text: z.string().min(1).max(8000),
   page_context: z.object({
@@ -298,6 +306,11 @@ const StreamBody = z.object({
     entityId: z.string().optional(),
     label: z.string().optional(),
   }).optional(),
+  // Phase 4 B — optional photo attached to the user message. When set,
+  // the LLM sees it as a vision input and can answer questions like
+  // "what should I plant in this corner?". Persisted in `content_json`
+  // so resumed conversations retain the image.
+  attachment: ImageAttachment.optional(),
 });
 
 const MAX_TURNS = 10;          // safety cap on tool-call iterations per send
@@ -371,7 +384,21 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   // Persist the user message.
   const userMessageId = nanoid();
   const now = Date.now();
-  const userContent: AnthropicContentBlock[] = [{ type: 'text', text: parsed.data.text }];
+  const userContent: AnthropicContentBlock[] = [];
+  // Phase 4 B — image comes FIRST in the content list (Anthropic's
+  // recommended order: vision input above the user's text question so
+  // the model has context before reading the prompt).
+  if (parsed.data.attachment) {
+    userContent.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: parsed.data.attachment.media_type,
+        data: parsed.data.attachment.data,
+      },
+    });
+  }
+  userContent.push({ type: 'text', text: parsed.data.text });
   await dbRun(
     sql,
     `INSERT INTO assistant_messages

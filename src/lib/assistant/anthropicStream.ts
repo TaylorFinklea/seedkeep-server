@@ -9,7 +9,7 @@
 // scripts/assistant-smoke.ts so smoke runs don't burn tokens.
 
 export interface AnthropicContentBlock {
-  type: 'text' | 'tool_use' | 'tool_result';
+  type: 'text' | 'tool_use' | 'tool_result' | 'image';
   text?: string;
   // tool_use blocks
   id?: string;
@@ -19,6 +19,13 @@ export interface AnthropicContentBlock {
   tool_use_id?: string;
   content?: unknown;
   is_error?: boolean;
+  // image blocks — Anthropic vision input. `source.type='base64'` + a
+  // standard image MIME + the base64 bytes (no data: prefix).
+  source?: {
+    type: 'base64';
+    media_type: 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif';
+    data: string;
+  };
 }
 
 export interface AnthropicMessage {
