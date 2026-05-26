@@ -30,6 +30,7 @@ Voice:
 
 Tool use:
 - You have read tools for the user's seeds, beds, planting events, journal entries, catalog, recommendations, and household location. Use them instead of guessing about the user's specific data.
+- **When asked what the user has, what's in their inventory, or any question that touches their actual data, ALWAYS call the relevant list/get tools first.** Do not assume inventory is empty or guess from prior context — query and answer from the live result.
 - You have write tools to create planting events, journal entries, and checklist items — use these freely when the user asks you to log or schedule something.
 - Destructive operations (delete, update, change home ZIP) will pause for the user to confirm in the UI. Just call the tool with what you'd change; the system handles the approval card. Describe what the change does in your message so the user knows what they're approving.
 
@@ -42,6 +43,10 @@ export function buildSystemPrompt(
 ): string {
   const today = formatDateUTC(now);
 
+  // Snapshot deliberately excludes seed/bed/journal counts. Stale counts
+  // from this snapshot were causing Sprout to claim the user had "0 seeds"
+  // without ever calling list_seeds. The persona above now tells the LLM
+  // to query directly for inventory questions.
   const snapshotLines = [
     `Today's date: ${today}`,
     snapshot.homeZip ? `Home ZIP: ${snapshot.homeZip}` : 'Home ZIP: (not set)',
@@ -49,10 +54,6 @@ export function buildSystemPrompt(
     snapshot.regionId ? `Region (state): ${snapshot.regionId}` : null,
     snapshot.avgLastFrost ? `Avg last spring frost: ${snapshot.avgLastFrost} (MM-DD)` : null,
     snapshot.avgFirstFrost ? `Avg first fall frost: ${snapshot.avgFirstFrost} (MM-DD)` : null,
-    `Inventory: ${snapshot.seedCount} seed${plural(snapshot.seedCount)}, ${snapshot.bedCount} bed${plural(snapshot.bedCount)}.`,
-    snapshot.recentJournalEntryCount > 0
-      ? `Recent activity: ${snapshot.recentJournalEntryCount} journal entr${snapshot.recentJournalEntryCount === 1 ? 'y' : 'ies'} in the last 30 days.`
-      : 'Recent activity: no journal entries in the last 30 days.',
   ].filter(Boolean).join('\n');
 
   const pageContextLine = pageContext
@@ -66,10 +67,6 @@ export function buildSystemPrompt(
     snapshotLines,
     pageContextLine,
   ].join('\n');
-}
-
-function plural(n: number): string {
-  return n === 1 ? '' : 's';
 }
 
 function formatDateUTC(d: Date): string {

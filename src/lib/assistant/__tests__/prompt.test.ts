@@ -27,16 +27,25 @@ describe('buildSystemPrompt', () => {
     expect(p).toContain("Today's date: 2026-05-25");
   });
 
-  it('includes the household snapshot when fully populated', () => {
+  it('includes the household location snapshot when populated', () => {
     const p = buildSystemPrompt(FULL_SNAPSHOT, null, NOW);
     expect(p).toContain('Home ZIP: 66109');
     expect(p).toContain('USDA zone: 6b');
     expect(p).toContain('Region (state): KS');
     expect(p).toContain('Avg last spring frost: 04-22');
     expect(p).toContain('Avg first fall frost: 10-18');
-    expect(p).toContain('12 seeds');
-    expect(p).toContain('3 beds');
-    expect(p).toContain('4 journal entries in the last 30 days');
+  });
+
+  it('omits inventory/journal counts so the LLM must call tools', () => {
+    // Stale counts in the prompt caused Sprout to confidently say "0 seeds"
+    // without ever invoking list_seeds. The snapshot deliberately no longer
+    // surfaces these — the persona section instructs tool use instead.
+    const p = buildSystemPrompt(FULL_SNAPSHOT, null, NOW);
+    expect(p).not.toContain('Inventory:');
+    expect(p).not.toContain('Recent activity:');
+    expect(p).not.toMatch(/\d+ seeds?\b/);
+    expect(p).not.toMatch(/\d+ beds?\b/);
+    expect(p).toContain('ALWAYS call the relevant list/get tools first');
   });
 
   it('handles a missing location gracefully', () => {
@@ -48,18 +57,9 @@ describe('buildSystemPrompt', () => {
     const p = buildSystemPrompt(snapshot, null, NOW);
     expect(p).toContain('Home ZIP: (not set)');
     expect(p).toContain('USDA zone: (unknown)');
-    expect(p).toContain('0 seeds');
-    expect(p).toContain('no journal entries in the last 30 days');
     // Region/frost lines should be absent when null
     expect(p).not.toContain('Region (state):');
     expect(p).not.toContain('Avg last spring frost:');
-  });
-
-  it('pluralizes correctly for counts of 1', () => {
-    const p = buildSystemPrompt({ ...FULL_SNAPSHOT, seedCount: 1, bedCount: 1, recentJournalEntryCount: 1 }, null, NOW);
-    expect(p).toContain('1 seed,');
-    expect(p).toContain('1 bed');
-    expect(p).toContain('1 journal entry');
   });
 
   it('includes page context when provided', () => {
