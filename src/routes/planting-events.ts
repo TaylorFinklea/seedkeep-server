@@ -82,28 +82,48 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
   }
   const id = nanoid();
   const now = Date.now();
-  await dbRun(
-    sql,
-    `INSERT INTO planting_events (
-       id, household_id, bed_id, seed_id, catalog_seed_id,
-       kind, planned_for, completed_at, notes,
-       x_feet, y_feet,
-       created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-    [
-      id, householdId,
-      parsed.data.bed_id ?? null,
-      parsed.data.seed_id ?? null,
-      parsed.data.catalog_seed_id ?? null,
-      parsed.data.kind,
-      parsed.data.planned_for,
-      parsed.data.completed_at ?? null,
-      parsed.data.notes ?? null,
-      parsed.data.x_feet ?? null,
-      parsed.data.y_feet ?? null,
-      now, now,
-    ],
-  );
+  try {
+    await dbRun(
+      sql,
+      `INSERT INTO planting_events (
+         id, household_id, bed_id, seed_id, catalog_seed_id,
+         kind, planned_for, completed_at, notes,
+         x_feet, y_feet,
+         created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        id, householdId,
+        parsed.data.bed_id ?? null,
+        parsed.data.seed_id ?? null,
+        parsed.data.catalog_seed_id ?? null,
+        parsed.data.kind,
+        parsed.data.planned_for,
+        parsed.data.completed_at ?? null,
+        parsed.data.notes ?? null,
+        parsed.data.x_feet ?? null,
+        parsed.data.y_feet ?? null,
+        now, now,
+      ],
+    );
+  } catch (err) {
+    // Postgres SQLSTATE 23503 = foreign_key_violation. The iOS client
+    // routinely sends bed_id / seed_id values that refer to local-only
+    // rows whose own create writes haven't synced yet (or failed). A
+    // 500 with an HTML body here causes the iOS sync engine to mark
+    // the write as decode_failed; a clean 400 lets it dead-letter
+    // cleanly so the user can retry the parent writes first.
+    if ((err as { code?: string }).code === '23503') {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced bed, seed, or catalog row does not exist on the server. Sync the parent records first (Settings → Sync → Pending writes → Retry), then retry this planting event.',
+        },
+      }, 400);
+    }
+    throw err;
+  }
   return c.json({
     ok: true,
     data: {
