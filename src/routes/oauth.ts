@@ -59,7 +59,41 @@ oauthRoutes.all('/oauth2/authorize', proxyToBetterAuth('/api/auth/oauth2/authori
 oauthRoutes.all('/oauth2/token',     proxyToBetterAuth('/api/auth/oauth2/token'));
 oauthRoutes.all('/oauth2/register',  proxyToBetterAuth('/api/auth/oauth2/register'));
 oauthRoutes.all('/oauth2/userinfo',  proxyToBetterAuth('/api/auth/oauth2/userinfo'));
-oauthRoutes.all('/oauth2/consent',   proxyToBetterAuth('/api/auth/oauth2/consent'));
+
+/// POST /oauth2/consent — bridge from the HTML consent form to
+/// better-auth's JSON-only consent endpoint. Reads accept +
+/// consent_code from urlencoded form data, re-POSTs as JSON, and
+/// follows the returned redirectURI back to the OAuth client.
+oauthRoutes.post('/oauth2/consent', async (c) => {
+  const auth = getAuth(c.env);
+  const formData = await c.req.formData();
+  const accept = String(formData.get('accept') ?? 'false') === 'true';
+  const consentCode = formData.get('consent_code')
+    ? String(formData.get('consent_code'))
+    : undefined;
+
+  const url = new URL(c.req.raw.url);
+  url.pathname = '/api/auth/oauth2/consent';
+  const proxied = new Request(url.toString(), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      cookie: c.req.header('cookie') ?? '',
+    },
+    body: JSON.stringify({ accept, consent_code: consentCode }),
+  });
+  const response = await auth.handler(proxied);
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    return c.html(consentErrorHTML(errBody), { status: response.status as 400 | 401 | 403 | 500 });
+  }
+  const body = await response.json() as { redirectURI?: string };
+  if (!body.redirectURI) {
+    return c.html(consentErrorHTML('Consent succeeded but the auth server did not return a redirect URL.'), 500);
+  }
+  return c.redirect(body.redirectURI, 302);
+});
 
 // ── Pairing-code: iOS → web bridge ───────────────────────────────────
 
@@ -401,6 +435,28 @@ function loginPageHTML(opts: {
       </div>
     </form>
     <p class="help">The code is good for ten minutes and can only be used once. Generate a fresh one in the app if it expires.</p>
+  </div>
+</body>
+</html>`;
+}
+
+function consentErrorHTML(detail: string) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seedkeep · Consent failed</title>
+  <style>${HERBARIUM_STYLES}</style>
+</head>
+<body>
+  <div class="page">
+    <div class="folio"><span>Seedkeep</span><em>consent failed</em></div>
+    <h1>Couldn't finish the connection</h1>
+    <p class="subtitle">The authorization server didn't accept the consent submission.</p>
+    <hr class="rule">
+    <pre style="background: var(--vellum-hi); padding: 12px; border: 0.5px solid var(--ink-faint); white-space: pre-wrap; font-size: 12px; color: var(--ink);">${escapeHTML(detail).slice(0, 1200)}</pre>
+    <p class="help">Head back to your client and start the connect flow again. If this keeps happening, the pairing code may have expired before consent — generate a fresh one.</p>
   </div>
 </body>
 </html>`;
