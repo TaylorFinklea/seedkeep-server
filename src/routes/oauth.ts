@@ -74,12 +74,31 @@ oauthRoutes.post('/oauth2/consent', async (c) => {
 
   const url = new URL(c.req.raw.url);
   url.pathname = '/api/auth/oauth2/consent';
+
+  // Better-auth's CSRF middleware requires `Origin` to be present
+  // (and to match the request URL's origin). Forward whatever the
+  // browser sent; if the form was posted same-origin the browser
+  // already set it. Falls back to the reconstructed public origin
+  // behind Fly's TLS proxy.
+  const proto = c.req.header('x-forwarded-proto') ?? 'https';
+  const host = c.req.header('host') ?? url.host;
+  const origin = c.req.header('origin') ?? `${proto}://${host}`;
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    cookie: c.req.header('cookie') ?? '',
+    origin,
+    host,
+    'x-forwarded-proto': proto,
+  };
+  // Some clients also send Referer; forward it if present so CSRF
+  // double-checks are happy.
+  const referer = c.req.header('referer');
+  if (referer) headers.referer = referer;
+
   const proxied = new Request(url.toString(), {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      cookie: c.req.header('cookie') ?? '',
-    },
+    headers,
     body: JSON.stringify({ accept, consent_code: consentCode }),
   });
   const response = await auth.handler(proxied);
