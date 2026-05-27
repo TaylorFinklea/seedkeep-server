@@ -19,8 +19,8 @@
 //    in the herbarium voice.
 
 import { Hono } from 'hono';
-import { setCookie } from 'hono/cookie';
 import { z } from 'zod';
+import { serializeSignedCookie } from 'better-call';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
@@ -178,13 +178,27 @@ oauthRoutes.post('/oauth/pair', async (c) => {
       error: 'Could not establish a web session. Please try again.',
     }), 500);
   }
-  setCookie(c, 'better-auth.session_token', session.token, {
-    path: '/',
-    httpOnly: true,
-    secure: c.env.APP_ENV === 'production',
-    sameSite: 'Lax',
-    maxAge: 60 * 60 * 24 * 30,
-  });
+  // Better-auth expects the session cookie to be SIGNED (HMAC-SHA256
+  // against the BETTER_AUTH_SECRET). It also prepends `__Secure-` to
+  // the cookie name when the baseURL is HTTPS. Use better-call's
+  // `serializeSignedCookie` to match better-auth's format exactly —
+  // a plain hono setCookie produces an unsigned value that better-
+  // auth rejects, kicking the user back into the loginPage loop.
+  const isHttps = c.env.APP_ENV === 'production';
+  const cookieName = `${isHttps ? '__Secure-' : ''}better-auth.session_token`;
+  const cookieValue = await serializeSignedCookie(
+    cookieName,
+    session.token,
+    c.env.BETTER_AUTH_SECRET,
+    {
+      path: '/',
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: 'Lax',
+      maxAge: 60 * 60 * 24 * 30,
+    },
+  );
+  c.header('Set-Cookie', cookieValue);
 
   // If a real OAuth flow is in progress, replay the authorize request
   // with the original query string — better-auth picks up the now-valid
