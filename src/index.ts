@@ -19,6 +19,7 @@ import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
 import { assistantRoutes } from './routes/assistant';
 import { mcpRoutes } from './routes/mcp';
+import { oauthRoutes } from './routes/oauth';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -87,6 +88,12 @@ export function createApp(env: Env): Hono<AppEnv> {
   // mount the router twice at the root: it carries both paths inside.
   app.route('/api', mcpRoutes);
   app.route('/', mcpRoutes);
+
+  // OAuth 2.1 surface: well-known proxies + pairing-code bridge
+  // + login/consent HTML pages. Mounted at root + /api for the
+  // pairing-code endpoint.
+  app.route('/', oauthRoutes);
+  app.route('/api', oauthRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),

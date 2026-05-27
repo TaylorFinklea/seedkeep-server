@@ -138,36 +138,69 @@ mcpRoutes.all('/mcp', async (c) => {
   // Authenticate. Bearer token in the standard Authorization header.
   const authHeader = c.req.header('authorization') || c.req.header('Authorization');
   if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+    // RFC 9728 — point clients at our resource-metadata document so
+    // OAuth-aware MCP clients (claude.ai) can begin the OAuth dance.
+    const wwwAuth = `Bearer realm="seedkeep", resource_metadata="${new URL(c.req.raw.url).origin}/.well-known/oauth-protected-resource"`;
+    c.header('WWW-Authenticate', wwwAuth);
     return c.json({ ok: false, error: { code: 'unauthorized',
-      message: 'Missing or malformed Authorization header. Use: Authorization: Bearer mcp_...' } }, 401);
+      message: 'Missing Authorization header. Use Bearer with an MCP token or an OAuth access token.' } }, 401);
   }
   const token = authHeader.slice(7).trim();
 
-  // Token format: mcp_<id>.<secret>
-  const parts = token.split('.');
-  if (parts.length !== 2 || !parts[0].startsWith('mcp_')) {
-    return c.json({ ok: false, error: { code: 'unauthorized', message: 'Token format unrecognized' } }, 401);
-  }
-  const id = parts[0].slice(4);
-  const tokenHash = createHash('sha256').update(token).digest('hex');
+  // Resolve to a household_id either via our personal MCP-token format
+  // (mcp_<id>.<secret> against `mcp_tokens`) OR via a better-auth
+  // OAuth access token (looked up in `oauthAccessToken` and joined to
+  // the user's primary household via memberships).
+  let householdId: string | null = null;
 
-  const row = await dbGet<MCPTokenRow>(
-    sql,
-    `SELECT id, household_id, user_id, label, created_at, last_used_at, revoked_at
-       FROM mcp_tokens
-      WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
-      LIMIT 1`,
-    [id, tokenHash],
-  );
-  if (!row) {
-    return c.json({ ok: false, error: { code: 'unauthorized', message: 'Invalid or revoked token' } }, 401);
+  if (token.startsWith('mcp_')) {
+    const parts = token.split('.');
+    if (parts.length === 2) {
+      const id = parts[0].slice(4);
+      const tokenHash = createHash('sha256').update(token).digest('hex');
+      const row = await dbGet<MCPTokenRow>(
+        sql,
+        `SELECT id, household_id, user_id, label, created_at, last_used_at, revoked_at
+           FROM mcp_tokens
+          WHERE id = $1 AND token_hash = $2 AND revoked_at IS NULL
+          LIMIT 1`,
+        [id, tokenHash],
+      );
+      if (row) {
+        householdId = row.household_id;
+        void dbRun(sql, `UPDATE mcp_tokens SET last_used_at = $1 WHERE id = $2`, [Date.now(), id]);
+      }
+    }
+  } else {
+    // OAuth access token from better-auth's OIDC provider.
+    const oauth = await dbGet<{ userId: string; expiresAt: Date }>(
+      sql,
+      `SELECT "userId", "accessTokenExpiresAt" AS "expiresAt"
+         FROM "oauthAccessToken"
+        WHERE "accessToken" = $1 AND "accessTokenExpiresAt" > NOW()
+        LIMIT 1`,
+      [token],
+    );
+    if (oauth?.userId) {
+      const membership = await dbGet<{ household_id: string }>(
+        sql,
+        `SELECT household_id FROM memberships WHERE user_id = $1 LIMIT 1`,
+        [oauth.userId],
+      );
+      if (membership?.household_id) {
+        householdId = membership.household_id;
+      }
+    }
   }
 
-  // Touch last_used_at out-of-band so it doesn't block the request.
-  void dbRun(sql, `UPDATE mcp_tokens SET last_used_at = $1 WHERE id = $2`, [Date.now(), id]);
+  if (!householdId) {
+    const wwwAuth = `Bearer realm="seedkeep", error="invalid_token", resource_metadata="${new URL(c.req.raw.url).origin}/.well-known/oauth-protected-resource"`;
+    c.header('WWW-Authenticate', wwwAuth);
+    return c.json({ ok: false, error: { code: 'unauthorized', message: 'Invalid, expired, or revoked token' } }, 401);
+  }
 
   // Build a fresh MCP server scoped to this household.
-  const server = buildMcpServer({ sql, householdId: row.household_id });
+  const server = buildMcpServer({ sql, householdId });
 
   // Stateless streamable HTTP transport. New session per request, no
   // server-held connection state — fine for Claude Desktop's MCP
