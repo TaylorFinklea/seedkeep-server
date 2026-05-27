@@ -56,7 +56,10 @@ interface SeedPhotoRow {
 const createSchema = z.object({
   // Optional client-supplied ID lets the iOS client create rows offline
   // and push later without needing the server to round-trip an ID first.
-  id: z.string().min(1).max(40).optional(),
+  // The iOS app generates ids like `seed_local_<36-char-uuid>` (47 chars),
+  // so the cap is 80 to match the other tables' id columns + leave room
+  // for any future prefix changes.
+  id: z.string().min(1).max(80).optional(),
   catalog_id: z.string().nullish(),
   state: z.enum(STATES),
   packet_count: z.number().int().min(0).max(10_000).default(1),
