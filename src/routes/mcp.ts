@@ -25,6 +25,17 @@ import { buildMcpServer } from '../lib/assistant/mcpServer';
 
 export const mcpRoutes = new Hono<AppEnv>();
 
+/// Compute the public-facing origin behind Fly's TLS proxy. Fly
+/// rewrites the URL to internal HTTP, so `req.url` shows http://...
+/// — we sniff X-Forwarded-Proto + Host to reconstruct the
+/// client-visible https URL.
+function publicOrigin(req: Request): string {
+  const url = new URL(req.url);
+  const proto = req.headers.get('x-forwarded-proto') ?? url.protocol.replace(':', '');
+  const host = req.headers.get('host') ?? url.host;
+  return `${proto}://${host}`;
+}
+
 // ── Token CRUD ───────────────────────────────────────────────────────
 
 const tokenAuth = [requireAuth(), requireHousehold()] as const;
@@ -140,7 +151,7 @@ mcpRoutes.all('/mcp', async (c) => {
   if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
     // RFC 9728 — point clients at our resource-metadata document so
     // OAuth-aware MCP clients (claude.ai) can begin the OAuth dance.
-    const wwwAuth = `Bearer realm="seedkeep", resource_metadata="${new URL(c.req.raw.url).origin}/.well-known/oauth-protected-resource"`;
+    const wwwAuth = `Bearer realm="seedkeep", resource_metadata="${publicOrigin(c.req.raw)}/.well-known/oauth-protected-resource"`;
     c.header('WWW-Authenticate', wwwAuth);
     return c.json({ ok: false, error: { code: 'unauthorized',
       message: 'Missing Authorization header. Use Bearer with an MCP token or an OAuth access token.' } }, 401);
@@ -194,7 +205,7 @@ mcpRoutes.all('/mcp', async (c) => {
   }
 
   if (!householdId) {
-    const wwwAuth = `Bearer realm="seedkeep", error="invalid_token", resource_metadata="${new URL(c.req.raw.url).origin}/.well-known/oauth-protected-resource"`;
+    const wwwAuth = `Bearer realm="seedkeep", error="invalid_token", resource_metadata="${publicOrigin(c.req.raw)}/.well-known/oauth-protected-resource"`;
     c.header('WWW-Authenticate', wwwAuth);
     return c.json({ ok: false, error: { code: 'unauthorized', message: 'Invalid, expired, or revoked token' } }, 401);
   }
