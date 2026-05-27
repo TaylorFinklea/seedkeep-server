@@ -101,16 +101,34 @@ oauthRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
 // redirects here (we set this URL as loginPage). The user types the
 // pairing code from their iOS app; we exchange it for a real session
 // cookie and bounce them back into the OAuth flow.
+//
+// better-auth appends the original authorize query string when it
+// redirects, so we capture EVERYTHING on the GET (every search param)
+// and re-attach it to the authorize endpoint after a successful pair.
+// When the user lands on /oauth/pair standalone (no upstream flow),
+// the post-pair redirect goes to a friendly "you're paired" page.
+
+const AUTHORIZE_ENDPOINT = '/api/auth/mcp/authorize';
 
 oauthRoutes.get('/oauth/pair', async (c) => {
-  const returnTo = c.req.query('redirect') ?? '/oauth2/consent';
-  const error = c.req.query('error') ?? '';
-  return c.html(loginPageHTML({ returnTo, error }));
+  const url = new URL(c.req.raw.url);
+  const params = new URLSearchParams(url.search);
+  const error = params.get('error') ?? '';
+  params.delete('error');
+  // Detect whether an OAuth flow is actually in-progress. The
+  // presence of client_id is the canonical signal — better-auth
+  // always passes it when redirecting to loginPage.
+  const inOAuthFlow = params.has('client_id');
+  return c.html(loginPageHTML({
+    inOAuthFlow,
+    originalParams: params.toString(),
+    error,
+  }));
 });
 
 const PairBody = z.object({
   code: z.string().min(6).max(16),
-  redirect: z.string().optional(),
+  oauthParams: z.string().optional(),
 });
 
 oauthRoutes.post('/oauth/pair', async (c) => {
@@ -118,10 +136,17 @@ oauthRoutes.post('/oauth/pair', async (c) => {
   const formData = await c.req.formData();
   const parsed = PairBody.safeParse({
     code: String(formData.get('code') ?? '').toUpperCase(),
-    redirect: formData.get('redirect') ? String(formData.get('redirect')) : undefined,
+    oauthParams: formData.get('oauthParams') ? String(formData.get('oauthParams')) : undefined,
   });
+  const oauthParams = parsed.success ? (parsed.data.oauthParams ?? '') : '';
+  const inOAuthFlow = oauthParams.length > 0 && new URLSearchParams(oauthParams).has('client_id');
+
   if (!parsed.success) {
-    return c.html(loginPageHTML({ returnTo: '/oauth2/consent', error: 'Enter the 8-character code from your Seedkeep app.' }), 400);
+    return c.html(loginPageHTML({
+      inOAuthFlow,
+      originalParams: oauthParams,
+      error: 'Enter the 8-character code from your Seedkeep app.',
+    }), 400);
   }
   const now = Date.now();
   const row = await dbGet<{ code: string; user_id: string; household_id: string; expires_at: number; used_at: number | null }>(
@@ -132,34 +157,43 @@ oauthRoutes.post('/oauth/pair', async (c) => {
   );
   if (!row || row.used_at !== null || row.expires_at < now) {
     return c.html(loginPageHTML({
-      returnTo: parsed.data.redirect ?? '/oauth2/consent',
+      inOAuthFlow,
+      originalParams: oauthParams,
       error: row?.used_at ? 'That code has already been used. Generate a fresh one in the app.'
         : 'That code is expired or unrecognized. Generate a fresh one.',
     }), 400);
   }
   await dbRun(sql, `UPDATE web_pairing_codes SET used_at = $1 WHERE code = $2`, [now, parsed.data.code]);
 
-  // Mint a real better-auth session for the user via the internal
-  // adapter. Public API doesn't expose createSession directly; the
-  // internal adapter is what every plugin (magic-link, anonymous,
-  // phone-number) uses to do the same thing.
+  // Mint a real better-auth session via the internal adapter.
   const auth = getAuth(c.env);
   const internal = (auth as unknown as {
     $context: Promise<{ internalAdapter: { createSession: (userId: string, ctx?: unknown) => Promise<{ token: string; id: string; expiresAt: Date | string | number } | null> } }>;
   }).$context;
   const session = await (await internal).internalAdapter.createSession(row.user_id);
   if (!session) {
-    return c.html(loginPageHTML({ returnTo: parsed.data.redirect ?? '/oauth2/consent', error: 'Could not establish a web session. Please try again.' }), 500);
+    return c.html(loginPageHTML({
+      inOAuthFlow,
+      originalParams: oauthParams,
+      error: 'Could not establish a web session. Please try again.',
+    }), 500);
   }
   setCookie(c, 'better-auth.session_token', session.token, {
     path: '/',
     httpOnly: true,
     secure: c.env.APP_ENV === 'production',
     sameSite: 'Lax',
-    // Match better-auth's default expiresIn (30 days).
     maxAge: 60 * 60 * 24 * 30,
   });
-  return c.redirect(parsed.data.redirect ?? '/oauth2/consent', 302);
+
+  // If a real OAuth flow is in progress, replay the authorize request
+  // with the original query string — better-auth picks up the now-valid
+  // session cookie and proceeds to consent. Otherwise show a friendly
+  // success page.
+  if (inOAuthFlow) {
+    return c.redirect(`${AUTHORIZE_ENDPOINT}?${oauthParams}`, 302);
+  }
+  return c.html(pairSuccessHTML());
 });
 
 // ── /oauth/consent HTML page ────────────────────────────────────────
@@ -321,7 +355,14 @@ const HERBARIUM_STYLES = `
   }
 `;
 
-function loginPageHTML(opts: { returnTo: string; error: string }) {
+function loginPageHTML(opts: {
+  inOAuthFlow: boolean;
+  originalParams: string;
+  error: string;
+}) {
+  const subtitle = opts.inOAuthFlow
+    ? 'A client is asking to connect to your Seedkeep garden. Type the code your Seedkeep app shows under Settings → Sprout · the scribe → Connect Claude / MCP → Pair browser, then approve the request on the next screen.'
+    : 'Type the code your Seedkeep app shows under Settings → Sprout · the scribe → Connect Claude / MCP → Pair browser.';
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -332,13 +373,13 @@ function loginPageHTML(opts: { returnTo: string; error: string }) {
 </head>
 <body>
   <div class="page">
-    <div class="folio"><span>Seedkeep</span><em>authorize</em></div>
+    <div class="folio"><span>Seedkeep</span><em>${opts.inOAuthFlow ? 'authorize' : 'pair browser'}</em></div>
     <h1>Pair your browser</h1>
-    <p class="subtitle">To let a desktop or web client read your garden, type the code your Seedkeep app shows under Settings → Sprout · the scribe → Connect Claude / MCP → Pair browser.</p>
+    <p class="subtitle">${subtitle}</p>
     <hr class="rule">
     ${opts.error ? `<div class="error">${escapeHTML(opts.error)}</div>` : ''}
     <form method="POST" action="/oauth/pair">
-      <input type="hidden" name="redirect" value="${escapeAttr(opts.returnTo)}">
+      <input type="hidden" name="oauthParams" value="${escapeAttr(opts.originalParams)}">
       <label for="code">Pairing code</label>
       <input id="code" type="text" name="code" autocomplete="one-time-code" autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="16" required>
       <div class="actions">
@@ -346,6 +387,27 @@ function loginPageHTML(opts: { returnTo: string; error: string }) {
       </div>
     </form>
     <p class="help">The code is good for ten minutes and can only be used once. Generate a fresh one in the app if it expires.</p>
+  </div>
+</body>
+</html>`;
+}
+
+function pairSuccessHTML() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seedkeep · Paired</title>
+  <style>${HERBARIUM_STYLES}</style>
+</head>
+<body>
+  <div class="page">
+    <div class="folio"><span>Seedkeep</span><em>paired</em></div>
+    <h1>Browser paired</h1>
+    <p class="subtitle">This browser is now signed in to your Seedkeep account. To grant a Claude.ai or other MCP client access, start the connect flow there and you'll be returned here to approve.</p>
+    <hr class="rule">
+    <p class="help">If you were already mid-flow in another tab, head back to that tab to continue. You can close this window otherwise.</p>
   </div>
 </body>
 </html>`;
