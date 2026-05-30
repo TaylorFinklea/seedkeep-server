@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { getSql } from '../db/client';
-import { dbGet, dbAll, dbRun } from '../db/helpers';
+import { dbGet, dbAll, dbRun, isFkViolation } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { validateAtMostOneAttach } from '../lib/journal/validation';
@@ -204,18 +204,32 @@ journalRoutes.post('/', ...auth, async (c) => {
 
   const id = nanoid();
   const now = Date.now();
-  await dbRun(
-    sql,
-    `INSERT INTO journal_entries
-       (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
-        created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
-    [
-      id, householdId, occurredOn, body.body ?? '',
-      body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null,
-      now,
-    ],
-  );
+  try {
+    await dbRun(
+      sql,
+      `INSERT INTO journal_entries
+         (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
+          created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+      [
+        id, householdId, occurredOn, body.body ?? '',
+        body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null,
+        now,
+      ],
+    );
+  } catch (err) {
+    if (isFkViolation(err)) {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced seed, bed, or planting event does not exist on the server. Sync the parent records first, then retry this entry.',
+        },
+      }, 400);
+    }
+    throw err;
+  }
 
   const row = await dbGet<EntryRow>(
     sql,
@@ -262,12 +276,26 @@ journalRoutes.patch('/:id', ...auth, async (c) => {
   if ('planting_event_id' in body) { sets.push(`planting_event_id = $${p++}`); params.push(body.planting_event_id ?? null); }
 
   params.push(id, householdId);
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET ${sets.join(', ')}
-       WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-    params,
-  );
+  try {
+    await dbRun(
+      sql,
+      `UPDATE journal_entries SET ${sets.join(', ')}
+         WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
+      params,
+    );
+  } catch (err) {
+    if (isFkViolation(err)) {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced seed, bed, or planting event does not exist on the server. Sync the parent records first, then retry this update.',
+        },
+      }, 400);
+    }
+    throw err;
+  }
 
   const row = await dbGet<EntryRow>(
     sql,

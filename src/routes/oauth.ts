@@ -67,7 +67,17 @@ oauthRoutes.all('/oauth2/userinfo',  proxyToBetterAuth('/api/auth/oauth2/userinf
 oauthRoutes.post('/oauth2/consent', async (c) => {
   const auth = getAuth(c.env);
   const formData = await c.req.formData();
-  const accept = String(formData.get('accept') ?? 'false') === 'true';
+  // The consent form has a hidden `<input name="accept" value="true">`
+  // for backward compatibility plus two submit buttons that also use
+  // `name="accept"` so the value reflects which button was clicked.
+  // formData.getAll preserves DOM order — the button-supplied value
+  // is appended last, so the LAST occurrence is what the user actually
+  // clicked. Reading the first occurrence would always see the hidden
+  // input's "true" — making Cancel silently authorize.
+  const acceptValues = formData.getAll('accept').map(String);
+  const accept = acceptValues.length > 0
+    ? acceptValues[acceptValues.length - 1] === 'true'
+    : false;
   const consentCode = formData.get('consent_code')
     ? String(formData.get('consent_code'))
     : undefined;
@@ -530,10 +540,9 @@ function consentPageHTML(opts: { consentCode: string; clientId: string; scopes: 
     </ul>
     <form method="POST" action="/oauth2/consent">
       <input type="hidden" name="consent_code" value="${escapeAttr(opts.consentCode)}">
-      <input type="hidden" name="accept" value="true">
       <div class="actions">
-        <button type="submit" name="accept" value="false" formaction="/oauth2/consent" class="danger">Cancel</button>
-        <button type="submit" name="accept" value="true" formaction="/oauth2/consent" class="primary">Authorize</button>
+        <button type="submit" name="accept" value="false" class="danger">Cancel</button>
+        <button type="submit" name="accept" value="true" class="primary">Authorize</button>
       </div>
     </form>
     <p class="help">You can revoke this connection at any time from the Seedkeep app under Settings → Sprout · the scribe → Connect Claude / MCP.</p>

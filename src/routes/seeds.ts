@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbBatch, dbGet, dbRun } from '../db/helpers';
+import { dbAll, dbBatch, dbGet, dbRun, isFkViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 import type { Sql } from 'postgres';
@@ -240,24 +240,38 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
   const id = parsed.data.id ?? nanoid();
   const now = Date.now();
   const data = parsed.data;
-  await dbRun(
-    sql,
-    `INSERT INTO seeds (
-       id, household_id, catalog_id, state, packet_count,
-       location_id, year_packed, source, custom_name,
-       custom_variety, custom_company, notes,
-       created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-    [
-      id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
-      data.location_id ?? null, data.year_packed ?? null, data.source,
-      data.custom_name ?? null, data.custom_variety ?? null,
-      data.custom_company ?? null, data.notes ?? null,
-      now, now,
-    ],
-  );
-  if (data.tag_ids && data.tag_ids.length > 0) {
-    await setSeedTags(sql, id, householdId, data.tag_ids, now);
+  try {
+    await dbRun(
+      sql,
+      `INSERT INTO seeds (
+         id, household_id, catalog_id, state, packet_count,
+         location_id, year_packed, source, custom_name,
+         custom_variety, custom_company, notes,
+         created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [
+        id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
+        data.location_id ?? null, data.year_packed ?? null, data.source,
+        data.custom_name ?? null, data.custom_variety ?? null,
+        data.custom_company ?? null, data.notes ?? null,
+        now, now,
+      ],
+    );
+    if (data.tag_ids && data.tag_ids.length > 0) {
+      await setSeedTags(sql, id, householdId, data.tag_ids, now);
+    }
+  } catch (err) {
+    if (isFkViolation(err)) {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced catalog, location, or tag does not exist on the server. Sync the parent records first (Settings → Sync → Pending writes → Retry), then retry this seed.',
+        },
+      }, 400);
+    }
+    throw err;
   }
   return c.json({
     ok: true,
@@ -326,23 +340,37 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     updated_at: Date.now(),
   };
 
-  await dbRun(
-    sql,
-    `UPDATE seeds SET
-       catalog_id = $1, state = $2, packet_count = $3, location_id = $4,
-       year_packed = $5, source = $6, custom_name = $7, custom_variety = $8,
-       custom_company = $9, notes = $10, updated_at = $11
-     WHERE id = $12 AND household_id = $13`,
-    [
-      merged.catalog_id, merged.state, merged.packet_count, merged.location_id,
-      merged.year_packed, merged.source, merged.custom_name, merged.custom_variety,
-      merged.custom_company, merged.notes, merged.updated_at,
-      id, householdId,
-    ],
-  );
+  try {
+    await dbRun(
+      sql,
+      `UPDATE seeds SET
+         catalog_id = $1, state = $2, packet_count = $3, location_id = $4,
+         year_packed = $5, source = $6, custom_name = $7, custom_variety = $8,
+         custom_company = $9, notes = $10, updated_at = $11
+       WHERE id = $12 AND household_id = $13`,
+      [
+        merged.catalog_id, merged.state, merged.packet_count, merged.location_id,
+        merged.year_packed, merged.source, merged.custom_name, merged.custom_variety,
+        merged.custom_company, merged.notes, merged.updated_at,
+        id, householdId,
+      ],
+    );
 
-  if (data.tag_ids !== undefined) {
-    await setSeedTags(sql, id, householdId, data.tag_ids, merged.updated_at);
+    if (data.tag_ids !== undefined) {
+      await setSeedTags(sql, id, householdId, data.tag_ids, merged.updated_at);
+    }
+  } catch (err) {
+    if (isFkViolation(err)) {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced catalog, location, or tag does not exist on the server. Sync the parent records first, then retry this update.',
+        },
+      }, 400);
+    }
+    throw err;
   }
 
   // Re-read tag_ids to return the current set.

@@ -64,3 +64,16 @@ export async function dbBatch(
     }
   });
 }
+
+/**
+ * Detect a Postgres foreign-key violation. The iOS client routinely
+ * sends create requests whose payloads reference local-only ids whose
+ * own create writes haven't synced yet (or failed). A 500 with an HTML
+ * body causes the iOS sync engine to mark the write as decode_failed
+ * and dead-letter it; mapping these to a clean 400 with
+ * `code: 'invalid_reference'` lets the user retry the parent writes
+ * first.
+ */
+export function isFkViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23503';
+}

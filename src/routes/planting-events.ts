@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbGet, dbRun } from '../db/helpers';
+import { dbAll, dbGet, dbRun, isFkViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 
@@ -106,13 +106,7 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
       ],
     );
   } catch (err) {
-    // Postgres SQLSTATE 23503 = foreign_key_violation. The iOS client
-    // routinely sends bed_id / seed_id values that refer to local-only
-    // rows whose own create writes haven't synced yet (or failed). A
-    // 500 with an HTML body here causes the iOS sync engine to mark
-    // the write as decode_failed; a clean 400 lets it dead-letter
-    // cleanly so the user can retry the parent writes first.
-    if ((err as { code?: string }).code === '23503') {
+    if (isFkViolation(err)) {
       return c.json({
         ok: false,
         error: {
@@ -176,21 +170,35 @@ plantingEventRoutes.patch('/planting-events/:id', ...auth, async (c) => {
     y_feet: parsed.data.y_feet === undefined ? existing.y_feet : parsed.data.y_feet ?? null,
     updated_at: now,
   };
-  await dbRun(
-    sql,
-    `UPDATE planting_events SET
-       bed_id = $1, seed_id = $2, catalog_seed_id = $3,
-       kind = $4, planned_for = $5, completed_at = $6, notes = $7,
-       x_feet = $8, y_feet = $9,
-       updated_at = $10
-     WHERE id = $11`,
-    [
-      merged.bed_id, merged.seed_id, merged.catalog_seed_id,
-      merged.kind, merged.planned_for, merged.completed_at, merged.notes,
-      merged.x_feet, merged.y_feet,
-      now, id,
-    ],
-  );
+  try {
+    await dbRun(
+      sql,
+      `UPDATE planting_events SET
+         bed_id = $1, seed_id = $2, catalog_seed_id = $3,
+         kind = $4, planned_for = $5, completed_at = $6, notes = $7,
+         x_feet = $8, y_feet = $9,
+         updated_at = $10
+       WHERE id = $11`,
+      [
+        merged.bed_id, merged.seed_id, merged.catalog_seed_id,
+        merged.kind, merged.planned_for, merged.completed_at, merged.notes,
+        merged.x_feet, merged.y_feet,
+        now, id,
+      ],
+    );
+  } catch (err) {
+    if (isFkViolation(err)) {
+      return c.json({
+        ok: false,
+        error: {
+          code: 'invalid_reference',
+          message:
+            'A referenced bed, seed, or catalog row does not exist on the server. Sync the parent records first, then retry this update.',
+        },
+      }, 400);
+    }
+    throw err;
+  }
   return c.json({ ok: true, data: { planting_event: merged } });
 });
 
