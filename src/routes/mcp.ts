@@ -23,7 +23,12 @@ import { WebStandardStreamableHTTPServerTransport } from
   '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { buildMcpServer } from '../lib/assistant/mcpServer';
 
-export const mcpRoutes = new Hono<AppEnv>();
+// Two routers from one file — token CRUD lives under /api/mcp/tokens
+// while the MCP wire-protocol endpoint lives at /mcp at the root.
+// Splitting them avoids mounting one router at both `/` and `/api`,
+// which previously created four valid URL aliases per endpoint.
+export const mcpTokenRoutes = new Hono<AppEnv>();
+export const mcpTransportRoutes = new Hono<AppEnv>();
 
 /// Compute the public-facing origin behind Fly's TLS proxy. Fly
 /// rewrites the URL to internal HTTP, so `req.url` shows http://...
@@ -63,7 +68,7 @@ interface MCPTokenRow {
  * Tokens are namespaced `mcp_<id>.<secret>` so the server can short-
  * circuit the hash lookup by the id before verifying the secret.
  */
-mcpRoutes.post('/mcp/tokens', ...tokenAuth, async (c) => {
+mcpTokenRoutes.post('/mcp/tokens', ...tokenAuth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const userId = c.get('userId') as string;
@@ -98,7 +103,7 @@ mcpRoutes.post('/mcp/tokens', ...tokenAuth, async (c) => {
  * GET /api/mcp/tokens — list non-revoked tokens for this household.
  * The raw token value is never returned — only the metadata.
  */
-mcpRoutes.get('/mcp/tokens', ...tokenAuth, async (c) => {
+mcpTokenRoutes.get('/mcp/tokens', ...tokenAuth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const rows = await dbAll<MCPTokenRow>(
@@ -117,18 +122,26 @@ mcpRoutes.get('/mcp/tokens', ...tokenAuth, async (c) => {
  * rather than deleting so the audit trail survives. The MCP transport
  * checks `revoked_at IS NULL` before accepting a token.
  */
-mcpRoutes.delete('/mcp/tokens/:id', ...tokenAuth, async (c) => {
+mcpTokenRoutes.delete('/mcp/tokens/:id', ...tokenAuth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const id = c.req.param('id');
   const now = Date.now();
-  await dbRun(
+  const result = await dbRun(
     sql,
     `UPDATE mcp_tokens
         SET revoked_at = $1
       WHERE id = $2 AND household_id = $3 AND revoked_at IS NULL`,
     [now, id, householdId],
   );
+  // 0 rows means the id doesn't exist, belongs to another household,
+  // or was already revoked. Surface that as 404 instead of a fake
+  // success so the iOS UI can distinguish "really revoked" from
+  // "nothing to do".
+  if (result.meta.changes === 0) {
+    return c.json({ ok: false, error: { code: 'not_found',
+      message: 'Token not found or already revoked' } }, 404);
+  }
   return c.json({ ok: true, data: { id, revoked_at: now } });
 });
 
@@ -143,7 +156,7 @@ mcpRoutes.delete('/mcp/tokens/:id', ...tokenAuth, async (c) => {
  * Claude Desktop's MCP client opens a fresh streaming connection per
  * tool invocation cycle.
  */
-mcpRoutes.all('/mcp', async (c) => {
+mcpTransportRoutes.all('/mcp', async (c) => {
   const sql = getSql(c.env);
 
   // Authenticate. Bearer token in the standard Authorization header.

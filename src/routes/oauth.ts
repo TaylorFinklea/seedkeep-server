@@ -28,7 +28,14 @@ import { dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
 import { getAuth } from '../lib/auth';
 
-export const oauthRoutes = new Hono<AppEnv>();
+// Two routers from one file. The pairing-code mint endpoint is
+// iOS-facing and belongs under /api; everything else (OAuth flow
+// pages, .well-known metadata proxies, OAuth endpoint proxies) is
+// browser-facing and lives at the root. Splitting avoids the
+// previous double-mount pattern, which created two valid URL aliases
+// per endpoint.
+export const oauthPublicRoutes = new Hono<AppEnv>();
+export const oauthApiRoutes = new Hono<AppEnv>();
 
 // ── Well-known metadata proxies ──────────────────────────────────────
 // These rewrite to /api/auth/<same> and call better-auth's handler.
@@ -43,11 +50,11 @@ function proxyToBetterAuth(targetPath: string) {
   };
 }
 
-oauthRoutes.get('/.well-known/oauth-authorization-server',
+oauthPublicRoutes.get('/.well-known/oauth-authorization-server',
   proxyToBetterAuth('/api/auth/.well-known/oauth-authorization-server'));
-oauthRoutes.get('/.well-known/oauth-protected-resource',
+oauthPublicRoutes.get('/.well-known/oauth-protected-resource',
   proxyToBetterAuth('/api/auth/.well-known/oauth-protected-resource'));
-oauthRoutes.get('/.well-known/openid-configuration',
+oauthPublicRoutes.get('/.well-known/openid-configuration',
   proxyToBetterAuth('/api/auth/.well-known/openid-configuration'));
 
 // ── OAuth endpoint proxies ───────────────────────────────────────────
@@ -55,16 +62,18 @@ oauthRoutes.get('/.well-known/openid-configuration',
 // canonical paths the metadata document points to. We make those work
 // at root and at the better-auth basePath.
 
-oauthRoutes.all('/oauth2/authorize', proxyToBetterAuth('/api/auth/oauth2/authorize'));
-oauthRoutes.all('/oauth2/token',     proxyToBetterAuth('/api/auth/oauth2/token'));
-oauthRoutes.all('/oauth2/register',  proxyToBetterAuth('/api/auth/oauth2/register'));
-oauthRoutes.all('/oauth2/userinfo',  proxyToBetterAuth('/api/auth/oauth2/userinfo'));
+oauthPublicRoutes.all('/oauth2/authorize', proxyToBetterAuth('/api/auth/oauth2/authorize'));
+oauthPublicRoutes.all('/oauth2/token',     proxyToBetterAuth('/api/auth/oauth2/token'));
+oauthPublicRoutes.all('/oauth2/register',  proxyToBetterAuth('/api/auth/oauth2/register'));
+oauthPublicRoutes.all('/oauth2/userinfo',  proxyToBetterAuth('/api/auth/oauth2/userinfo'));
 
 /// POST /oauth2/consent — bridge from the HTML consent form to
 /// better-auth's JSON-only consent endpoint. Reads accept +
 /// consent_code from urlencoded form data, re-POSTs as JSON, and
 /// follows the returned redirectURI back to the OAuth client.
-oauthRoutes.post('/oauth2/consent', async (c) => {
+oauthPublicRoutes.post('/oauth2/consent', async (c) => {
+  c.header('Content-Security-Policy', "frame-ancestors 'none'");
+  c.header('X-Frame-Options', 'DENY');
   const auth = getAuth(c.env);
   const formData = await c.req.formData();
   // The consent form has a hidden `<input name="accept" value="true">`
@@ -143,7 +152,7 @@ function generatePairingCode(): string {
  * iOS-only. Returns a short code the user types into the browser to
  * authorize MCP. Code expires in 10 min; single-use.
  */
-oauthRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
+oauthPublicRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
   const sql = getSql(c.env);
   const userId = c.get('userId') as string;
   const householdId = c.get('householdId') as string;
@@ -160,6 +169,14 @@ oauthRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
       WHERE (used_at IS NOT NULL AND used_at < $1)
          OR expires_at < $1`,
     [now - 24 * 60 * 60 * 1000]);
+  // Also sweep better-auth's expired OAuth tokens — they accumulate
+  // forever otherwise. better-auth doesn't ship a janitor; we piggyback
+  // on this mint endpoint so the cleanup runs each time a user starts
+  // a new pairing. Refresh tokens whose refresh window is also past
+  // are unrecoverable and safe to drop.
+  await dbRun(sql,
+    `DELETE FROM "oauthAccessToken"
+      WHERE "refreshTokenExpiresAt" < NOW()`);
   await dbRun(
     sql,
     `INSERT INTO web_pairing_codes (code, user_id, household_id, expires_at)
@@ -184,7 +201,7 @@ oauthRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
 
 const AUTHORIZE_ENDPOINT = '/api/auth/mcp/authorize';
 
-oauthRoutes.get('/oauth/pair', async (c) => {
+oauthPublicRoutes.get('/oauth/pair', async (c) => {
   const url = new URL(c.req.raw.url);
   const params = new URLSearchParams(url.search);
   const error = params.get('error') ?? '';
@@ -193,6 +210,8 @@ oauthRoutes.get('/oauth/pair', async (c) => {
   // presence of client_id is the canonical signal — better-auth
   // always passes it when redirecting to loginPage.
   const inOAuthFlow = params.has('client_id');
+  c.header('Content-Security-Policy', "frame-ancestors 'none'");
+  c.header('X-Frame-Options', 'DENY');
   return c.html(loginPageHTML({
     inOAuthFlow,
     originalParams: params.toString(),
@@ -205,7 +224,9 @@ const PairBody = z.object({
   oauthParams: z.string().optional(),
 });
 
-oauthRoutes.post('/oauth/pair', async (c) => {
+oauthPublicRoutes.post('/oauth/pair', async (c) => {
+  c.header('Content-Security-Policy', "frame-ancestors 'none'");
+  c.header('X-Frame-Options', 'DENY');
   const sql = getSql(c.env);
   const formData = await c.req.formData();
   const parsed = PairBody.safeParse({
@@ -304,10 +325,15 @@ oauthRoutes.post('/oauth/pair', async (c) => {
 
 // ── /oauth/consent HTML page ────────────────────────────────────────
 
-oauthRoutes.get('/oauth/consent', async (c) => {
+oauthPublicRoutes.get('/oauth/consent', async (c) => {
   const consentCode = c.req.query('consent_code') ?? '';
   const clientId = c.req.query('client_id') ?? '(unknown client)';
   const scope = c.req.query('scope') ?? '';
+  // Block iframe embedding — a hostile site framing the consent page
+  // could trick a logged-in user into authorizing a malicious client
+  // via a one-click overlay (classic clickjacking).
+  c.header('Content-Security-Policy', "frame-ancestors 'none'");
+  c.header('X-Frame-Options', 'DENY');
   return c.html(consentPageHTML({ consentCode, clientId, scopes: scope.split(' ').filter(Boolean) }));
 });
 

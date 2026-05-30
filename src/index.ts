@@ -18,8 +18,8 @@ import { plantingEventRoutes } from './routes/planting-events';
 import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
 import { assistantRoutes } from './routes/assistant';
-import { mcpRoutes } from './routes/mcp';
-import { oauthRoutes } from './routes/oauth';
+import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
+import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -82,18 +82,18 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api/journal', journalRoutes);
   app.route('/api/assistant', assistantRoutes);
 
-  // MCP token-management routes live under /api/mcp/tokens; the bare
-  // /mcp endpoint inside the same router is the MCP wire protocol.
-  // Hono's `app.route('/api', ...)` would prefix every path — so we
-  // mount the router twice at the root: it carries both paths inside.
-  app.route('/api', mcpRoutes);
-  app.route('/', mcpRoutes);
+  // MCP surface — split into two routers so each mounts at exactly
+  // one path: token CRUD under /api, the wire-protocol endpoint at
+  // root (per RFC 9728 the resource URL is canonical there).
+  app.route('/api', mcpTokenRoutes);
+  app.route('/', mcpTransportRoutes);
 
-  // OAuth 2.1 surface: well-known proxies + pairing-code bridge
-  // + login/consent HTML pages. Mounted at root + /api for the
-  // pairing-code endpoint.
-  app.route('/', oauthRoutes);
-  app.route('/api', oauthRoutes);
+  // OAuth 2.1 surface — split for the same reason. Browser-facing
+  // pages + well-known metadata + endpoint proxies + pairing-code
+  // POST sit at root; the placeholder /api router stays here in case
+  // we add iOS-only OAuth endpoints later.
+  app.route('/', oauthPublicRoutes);
+  app.route('/api', oauthApiRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),
