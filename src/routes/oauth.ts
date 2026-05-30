@@ -148,7 +148,18 @@ oauthRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
   const userId = c.get('userId') as string;
   const householdId = c.get('householdId') as string;
   const code = generatePairingCode();
-  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const now = Date.now();
+  const expiresAt = now + 10 * 60 * 1000;
+  // Sweep stale rows opportunistically on each mint — keeps the table
+  // small without a separate cron. Both expired-unused and used-long-ago
+  // entries are removed; nothing in the OAuth flow relies on a
+  // pairing-code row's existence after the session it minted is
+  // established.
+  await dbRun(sql,
+    `DELETE FROM web_pairing_codes
+      WHERE (used_at IS NOT NULL AND used_at < $1)
+         OR expires_at < $1`,
+    [now - 24 * 60 * 60 * 1000]);
   await dbRun(
     sql,
     `INSERT INTO web_pairing_codes (code, user_id, household_id, expires_at)
@@ -212,28 +223,46 @@ oauthRoutes.post('/oauth/pair', async (c) => {
     }), 400);
   }
   const now = Date.now();
-  const row = await dbGet<{ code: string; user_id: string; household_id: string; expires_at: number; used_at: number | null }>(
+  // Single atomic UPDATE — the row is consumed and returned in one
+  // round trip, so two simultaneous POSTs with the same code can't
+  // both succeed. The WHERE clause subsumes the validity check
+  // (unused + unexpired) so we only need the failure branch when the
+  // RETURNING yields zero rows.
+  const consumed = await dbGet<{ user_id: string; household_id: string }>(
     sql,
-    `SELECT code, user_id, household_id, expires_at, used_at
-       FROM web_pairing_codes WHERE code = $1 LIMIT 1`,
-    [parsed.data.code],
+    `UPDATE web_pairing_codes
+        SET used_at = $1
+      WHERE code = $2
+        AND used_at IS NULL
+        AND expires_at > $1
+    RETURNING user_id, household_id`,
+    [now, parsed.data.code],
   );
-  if (!row || row.used_at !== null || row.expires_at < now) {
+  if (!consumed) {
     return c.html(loginPageHTML({
       inOAuthFlow,
       originalParams: oauthParams,
-      error: row?.used_at ? 'That code has already been used. Generate a fresh one in the app.'
-        : 'That code is expired or unrecognized. Generate a fresh one.',
+      error: 'That code is expired, already used, or unrecognized. Generate a fresh one in the app.',
     }), 400);
   }
-  await dbRun(sql, `UPDATE web_pairing_codes SET used_at = $1 WHERE code = $2`, [now, parsed.data.code]);
+
+  // Pin the household choice so the OAuth → /mcp path resolves to the
+  // same household iOS saw. better-auth's access-token schema doesn't
+  // carry household scope; this user-keyed pin closes the gap.
+  await dbRun(sql,
+    `INSERT INTO oauth_user_household (user_id, household_id, updated_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE
+       SET household_id = EXCLUDED.household_id,
+           updated_at   = EXCLUDED.updated_at`,
+    [consumed.user_id, consumed.household_id, now]);
 
   // Mint a real better-auth session via the internal adapter.
   const auth = getAuth(c.env);
   const internal = (auth as unknown as {
     $context: Promise<{ internalAdapter: { createSession: (userId: string, ctx?: unknown) => Promise<{ token: string; id: string; expiresAt: Date | string | number } | null> } }>;
   }).$context;
-  const session = await (await internal).internalAdapter.createSession(row.user_id);
+  const session = await (await internal).internalAdapter.createSession(consumed.user_id);
   if (!session) {
     return c.html(loginPageHTML({
       inOAuthFlow,

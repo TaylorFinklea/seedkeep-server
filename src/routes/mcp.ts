@@ -193,13 +193,36 @@ mcpRoutes.all('/mcp', async (c) => {
       [token],
     );
     if (oauth?.userId) {
-      const membership = await dbGet<{ household_id: string }>(
+      // Prefer the household the user pinned at pairing time — that's
+      // what they intended when they typed the code from iOS. Falls
+      // back to memberships with the SAME ordering as `requireHousehold`
+      // so OAuth-MCP and iOS-session pick the same household when no
+      // pin exists yet.
+      const pinned = await dbGet<{ household_id: string }>(
         sql,
-        `SELECT household_id FROM memberships WHERE user_id = $1 LIMIT 1`,
+        `SELECT ouh.household_id
+           FROM oauth_user_household ouh
+           JOIN memberships m
+             ON m.user_id = ouh.user_id
+            AND m.household_id = ouh.household_id
+          WHERE ouh.user_id = $1
+          LIMIT 1`,
         [oauth.userId],
       );
-      if (membership?.household_id) {
-        householdId = membership.household_id;
+      if (pinned?.household_id) {
+        householdId = pinned.household_id;
+      } else {
+        const membership = await dbGet<{ household_id: string }>(
+          sql,
+          `SELECT household_id FROM memberships
+            WHERE user_id = $1
+            ORDER BY joined_at DESC
+            LIMIT 1`,
+          [oauth.userId],
+        );
+        if (membership?.household_id) {
+          householdId = membership.household_id;
+        }
       }
     }
   }
