@@ -76,3 +76,33 @@ When a user converts to hosted tier, their submissions automatically route throu
 **Alternatives considered**: Real per-ZIP NOAA freeze/frost climatology (not readily available as a bulk join-able file); a third-party geocoding/climate API (rejected — breaks the self-hostable, no-proprietary-API-in-the-path constraint).
 
 **Rationale**: Zone-estimated frost dates are accurate to ~±1–2 weeks — good enough for a planting-*window* feature that already presents ranges, not exact days. Real NOAA data is a clean future upgrade: re-run the build script with a NOAA source, re-seed `zip_locations`; no schema or code change. The trade-off is documented so it isn't mistaken for authoritative data.
+
+## [2026-05-30] OAuth household pin lives in `oauth_user_household`, not better-auth schema
+
+**Context**: better-auth's `oauthAccessToken` row has only `userId` — no household scope. iOS captures the household at pairing-code mint time, but when claude.ai later hits `/mcp` we resolve household from `memberships`. For users with multiple memberships the chosen row diverges from what `requireHousehold` picks for iOS sessions, exposing a different household than the user expected.
+
+**Decision**: Migration 0016 adds a user-keyed `oauth_user_household(user_id PK, household_id, updated_at)` table. `/oauth/pair` UPSERTs the pin using the household captured by the pairing code. `/mcp` resolves household by preferring the pin (joined to memberships for validity), falling back to `ORDER BY joined_at DESC LIMIT 1` for parity with `requireHousehold`.
+
+**Alternatives considered**: Patch better-auth's `oauthAccessToken` row with an extra column (rejected — fights the library); store household in OAuth scope strings (rejected — scopes are user-visible and shouldn't carry per-user state); session-keyed pin (rejected — the access token doesn't carry session_token, so there's no path from access-token → session).
+
+**Rationale**: A separate user-keyed table outside better-auth's schema means library upgrades don't fight us. UPSERT semantics keep the pin in sync with the iOS-time choice on each repair, and `LIMIT 1 + ORDER BY joined_at DESC` fallback matches the existing iOS resolution rule so single-membership users see identical behavior across both paths.
+
+## [2026-05-30] Per-thread stream lock via column on `assistant_threads`
+
+**Context**: The streaming POST and the proposed-change confirmation POST both call Anthropic and persist assistant messages. The pre-existing pending-tool-call SELECT doesn't lock — two devices sending simultaneously could each pass the check and each spawn an orchestration, corrupting conversation history with overlapping placeholder rows.
+
+**Decision**: Migration 0017 adds `stream_lock_at BIGINT` to `assistant_threads`. `acquireStreamLock` runs `UPDATE … SET stream_lock_at = $now WHERE id = $1 AND (stream_lock_at IS NULL OR stream_lock_at < $stale) RETURNING id` — atomic UPDATE-with-conditional-WHERE returns nothing when another stream holds the lock. `releaseStreamLock` clears it in `streamSSE`'s `finally` block. Stale locks (>10 min) auto-release on the next acquire.
+
+**Alternatives considered**: Postgres advisory locks via `pg_try_advisory_lock` (rejected — session-scoped to a connection that pin-holding for ~minutes blocks the postgres.js pool); separate `assistant_thread_locks` table (rejected — heavier than needed, same semantics); UNIQUE-constraint on placeholder messages (rejected — placeholders are intentionally per-orchestration, not per-thread).
+
+**Rationale**: A column on the existing thread row is the lightest representation. The TTL handles crashes mid-stream without manual janitor work. The lock is opportunistic — if it's busy, the second client gets a clean 409 `stream_busy` and can retry, rather than corrupting state.
+
+## [2026-05-30] TOCTOU re-check in `executeProposedChange`
+
+**Context**: The proposed-change card shows the user "was → becomes" snapshot, captured at preview time. By the time the user clicks Confirm, another device or tool call could have mutated the row. Without a re-check, the user authorized one change but a different one happens.
+
+**Decision**: `executeProposedChange` takes an optional `storedWas` (extracted from `proposed_change_json.was` by the /confirm route). Before applying, a new `readCurrentWas` helper re-runs the same SELECT as `previewDestructive` and `wasMatches` does a shallow key-by-key comparison. Divergence returns `status='failed', code='stale_proposal'` — the user must cancel and re-ask so they see the current state.
+
+**Alternatives considered**: `SELECT … FOR UPDATE` around preview+apply (rejected — preview happens during streaming, holding a row lock for ~minutes); accept the race (rejected — destructive ops deserve the re-check); compare hashes of the full row (rejected — works but obscures which field changed; key-by-key is easier to debug).
+
+**Rationale**: The shallow compare is conservative (treats null/undefined as equal so JSON round-tripping doesn't trip the check) and only fires when the row genuinely changed. The error code is distinct so the iOS client can surface a "Refresh and ask Sprout again" UX rather than the generic execution_error string.

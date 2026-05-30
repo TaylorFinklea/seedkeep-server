@@ -8,6 +8,31 @@
 
 ## Last Session Summary
 
+**Date**: 2026-05-30 — Bug-sweep batch (server): 12 fixes across OAuth/Sprout/sync surfaces
+
+- Cross-repo bug sweep triggered after Phase 4 E shipped. Read OAuth + MCP + assistant + executor + tools + middleware + photos + journal + seeds + planting-events end-to-end against the actual code (no speculation); identified 7 critical/high + 10 medium-severity bugs across iOS + server.
+- **Commits (3, on `main`, NOT pushed yet pending session-end sweep)**:
+  - `92f9a16` oauth+sync: cancel-authorizes fix + FK violations as clean 400 across seeds/journal/planting
+  - `9034695` oauth: pin household choice from pairing code; atomic code consumption
+  - `264de10` sprout+sync: stream timeout/lock, TOCTOU + cascade delete, photo cap
+- **OAuth fixes**:
+  - **Consent Cancel-authorizes bug**: hidden `<input name="accept" value="true">` was winning DOM-order over the Cancel button. Cancel previously authorized. Fix uses `formData.getAll('accept').pop()` to read the actual button click, plus removed the redundant hidden input.
+  - **Atomic pairing-code consumption**: SELECT-then-UPDATE race replaced with single `UPDATE … WHERE used_at IS NULL AND expires_at > $1 RETURNING …`. Concurrent identical POSTs now collapse to a single winner.
+  - **OAuth → MCP household drift**: migration 0016 adds `oauth_user_household(user_id PK, household_id, updated_at)`; `/oauth/pair` UPSERTs the pin from the pairing code; `/mcp` resolves household by preferring the pin (joined to memberships for validity), falling back to `ORDER BY joined_at DESC` for parity with `requireHousehold`. Latent today (no multi-household users yet) but a correctness floor for when it ships.
+  - Opportunistic cleanup of expired/used `web_pairing_codes` rows on each mint.
+- **FK error handling (H1)**: postgres SQLSTATE 23503 was reaching Fly's HTML 500 page from `POST/PATCH /seeds`, `POST/PATCH /journal`, `PATCH /planting-events`. iOS sync engine then dead-lettered with `decode_failed`. New `isFkViolation` helper in `db/helpers.ts`; INSERT/UPDATE try-catch in all affected routes maps FK violations to a clean 400 + `code:'invalid_reference'` + user-actionable message.
+- **Sprout stream resilience**:
+  - 5-minute AbortSignal timeout on Anthropic /v1/messages (was hanging Fly workers).
+  - Migration 0017 adds `stream_lock_at` to `assistant_threads` + `acquireStreamLock`/`releaseStreamLock` helpers. Streaming POST and /confirm both acquire/release in streamSSE's finally. Stale lock auto-released after 10 min for crash recovery.
+  - Empty placeholder messages (`content_json='[]'`) cleaned up on stream error AND on natural empty completion. `loadConversationHistory` filters them defensively for any pre-existing orphans. Stripped misleading `void def` cosmetic comment.
+- **Update-tool gaps**: added `custom_variety`/`custom_company`/`source` to `UpdateSeedArgs` + apply path; `catalog_seed_id`/`completed_at`/`x_feet`/`y_feet` to `UpdatePlantingEventArgs`; `sort_order` to `UpdateBedArgs`. Previously Sprout couldn't propose changes to those fields.
+- **TOCTOU re-check**: `executeProposedChange` now takes `storedWas` (from `proposed_change_json.was`), re-reads the current row via `readCurrentWas`, and refuses with `stale_proposal` if the row changed between preview and confirm. /confirm route extracts and passes the storedWas.
+- **Cascade soft-delete**: delete_seed/delete_bed (both the assistant tool path AND the regular DELETE routes) now cascade-soft-delete child planting_events + journal_entries. delete_planting_event cascades to journal_entries.
+- **Photo upload cap**: 10 MB ceiling on photo bodies via Content-Length pre-check + post-read length check; returns 413. Applied to both `POST /seeds/:id/photos` and `POST /journal/:id/photos`.
+- Verified: `bun run typecheck` clean throughout; 114/117 unit tests pass (3 pre-existing infra-dependent failures need a local Postgres, unrelated).
+- **Migrations 0016 + 0017 NOT yet applied to prod** — next `fly deploy` triggers them via `release_command`. Both are pure CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS — safe re-runs.
+- Open: deploy to Fly, retest the dead-lettered writes from the previous session's screenshot (the seed/planting_event creates should now return clean 400 instead of opaque decode_failed). C2 needs a multi-membership account to truly verify.
+
 **Date**: 2026-05-25 (afternoon) — Phase 4 (Sprout) server foundation deployed (Fly v17)
 
 - Inline-executed the 11-task plan at `.docs/ai/plans/2026-05-25-phase-4-sprout-server.md` on worktree branch `phase-4-sprout-server`. Single persistent agent (no subagent dispatch) — applied the lesson from Phase 3.
