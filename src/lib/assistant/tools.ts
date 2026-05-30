@@ -104,9 +104,13 @@ const UpdatePlantingEventArgs = z.object({
   id: z.string(),
   bed_id: z.string().optional(),
   seed_id: z.string().nullable().optional(),
+  catalog_seed_id: z.string().nullable().optional(),
   kind: z.enum(['sowing', 'transplant', 'harvest']).optional(),
   planned_for: YYYY_MM_DD.optional(),
+  completed_at: z.number().int().nullable().optional(),
   notes: z.string().nullable().optional(),
+  x_feet: z.number().nullable().optional(),
+  y_feet: z.number().nullable().optional(),
 }).strict();
 
 const UpdateJournalEntryArgs = z.object({
@@ -121,10 +125,13 @@ const UpdateJournalEntryArgs = z.object({
 const UpdateSeedArgs = z.object({
   id: z.string(),
   custom_name: z.string().nullable().optional(),
+  custom_variety: z.string().nullable().optional(),
+  custom_company: z.string().nullable().optional(),
   state: z.enum(['active', 'wishlist', 'saved', 'archived']).optional(),
   packet_count: z.number().int().nullable().optional(),
   location_id: z.string().nullable().optional(),
   year_packed: z.number().int().nullable().optional(),
+  source: z.enum(['store', 'saved', 'gift', 'swap']).optional(),
   notes: z.string().nullable().optional(),
 }).strict();
 
@@ -133,6 +140,7 @@ const UpdateBedArgs = z.object({
   name: z.string().optional(),
   width_feet: z.number().nullable().optional(),
   length_feet: z.number().nullable().optional(),
+  sort_order: z.number().int().optional(),
 }).strict();
 
 const DeletePlantingEventArgs = z.object({ id: z.string() }).strict();

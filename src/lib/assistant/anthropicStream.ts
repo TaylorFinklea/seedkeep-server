@@ -91,33 +91,55 @@ export async function* streamAnthropic(
     ?? (process.env.MOCK_ANTHROPIC_URL && process.env.MOCK_ANTHROPIC_URL.trim())
     ?? ANTHROPIC_BASE;
 
-  const res = await fetch(`${base}/v1/messages`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': config.apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: config.model,
-      max_tokens: config.maxTokens ?? 4096,
-      system: config.system,
-      messages: config.messages,
-      tools: config.tools,
-      stream: true,
-    }),
-  });
+  // Hard cap on the request — if Anthropic hangs, we don't want the
+  // Fly machine stuck indefinitely. 5 min covers normal long
+  // completions with tool calls; anything past that the user retries.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': config.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        max_tokens: config.maxTokens ?? 4096,
+        system: config.system,
+        messages: config.messages,
+        tools: config.tools,
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if ((err as { name?: string }).name === 'AbortError') {
+      throw new Error('Anthropic stream timed out after 5 minutes — try a more direct prompt or retry.');
+    }
+    throw err;
+  }
 
   if (!res.ok) {
     let errText = '';
     try { errText = await res.text(); } catch { /* noop */ }
+    clearTimeout(timeoutId);
     throw new Error(`Anthropic stream returned ${res.status}: ${errText.slice(0, 400)}`);
   }
   if (!res.body) {
+    clearTimeout(timeoutId);
     throw new Error('Anthropic stream returned no body');
   }
 
-  yield* parseSSE(res.body);
+  try {
+    yield* parseSSE(res.body);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ── SSE parser ─────────────────────────────────────────────────────────────

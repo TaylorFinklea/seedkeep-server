@@ -9,7 +9,7 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
 import { decryptApiKey } from '../lib/assistant/keyEncryption';
-import { TOOL_REGISTRY, anthropicTools, type ToolName } from '../lib/assistant/tools';
+import { anthropicTools } from '../lib/assistant/tools';
 import { executeTool, executeProposedChange } from '../lib/assistant/executor';
 import { streamAnthropic, type AnthropicMessage, type AnthropicContentBlock } from '../lib/assistant/anthropicStream';
 import { buildSystemPrompt, type HouseholdSnapshot } from '../lib/assistant/prompt';
@@ -315,6 +315,37 @@ const StreamBody = z.object({
 
 const MAX_TURNS = 10;          // safety cap on tool-call iterations per send
 const DEFAULT_MODEL = 'claude-opus-4-7';
+const STREAM_LOCK_TTL_MS = 10 * 60 * 1000;  // stale locks auto-expire after 10 min
+
+/**
+ * Try to take the per-thread stream lock. Returns true if we hold it,
+ * false if another stream is already running. A stale lock (older than
+ * STREAM_LOCK_TTL_MS) is treated as released.
+ */
+async function acquireStreamLock(
+  sql: ReturnType<typeof getSql>,
+  threadId: string,
+): Promise<boolean> {
+  const now = Date.now();
+  const staleBefore = now - STREAM_LOCK_TTL_MS;
+  const got = await dbGet<{ id: string }>(sql,
+    `UPDATE assistant_threads
+        SET stream_lock_at = $1
+      WHERE id = $2
+        AND (stream_lock_at IS NULL OR stream_lock_at < $3)
+    RETURNING id`,
+    [now, threadId, staleBefore]);
+  return got !== null;
+}
+
+async function releaseStreamLock(
+  sql: ReturnType<typeof getSql>,
+  threadId: string,
+): Promise<void> {
+  await dbRun(sql,
+    `UPDATE assistant_threads SET stream_lock_at = NULL WHERE id = $1`,
+    [threadId]);
+}
 
 assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   const sql = getSql(c.env);
@@ -356,6 +387,17 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   if (pending) {
     return c.json({ ok: false, error: { code: 'awaiting_confirmation',
       message: 'A previous tool call is still awaiting user confirmation' } }, 409);
+  }
+
+  // Acquire a thread-level stream lock so two devices sending
+  // simultaneously can't both fan out an orchestration on the same
+  // thread (which would corrupt history). The lock is opportunistic:
+  // a UPSERT that fails when another stream is in-flight. The lock
+  // row gets cleared in streamSSE's finally block.
+  const lockAcquired = await acquireStreamLock(sql, threadId);
+  if (!lockAcquired) {
+    return c.json({ ok: false, error: { code: 'stream_busy',
+      message: 'Another stream is already in progress for this thread. Wait for it to finish or refresh.' } }, 409);
   }
 
   // Load the encrypted Anthropic key.
@@ -429,6 +471,8 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
       await stream.writeSSE({
         data: JSON.stringify({ type: 'error', code: 'orchestration_error', message }),
       });
+    } finally {
+      await releaseStreamLock(sql, threadId);
     }
   });
 });
@@ -512,9 +556,26 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
     c.env.ASSISTANT_KEY_MASTER,
   );
 
-  // Apply the deferred change.
+  // Lock the thread for the confirmation stream so simultaneous
+  // confirm-clicks from two devices don't both fan out.
+  const lockAcquired = await acquireStreamLock(sql, tc.thread_id);
+  if (!lockAcquired) {
+    return c.json({ ok: false, error: { code: 'stream_busy',
+      message: 'Another stream is already in progress for this thread.' } }, 409);
+  }
+
+  // Apply the deferred change. The stored proposed_change.was snapshot
+  // is the row at preview time; executeProposedChange re-reads the
+  // current row and refuses with stale_proposal if it changed.
   const args = JSON.parse(tc.args_json);
-  const applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId });
+  let storedWas: unknown;
+  try {
+    const proposed = tc.proposed_change_json ? JSON.parse(tc.proposed_change_json) : null;
+    storedWas = (proposed as { was?: unknown } | null)?.was;
+  } catch {
+    storedWas = undefined;
+  }
+  const applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId }, storedWas);
   const now = Date.now();
   await dbRun(sql,
     `UPDATE assistant_tool_calls
@@ -564,6 +625,8 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
       await stream.writeSSE({
         data: JSON.stringify({ type: 'error', code: 'orchestration_error', message }),
       });
+    } finally {
+      await releaseStreamLock(sql, tc.thread_id);
     }
   });
 });
@@ -604,7 +667,10 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
 
     // Insert a placeholder assistant_message row now so tool_calls inserted
     // during the stream can reference it via FK. We'll UPDATE it with the
-    // final content_json + model + usage at message_stop.
+    // final content_json + model + usage at message_stop. If the stream
+    // fails before any content arrives, we DELETE the row in the catch
+    // block below so loadConversationHistory doesn't feed an empty
+    // assistant turn back to Anthropic on the next send.
     const placeholderNow = Date.now();
     await dbRun(sql,
       `INSERT INTO assistant_messages
@@ -612,8 +678,10 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
        VALUES ($1, $2, 'assistant', '[]', $3)`,
       [assistantMessageId, threadId, placeholderNow]);
 
+    let streamThrew = false;
     const events = streamAnthropic({ apiKey, model, system, messages, tools });
 
+    try {
     for await (const ev of events) {
       switch (ev.type) {
         case 'message_start':
@@ -688,7 +756,6 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
               }),
             });
 
-            const def = TOOL_REGISTRY[pending.name as ToolName];
             const result = await executeTool(pending.name, parsedArgs, { sql, householdId });
             const now = Date.now();
 
@@ -728,12 +795,6 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
             });
             toolUsesPendingArgs.delete(ev.index);
             stoppedDueToTool = true;
-            // Note: confirmation flag is set in the tool registry; we're using
-            // `def.requires_confirmation` indirectly via executeTool returning
-            // 'proposed' status, which we already handled above. The `def`
-            // lookup here is intentionally unused — left as documentation
-            // that the registry drives executor behavior.
-            void def;
           }
           break;
         }
@@ -762,10 +823,38 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
 
       if (pausedForProposedChange) break;
     }
+    } catch (err) {
+      // streamAnthropic / Anthropic-side error mid-stream. If we
+      // accumulated nothing, drop the empty placeholder so it doesn't
+      // poison the next turn's conversation history. Re-throw so the
+      // outer handler still writes an SSE error event.
+      streamThrew = true;
+      if (accumulatedBlocks.length === 0) {
+        await dbRun(sql,
+          `DELETE FROM assistant_messages WHERE id = $1 AND content_json = '[]'`,
+          [assistantMessageId]);
+      } else {
+        // Otherwise persist what we have so the user can see the
+        // partial reply on their next refresh.
+        await persistAssistantMessage(sql, assistantMessageId, threadId,
+          accumulatedBlocks, model_used, usage);
+      }
+      throw err;
+    }
 
     // End of one Anthropic call. Persist the assistant message we just built.
-    await persistAssistantMessage(sql, assistantMessageId, threadId,
-      accumulatedBlocks, model_used, usage);
+    // If the stream came back empty AND no tool calls fired, drop the
+    // placeholder — Anthropic may emit message_start/stop with no content
+    // and we don't want a zero-byte assistant turn in history.
+    if (accumulatedBlocks.length === 0) {
+      await dbRun(sql,
+        `DELETE FROM assistant_messages WHERE id = $1 AND content_json = '[]'`,
+        [assistantMessageId]);
+    } else {
+      await persistAssistantMessage(sql, assistantMessageId, threadId,
+        accumulatedBlocks, model_used, usage);
+    }
+    void streamThrew;
 
     if (pausedForProposedChange) {
       // The stream was paused — iOS will call /confirm or /cancel.
@@ -878,9 +967,17 @@ async function loadConversationHistory(
   sql: ReturnType<typeof getSql>,
   threadId: string,
 ): Promise<AnthropicMessage[]> {
+  // Filter out empty placeholders — orchestration creates a row at
+  // message-start so tool_calls can reference it via FK, but if the
+  // Anthropic stream produces nothing (network drop, billing reject)
+  // the placeholder stays `[]` and Anthropic rejects malformed
+  // history. We delete them inline now, but old rows from before this
+  // landed are still in the table.
   const rows = await dbAll<{ role: string; content_json: string }>(sql,
     `SELECT role, content_json FROM assistant_messages
-      WHERE thread_id = $1 ORDER BY created_at ASC, id ASC`,
+      WHERE thread_id = $1
+        AND content_json <> '[]'
+      ORDER BY created_at ASC, id ASC`,
     [threadId]);
   return rows.map((r) => ({
     role: (r.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',

@@ -184,5 +184,15 @@ bedRoutes.delete('/beds/:id', ...auth, async (c) => {
   if (result.meta.changes === 0) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
   }
+  // Cascade soft-delete to children — planting_events + journal_entries
+  // scoped to this bed. iOS sees matching tombstones on the next pull.
+  await dbRun(sql,
+    `UPDATE planting_events SET deleted_at = $1, updated_at = $1
+       WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+    [now, id, householdId]);
+  await dbRun(sql,
+    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
+       WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+    [now, id, householdId]);
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

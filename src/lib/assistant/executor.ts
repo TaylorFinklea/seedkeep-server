@@ -59,15 +59,41 @@ export async function executeTool(
 /**
  * Apply a previously-proposed destructive change. Called by the /confirm
  * route once the user has approved the diff.
+ *
+ * Optional `storedWas` is the `was` snapshot captured at preview time.
+ * When provided, we re-read the current row before applying and compare
+ * — if the row has changed (another device wrote between preview and
+ * confirm), we refuse with `stale_proposal` so the user can re-review
+ * the now-stale diff instead of silently applying a different change
+ * than what they saw.
  */
 export async function executeProposedChange(
   name: string,
   rawArgs: unknown,
   ctx: ToolExecutionContext,
+  storedWas?: unknown,
 ): Promise<ToolExecutionResult> {
   const validated = validateToolArgs(name, rawArgs);
   if (!validated.ok) {
     return { status: 'failed', error: { code: 'invalid_args', message: validated.reason } };
+  }
+  if (storedWas != null) {
+    try {
+      const current = await readCurrentWas(name as ToolName, validated.args, ctx);
+      if (current !== null && !wasMatches(storedWas, current)) {
+        return {
+          status: 'failed',
+          error: {
+            code: 'stale_proposal',
+            message: 'The target row changed since this proposal was created. Cancel and ask again so you can review the current state.',
+          },
+        };
+      }
+    } catch {
+      // If we can't read the current `was` (e.g. row deleted between
+      // preview and confirm), fall through — applyDestructive will fail
+      // with a more specific error.
+    }
   }
   try {
     const result = await applyDestructive(name as ToolName, validated.args, ctx);
@@ -76,6 +102,79 @@ export async function executeProposedChange(
     const message = err instanceof Error ? err.message : String(err);
     return { status: 'failed', error: { code: 'execution_error', message } };
   }
+}
+
+/// Re-runs the same SELECT as `previewDestructive` so the caller can
+/// compare current state to what the user saw at proposal time.
+async function readCurrentWas(
+  name: ToolName,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext,
+): Promise<Record<string, unknown> | null> {
+  // For deletes the "was" comparison is whether the row still exists.
+  // For updates, we read the columns previewDestructive showed. For
+  // set_household_location, the user sees household state — re-read it.
+  const { sql, householdId } = ctx;
+  switch (name) {
+    case 'update_planting_event':
+    case 'delete_planting_event':
+      return (await dbGet(sql,
+        `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
+                completed_at, notes, x_feet, y_feet
+           FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
+        [args.id, householdId])) as Record<string, unknown> | null;
+    case 'update_journal_entry':
+    case 'delete_journal_entry':
+      return (await dbGet(sql,
+        `SELECT id, occurred_on::text AS occurred_on, body, seed_id, bed_id, planting_event_id
+           FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
+        [args.id, householdId])) as Record<string, unknown> | null;
+    case 'update_seed':
+    case 'delete_seed':
+      return (await dbGet(sql,
+        `SELECT id, custom_name, custom_variety, custom_company, state, packet_count,
+                year_packed, source, notes, location_id
+           FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
+        [args.id, householdId])) as Record<string, unknown> | null;
+    case 'update_bed':
+    case 'delete_bed':
+      return (await dbGet(sql,
+        `SELECT id, name, width_feet, length_feet, sort_order
+           FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
+        [args.id, householdId])) as Record<string, unknown> | null;
+    case 'set_household_location':
+      return (await dbGet(sql,
+        `SELECT home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, region_id
+           FROM households WHERE id = $1 LIMIT 1`,
+        [householdId])) as Record<string, unknown> | null;
+    default:
+      return null;
+  }
+}
+
+/// Field-by-field shallow comparison. Both inputs come from the same
+/// SELECT shape, so we only check the keys present in the stored
+/// snapshot. Treats null and undefined as equal so JSON round-tripping
+/// doesn't trip us up.
+function wasMatches(stored: unknown, current: Record<string, unknown>): boolean {
+  if (typeof stored !== 'object' || stored === null) return true;
+  const s = stored as Record<string, unknown>;
+  for (const key of Object.keys(s)) {
+    const a = s[key];
+    const b = current[key];
+    if (a == null && b == null) continue;
+    if (a == null || b == null) return false;
+    if (a instanceof Date || b instanceof Date) {
+      if (String(a) !== String(b)) return false;
+      continue;
+    }
+    if (typeof a === 'object' || typeof b === 'object') {
+      if (JSON.stringify(a) !== JSON.stringify(b)) return false;
+      continue;
+    }
+    if (a !== b) return false;
+  }
+  return true;
 }
 
 // ── Auto-execute handlers (reads + creates + checklist) ────────────────────
@@ -354,7 +453,7 @@ async function previewDestructive(
     case 'update_planting_event': {
       const was = await dbGet(sql,
         `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
-                notes, x_feet, y_feet
+                completed_at, notes, x_feet, y_feet
            FROM planting_events
           WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
         [args.id, householdId]);
@@ -381,7 +480,7 @@ async function previewDestructive(
     }
     case 'update_bed': {
       const was = await dbGet(sql,
-        `SELECT id, name, width_feet, length_feet
+        `SELECT id, name, width_feet, length_feet, sort_order
            FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
         [args.id, householdId]);
       if (!was) throw new Error(`bed not found: ${args.id}`);
@@ -440,7 +539,10 @@ async function applyDestructive(
       const sets: string[] = ['updated_at = $1'];
       const params: unknown[] = [now];
       let p = 2;
-      for (const key of ['bed_id', 'seed_id', 'kind', 'planned_for', 'notes', 'x_feet', 'y_feet']) {
+      for (const key of [
+        'bed_id', 'seed_id', 'catalog_seed_id', 'kind', 'planned_for',
+        'completed_at', 'notes', 'x_feet', 'y_feet',
+      ]) {
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
@@ -468,7 +570,11 @@ async function applyDestructive(
       const sets: string[] = ['updated_at = $1'];
       const params: unknown[] = [now];
       let p = 2;
-      for (const key of ['custom_name', 'state', 'packet_count', 'location_id', 'year_packed', 'notes']) {
+      for (const key of [
+        'custom_name', 'custom_variety', 'custom_company',
+        'state', 'packet_count', 'location_id', 'year_packed',
+        'source', 'notes',
+      ]) {
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
@@ -482,7 +588,7 @@ async function applyDestructive(
       const sets: string[] = ['updated_at = $1'];
       const params: unknown[] = [now];
       let p = 2;
-      for (const key of ['name', 'width_feet', 'length_feet']) {
+      for (const key of ['name', 'width_feet', 'length_feet', 'sort_order']) {
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
@@ -507,16 +613,38 @@ async function applyDestructive(
       return { deleted_id: args.id };
     }
     case 'delete_seed': {
+      // Cascade: child planting_events + journal_entries referencing
+      // this seed lose their parent. Soft-delete them too so iOS sees
+      // matching deletes on the next sync — otherwise child rows leak,
+      // pointing at a gone seed.
       await dbRun(sql,
         `UPDATE seeds SET deleted_at = $1, updated_at = $1
            WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
         [now, args.id, householdId]);
+      await dbRun(sql,
+        `UPDATE planting_events SET deleted_at = $1, updated_at = $1
+           WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+        [now, args.id, householdId]);
+      await dbRun(sql,
+        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
+           WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+        [now, args.id, householdId]);
       return { deleted_id: args.id };
     }
     case 'delete_bed': {
+      // Cascade: child planting_events + journal_entries scoped to
+      // this bed go with the bed.
       await dbRun(sql,
         `UPDATE beds SET deleted_at = $1, updated_at = $1
            WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+        [now, args.id, householdId]);
+      await dbRun(sql,
+        `UPDATE planting_events SET deleted_at = $1, updated_at = $1
+           WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+        [now, args.id, householdId]);
+      await dbRun(sql,
+        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
+           WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
         [now, args.id, householdId]);
       return { deleted_id: args.id };
     }

@@ -216,5 +216,10 @@ plantingEventRoutes.delete('/planting-events/:id', ...auth, async (c) => {
   if (result.meta.changes === 0) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
   }
+  // Cascade soft-delete to journal entries that point at this event.
+  await dbRun(sql,
+    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
+       WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
+    [now, id, householdId]);
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

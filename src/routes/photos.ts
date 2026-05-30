@@ -14,6 +14,10 @@ const auth = [requireAuth(), requireHousehold()] as const;
 const ALLOWED_ROLES = ['front', 'back', 'extra'] as const;
 type PhotoRole = typeof ALLOWED_ROLES[number];
 
+// 10 MB ceiling on photo uploads. Seed packets compress well under 1MB
+// after the iOS resize; this cap is the abuse-prevention guardrail.
+const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
+
 interface PhotoRow {
   id: string;
   seed_id: string;
@@ -60,9 +64,21 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'Unsupported Content-Type' } }, 400);
   }
 
+  // Cap before consuming the body — packets compress to under 1MB and
+  // we don't want a buggy or hostile client OOMing the Fly machine.
+  // The Content-Length header may lie, so we still cap after reading.
+  const declaredLength = Number(c.req.header('Content-Length') ?? '0');
+  if (declaredLength > MAX_PHOTO_BYTES) {
+    return c.json({ ok: false, error: { code: 'payload_too_large',
+      message: `Photo too large (${declaredLength} bytes). Max ${MAX_PHOTO_BYTES}.` } }, 413);
+  }
   const body = await c.req.arrayBuffer();
   if (body.byteLength === 0) {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'Empty body' } }, 400);
+  }
+  if (body.byteLength > MAX_PHOTO_BYTES) {
+    return c.json({ ok: false, error: { code: 'payload_too_large',
+      message: `Photo too large (${body.byteLength} bytes). Max ${MAX_PHOTO_BYTES}.` } }, 413);
   }
 
   const key = newPhotoKey({ householdId, scope: 'seeds', ownerId: seedId, role: roleParam });
