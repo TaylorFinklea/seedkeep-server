@@ -18,6 +18,7 @@ import { plantingEventRoutes } from './routes/planting-events';
 import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
 import { assistantRoutes } from './routes/assistant';
+import { petRoutes } from './routes/pets';
 import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
 import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
 
@@ -81,6 +82,7 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', recommendationRoutes);
   app.route('/api/journal', journalRoutes);
   app.route('/api/assistant', assistantRoutes);
+  app.route('/api', petRoutes);
 
   // MCP surface — split into two routers so each mounts at exactly
   // one path: token CRUD under /api, the wire-protocol endpoint at
