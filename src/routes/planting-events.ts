@@ -159,6 +159,30 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
     throw err;
   }
 
+  // Phase 5.1.0 — seed a default journal entry + "Watered" checklist item
+  // so the mood engine's thirst signal has something to query on a fresh
+  // pet. Mirrors the journal.ts POST shape exactly (INSERT into
+  // journal_entries with planned_for as occurred_on, then INSERT a
+  // single unchecked checklist item). The seeded entry's body is empty
+  // by convention — the checklist item is the payload.
+  const journalEntryId = nanoid();
+  const checklistItemId = nanoid();
+  await dbRun(
+    sql,
+    `INSERT INTO journal_entries
+       (id, household_id, occurred_on, body, planting_event_id,
+        created_at, updated_at)
+     VALUES ($1, $2, $3, '', $4, $5, $5)`,
+    [journalEntryId, householdId, parsed.data.planned_for, id, now],
+  );
+  await dbRun(
+    sql,
+    `INSERT INTO journal_checklist_items
+       (id, entry_id, text, completed, sort_order, updated_at)
+     VALUES ($1, $2, 'Watered', FALSE, 0, $3)`,
+    [checklistItemId, journalEntryId, now],
+  );
+
   // SELECT … RETURNING pattern via fresh GET; we already wrote the row,
   // so a follow-up SELECT is the cleanest way to mirror the legacy shape
   // exactly (planned_for to_char, x_feet/y_feet cast, etc.).
