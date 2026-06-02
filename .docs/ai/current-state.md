@@ -8,6 +8,16 @@
 
 ## Last Session Summary
 
+**Date**: 2026-06-02 — Diagnosed + reverted 404 trace; root cause was iOS-side URL encoding
+
+- User reported `not_found: Route not found` on Sync now (Phase 4 v1 install). Static analysis of all sync endpoint URLs showed every path the iOS client hits responds 401 (= registered) on prod — none were 404.
+- Added temporary `console.log` in `app.notFound` (index.ts) to capture method + URL; deployed (Fly v32); rearmed Monitor; user retapped Sync now.
+- **Capture**: `GET http://seedkeep-server.fly.dev/api/assistant/threads%3Fsince=0`. The `?` came in URL-percent-encoded as `%3F`, so Hono saw a literal path and notFound-handled it.
+- Root cause was in iOS `SeedkeepClient.assistantThreads()` (and latently in `deleteAssistantKey()`): both pre-baked their query string into the path via `URLComponents(string:).url!.absoluteString`, then called `getJSON`/`deleteJSON` which run `baseURL.appendingPathComponent(path)` — `appendingPathComponent` percent-encodes the `?`. Server side was correct throughout.
+- Fixed on iOS (commit `19fa668` in `seedkeep-ios`); shipped to TestFlight as build 34 (`b03353b`).
+- **Server reverted the log line** and redeployed (Fly v33). No source diff vs. v31 — instrumentation is gone.
+- **Operational lesson**: `fly deploy` packages the working tree, not git HEAD — the trace log line was applied + deployed without ever being committed. (Same gotcha that bit us during the L-tier rollout last session.)
+
 **Date**: 2026-05-30 — Bug-sweep batch (server): 12 fixes across OAuth/Sprout/sync surfaces
 
 - Cross-repo bug sweep triggered after Phase 4 E shipped. Read OAuth + MCP + assistant + executor + tools + middleware + photos + journal + seeds + planting-events end-to-end against the actual code (no speculation); identified 7 critical/high + 10 medium-severity bugs across iOS + server.
