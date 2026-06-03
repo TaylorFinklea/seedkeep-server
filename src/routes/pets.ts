@@ -24,12 +24,14 @@ import { z } from 'zod';
 import type { TransactionSql } from 'postgres';
 import type { AppEnv } from '../index';
 import { getSql } from '../db/client';
+import { dbAll } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { decryptApiKey } from '../lib/assistant/keyEncryption';
 import { buildDepartureNotePrompt, parseDepartureNoteResponse } from '../lib/pets/sprout';
 import { anthropicOneShot } from '../lib/pets/anthropicOneShot';
 import { BESTIARY, type PetRarity } from '../lib/pets/bestiary';
+import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
 
 export const petRoutes = new Hono<AppEnv>();
 
@@ -134,6 +136,42 @@ interface GoodbyePayload {
   fallback_attempts: number;
   last_attempt_at: number;
 }
+
+// ── GET /api/pets/departures ──────────────────────────────────────────────
+//
+// Delta-sync feed for Menagerie. Mirrors `journal.ts:GET /` exactly:
+// `parseDeltaQuery` reads `since`+`limit`, `buildDeltaPayload` produces the
+// `{ items, cursor, has_more }` envelope, and we hide tombstones when
+// `since=0` so first-pull clients don't materialize already-deleted rows.
+// Any non-zero `since` includes tombstones so the iOS sync engine can
+// cascade `LocalPetDeparture` deletes.
+//
+// Rows are returned in their raw snake_case shape (mirrors the POST
+// /depart response's `departure` field) so the iOS `PetDepartureDTO`
+// decoder reuses the same property names.
+petRoutes.get('/pets/departures', ...auth, async (c) => {
+  const sql = getSql(c.env);
+  const householdId = c.get('householdId');
+  const query = parseDeltaQuery(new URL(c.req.url).searchParams);
+
+  const wheres: string[] = ['household_id = $1', 'updated_at > $2'];
+  const params: unknown[] = [householdId, query.since];
+  if (query.since === 0) wheres.push('deleted_at IS NULL');
+  params.push(query.limit);
+
+  const rows = await dbAll<PetDepartureRow>(
+    sql,
+    `SELECT planting_event_id, household_id, goodbye_note, reason,
+            departed_at, created_at, updated_at, deleted_at
+       FROM pet_departures
+      WHERE ${wheres.join(' AND ')}
+      ORDER BY updated_at ASC
+      LIMIT $${params.length}`,
+    params,
+  );
+
+  return c.json({ ok: true, data: buildDeltaPayload(rows, query) });
+});
 
 // ── POST /api/pets/:planting_event_id/depart ──────────────────────────────
 
