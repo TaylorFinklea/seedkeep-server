@@ -64,6 +64,15 @@ const SearchCatalogArgs = z.object({
 
 const GetHouseholdLocationArgs = z.object({}).strict();
 
+const QueryPetArgs = z.object({
+  planting_event_id: z.string().optional(),
+  seed_id: z.string().optional(),
+  bed_id: z.string().optional(),
+  status: z.enum(['alive', 'departed', 'graduated', 'all']).default('all'),
+  rarity: z.enum(['common', 'uncommon', 'rare', 'legendary', 'mythical']).optional(),
+  limit: z.number().int().min(1).max(200).default(50),
+}).strict();
+
 // ── Write tools (auto-execute) ─────────────────────────────────────────────
 
 const CreatePlantingEventArgs = z.object({
@@ -162,6 +171,7 @@ export type ToolName =
   | 'list_journal_entries' | 'get_journal_entry'
   | 'get_recommendation' | 'search_catalog'
   | 'get_household_location'
+  | 'query_pet'
   // write (auto-execute)
   | 'create_planting_event' | 'create_journal_entry'
   | 'add_checklist_item' | 'toggle_checklist_item'
@@ -245,6 +255,12 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDef> = {
     name: 'get_household_location',
     description: 'Get the user\'s home ZIP, USDA hardiness zone, average frost dates, and region (state code).',
     schema: GetHouseholdLocationArgs,
+    requires_confirmation: false,
+  },
+  query_pet: {
+    name: 'query_pet',
+    description: 'Look up plant pets (Tomagachi-style companion creatures attached to planting events). Identity (name, rarity, creature_kind, vignette) is server-of-record and returned here. Detailed mood (thriving/content/quiet/wilted/departingImminent) is iOS-derived and present only when the iOS client preloaded it via client_pet_state; otherwise mood is null. Status (alive/departed/graduated) is always populated from server columns. Use for queries like "how\'s my basil\'s pet?" or "tell me about my menagerie".',
+    schema: QueryPetArgs,
     requires_confirmation: false,
   },
 

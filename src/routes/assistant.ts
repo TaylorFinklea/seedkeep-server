@@ -299,6 +299,14 @@ const ImageAttachment = z.object({
   data: z.string().min(1).max(4 * 1024 * 1024),
 });
 
+/// Phase 5.1.5 — per-turn hint of iOS-derived pet state. Keyed by
+/// `planting_event_id`. Optional + sparse; missing entries mean the
+/// query_pet tool will return null for `mood` + `age_stars`.
+const ClientPetStateEntrySchema = z.object({
+  mood: z.enum(['thriving', 'content', 'quiet', 'wilted', 'departingImminent']),
+  age_stars: z.number().int().min(0).max(5),
+});
+
 const StreamBody = z.object({
   text: z.string().min(1).max(8000),
   page_context: z.object({
@@ -311,6 +319,9 @@ const StreamBody = z.object({
   // "what should I plant in this corner?". Persisted in `content_json`
   // so resumed conversations retain the image.
   attachment: ImageAttachment.optional(),
+  // Phase 5.1.5 — iOS hint of derived pet state for visible plantings.
+  // Stashed on ToolExecutionContext; consumed by query_pet.
+  client_pet_state: z.record(z.string(), ClientPetStateEntrySchema).optional(),
 });
 
 const MAX_TURNS = 10;          // safety cap on tool-call iterations per send
@@ -465,6 +476,7 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
         apiKey, model: DEFAULT_MODEL, system: systemPrompt,
         messages: history, tools,
         stream,
+        clientPetState: parsed.data.client_pet_state,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -645,6 +657,10 @@ interface OrchestrateOptions {
   stream: {
     writeSSE: (msg: { data: string; event?: string }) => Promise<void>;
   };
+  /// Phase 5.1.5 — per-turn iOS-derived pet state. Forwarded to
+  /// `query_pet` via the ToolExecutionContext so the response can fill
+  /// `mood` + `age_stars`. Optional + sparse.
+  clientPetState?: Record<string, { mood: string; age_stars: number }>;
 }
 
 /**
@@ -653,7 +669,7 @@ interface OrchestrateOptions {
  * (no pending tool call) OR a proposed_change pauses the stream.
  */
 async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> {
-  const { sql, householdId, threadId, apiKey, model, system, tools, stream } = opts;
+  const { sql, householdId, threadId, apiKey, model, system, tools, stream, clientPetState } = opts;
   let messages = [...opts.messages];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -756,7 +772,13 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
               }),
             });
 
-            const result = await executeTool(pending.name, parsedArgs, { sql, householdId });
+            const result = await executeTool(pending.name, parsedArgs, {
+              sql,
+              householdId,
+              clientPetState: clientPetState as
+                Record<string, { mood: 'thriving' | 'content' | 'quiet' | 'wilted' | 'departingImminent'; age_stars: number }>
+                | undefined,
+            });
             const now = Date.now();
 
             if (result.status === 'proposed') {

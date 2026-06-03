@@ -13,9 +13,31 @@ import type { getSql } from '../../db/client';
 import { dbGet, dbAll, dbRun } from '../../db/helpers';
 import { validateToolArgs, TOOL_REGISTRY, type ToolName } from './tools';
 
+/// Safe JSON.parse for TEXT-stored JSON payloads (pet_personality,
+/// goodbye_note). Returns null on any error — these blobs are written by
+/// our own server code so corruption is unexpected, but the tool handler
+/// should still degrade gracefully.
+function safeParseJSON(raw: string | null): any {
+  if (!raw) return null;
+  try { return JSON.parse(raw); }
+  catch { return null; }
+}
+
+/// Per-turn hint from iOS for derived state the server can't compute on its
+/// own. Phase 5.1.5 adds `clientPetState`: when the iOS assistant turn is
+/// likely about pets, it sends each visible planting_event's current iOS-
+/// derived mood + age_stars so `query_pet` can return those alongside
+/// server-of-record identity. Optional; tools handle missing entries by
+/// returning null for those fields.
+export interface ClientPetStateEntry {
+  mood: 'thriving' | 'content' | 'quiet' | 'wilted' | 'departingImminent';
+  age_stars: number;
+}
+
 export interface ToolExecutionContext {
   sql: ReturnType<typeof getSql>;
   householdId: string;
+  clientPetState?: Record<string, ClientPetStateEntry>;
 }
 
 export interface ToolExecutionResult {
@@ -346,6 +368,93 @@ async function runAutoExecute(
            FROM households WHERE id = $1 LIMIT 1`,
         [householdId]);
       return { location: row ?? null };
+    }
+
+    case 'query_pet': {
+      // First multi-table tool handler — joins planting_events to
+      // pet_departures so we can compute `status` server-side. Aliases
+      // are required here (deviation from the single-table bare-column
+      // convention; flagged in the Sprout-integration spec section).
+      const conditions: string[] = ['pe.household_id = $1', 'pe.deleted_at IS NULL', 'pe.pet_seed IS NOT NULL'];
+      const params: unknown[] = [householdId];
+      if (args.planting_event_id) {
+        params.push(args.planting_event_id);
+        conditions.push(`pe.id = $${params.length}`);
+      }
+      if (args.seed_id) {
+        params.push(args.seed_id);
+        conditions.push(`pe.seed_id = $${params.length}`);
+      }
+      if (args.bed_id) {
+        params.push(args.bed_id);
+        conditions.push(`pe.bed_id = $${params.length}`);
+      }
+      if (args.rarity) {
+        params.push(args.rarity);
+        conditions.push(`pe.pet_rarity = $${params.length}`);
+      }
+      // Status filter using server-derivable lifecycle outcomes.
+      if (args.status === 'alive') {
+        conditions.push(`pe.completed_at IS NULL`);
+        conditions.push(`pd.planting_event_id IS NULL`);
+      } else if (args.status === 'departed') {
+        conditions.push(`pd.planting_event_id IS NOT NULL`);
+      } else if (args.status === 'graduated') {
+        conditions.push(`pe.completed_at IS NOT NULL`);
+        conditions.push(`pd.planting_event_id IS NULL`);
+      }
+      params.push(args.limit);
+      const rows = await dbAll<{
+        id: string;
+        pet_name: string | null;
+        pet_rarity: string | null;
+        pet_creature_kind: string | null;
+        pet_personality: string | null;
+        pet_spawned_at: string | null;
+        completed_at: string | null;
+        departed_at: string | null;
+        goodbye_note: string | null;
+      }>(sql,
+        `SELECT pe.id,
+                pe.pet_name, pe.pet_rarity, pe.pet_creature_kind, pe.pet_personality, pe.pet_spawned_at,
+                pe.completed_at,
+                pd.departed_at, pd.goodbye_note
+           FROM planting_events pe
+           LEFT JOIN pet_departures pd
+                  ON pd.planting_event_id = pe.id AND pd.deleted_at IS NULL
+          WHERE ${conditions.join(' AND ')}
+          ORDER BY pe.pet_spawned_at DESC NULLS LAST
+          LIMIT $${params.length}`,
+        params);
+
+      const pets = rows.map((row) => {
+        const personality = row.pet_personality
+          ? safeParseJSON(row.pet_personality) : null;
+        const goodbyeRaw = row.goodbye_note ? safeParseJSON(row.goodbye_note) : null;
+        const status: 'alive' | 'departed' | 'graduated' =
+          row.departed_at != null ? 'departed'
+            : row.completed_at != null ? 'graduated'
+            : 'alive';
+        const clientEntry = ctx.clientPetState?.[row.id];
+        return {
+          planting_event_id: row.id,
+          name: row.pet_name ?? personality?.name ?? null,
+          rarity: row.pet_rarity,
+          creature_kind: row.pet_creature_kind,
+          vignette: personality?.vignette ?? null,
+          age_stars: clientEntry?.age_stars ?? null,
+          mood: clientEntry?.mood ?? null,
+          status,
+          spawned_at: row.pet_spawned_at ? Number(row.pet_spawned_at) : null,
+          departed_at: row.departed_at ? Number(row.departed_at) : null,
+          completed_at: row.completed_at ? Number(row.completed_at) : null,
+          goodbye_note: goodbyeRaw
+            ? { note_text: goodbyeRaw.note_text, signoff: goodbyeRaw.signoff }
+            : null,
+        };
+      });
+
+      return { pets };
     }
 
     case 'create_planting_event': {
