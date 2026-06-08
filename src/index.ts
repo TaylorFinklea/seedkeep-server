@@ -17,6 +17,7 @@ import { bedRoutes } from './routes/beds';
 import { plantingEventRoutes } from './routes/planting-events';
 import { recommendationRoutes } from './routes/recommendations';
 import { journalRoutes } from './routes/journal';
+import { wateringStateRoutes } from './routes/watering-state';
 import { assistantRoutes } from './routes/assistant';
 import { petRoutes } from './routes/pets';
 import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
@@ -81,6 +82,7 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', plantingEventRoutes);
   app.route('/api', recommendationRoutes);
   app.route('/api/journal', journalRoutes);
+  app.route('/api', wateringStateRoutes);
   app.route('/api/assistant', assistantRoutes);
   app.route('/api', petRoutes);
 
