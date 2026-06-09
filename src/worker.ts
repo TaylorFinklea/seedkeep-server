@@ -1,6 +1,15 @@
-// Standalone worker process: drains recommendation_jobs by calling the
-// AI fallback for low-confidence planting windows. Run with `bun run worker`.
-// Deployed as a separate Fly process so the web process stays stateless.
+// Standalone worker process: drains two AI-backed job sources in a single
+// always-on Bun loop. Run with `bun run worker`. Deployed as a separate
+// Fly process so the web process stays stateless.
+//
+// Job sources, in order per tick:
+//   1. recommendation_jobs  — AI baseline for low-confidence planting windows.
+//   2. catalog_feedback     — Phase 4D moderation worker, drains structured
+//                             corrections for catalog_seeds.
+//
+// Each path is wrapped in its own try/catch; a throw in one cannot crash
+// the other tick. After processOneCorrection returns false (queue empty),
+// we sleep POLL_INTERVAL_MS before the next iteration.
 
 import { loadEnv } from './env';
 import { getSql, closeDb } from './db/client';
@@ -9,6 +18,7 @@ import type { Sql } from 'postgres';
 import { fetchAiBaseline } from './lib/recommendation/aiFallback';
 import type { AiBaseline } from './lib/recommendation/aiFallback';
 import type { HouseholdLocation } from './lib/recommendation/engine';
+import { processOne as processOneCorrection } from './lib/catalog/moderationWorker';
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_ATTEMPTS = 3;
@@ -153,7 +163,17 @@ async function main() {
     try {
       didWork = await processOne(env);
     } catch (err) {
-      console.error('[worker] poll error', err);
+      console.error('[worker] recommendation poll error', err);
+    }
+    // Phase 4D — catalog corrections piggyback. Independent try/catch:
+    // a throw here cannot mask or crash the recommendation path's tick.
+    if (!didWork) {
+      try {
+        const sql = getSql(env);
+        didWork = await processOneCorrection(env, sql);
+      } catch (err) {
+        console.error('[worker] corrections poll error', err);
+      }
     }
     if (!didWork) await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }

@@ -61,6 +61,7 @@ const TEST_ENV: Env = {
   ASSISTANT_KEY_MASTER: TEST_MASTER_KEY,
   DEFAULT_VISION_MODEL: 'claude-sonnet-4-6',
   DEFAULT_REVIEW_MODEL: 'claude-haiku-4-5-20251001',
+  ADMIN_SECRET: undefined,
 };
 
 const cleanup = {

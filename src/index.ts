@@ -22,6 +22,7 @@ import { assistantRoutes } from './routes/assistant';
 import { petRoutes } from './routes/pets';
 import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
 import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
+import { adminRoutes } from './routes/admin';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -98,6 +99,9 @@ export function createApp(env: Env): Hono<AppEnv> {
   // we add iOS-only OAuth endpoints later.
   app.route('/', oauthPublicRoutes);
   app.route('/api', oauthApiRoutes);
+
+  // Phase 4D · admin triage surface (env-secret header gated).
+  app.route('/', adminRoutes);
 
   app.notFound((c) =>
     c.json({ ok: false, error: { code: 'not_found', message: 'Route not found' } }, 404),

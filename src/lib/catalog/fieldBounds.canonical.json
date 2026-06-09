@@ -1,0 +1,68 @@
+{
+  "correctableFields": [
+    "common_name",
+    "company",
+    "days_to_germinate_max",
+    "days_to_germinate_min",
+    "days_to_maturity_max",
+    "days_to_maturity_min",
+    "frost_tolerance",
+    "hardiness_zone_max",
+    "hardiness_zone_min",
+    "instructions",
+    "life_cycle",
+    "plant_spacing_inches",
+    "row_spacing_inches",
+    "scientific_name",
+    "seed_depth_inches",
+    "soil_temp_max_f",
+    "soil_temp_min_f",
+    "sow_method",
+    "sun_requirement",
+    "variety",
+    "viability_years"
+  ],
+  "autoApplyFields": [
+    "days_to_germinate_max",
+    "days_to_germinate_min",
+    "days_to_maturity_max",
+    "days_to_maturity_min",
+    "frost_tolerance",
+    "hardiness_zone_max",
+    "hardiness_zone_min",
+    "life_cycle",
+    "plant_spacing_inches",
+    "row_spacing_inches",
+    "seed_depth_inches",
+    "soil_temp_max_f",
+    "soil_temp_min_f",
+    "sow_method",
+    "sun_requirement",
+    "viability_years"
+  ],
+  "sanityBounds": {
+    "days_to_germinate_max": { "min": 1, "max": 90 },
+    "days_to_germinate_min": { "min": 1, "max": 60 },
+    "days_to_maturity_max": { "min": 5, "max": 365 },
+    "days_to_maturity_min": { "min": 5, "max": 365 },
+    "hardiness_zone_max": { "min": 1, "max": 13 },
+    "hardiness_zone_min": { "min": 1, "max": 13 },
+    "plant_spacing_inches": { "min": 1, "max": 240 },
+    "row_spacing_inches": { "min": 1, "max": 240 },
+    "seed_depth_inches": { "min": 0.05, "max": 9.99 },
+    "soil_temp_max_f": { "min": 20, "max": 110 },
+    "soil_temp_min_f": { "min": 20, "max": 110 },
+    "viability_years": { "min": 1, "max": 20 }
+  },
+  "suspectThresholds": {
+    "plant_spacing_inches": 96,
+    "row_spacing_inches": 96,
+    "seed_depth_inches": 3
+  },
+  "enumValues": {
+    "frost_tolerance": ["tender", "half_hardy", "hardy"],
+    "life_cycle": ["annual", "biennial", "perennial"],
+    "sow_method": ["direct", "transplant", "either"],
+    "sun_requirement": ["full", "partial", "shade"]
+  }
+}

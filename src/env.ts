@@ -49,6 +49,10 @@ const schema = z.object({
   // Models
   DEFAULT_VISION_MODEL: z.string().default('claude-sonnet-4-6'),
   DEFAULT_REVIEW_MODEL: z.string().default('claude-haiku-4-5-20251001'),
+
+  // Phase 4D · admin surface secret. When unset, admin routes return 503
+  // not_configured — explicit fail-closed rather than silent open.
+  ADMIN_SECRET: z.string().optional().transform((v) => v?.trim() || undefined),
 });
 
 export type Env = z.infer<typeof schema>;

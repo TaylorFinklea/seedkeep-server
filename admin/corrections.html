@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Seedkeep · Catalog Correction Triage</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --bg: #1a1b26;
+      --bg-soft: #24283b;
+      --bg-elev: #2a2f45;
+      --ink: #c0caf5;
+      --ink-soft: #9aa5ce;
+      --ink-faint: #6e7593;
+      --accent: #7aa2f7;
+      --green: #9ece6a;
+      --rose: #f7768e;
+      --ochre: #e0af68;
+      --border: #414868;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.5;
+    }
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--bg-soft);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    header .pill {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 8px;
+      background: var(--bg-elev);
+      color: var(--ink-soft);
+    }
+    header .grow { flex: 1; }
+    header input[type="password"] {
+      background: var(--bg-elev);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      min-width: 240px;
+    }
+    header button {
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    header button:hover { filter: brightness(1.1); }
+    main {
+      padding: 16px 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    #status {
+      margin: 8px 0 16px;
+      color: var(--ink-faint);
+      font-size: 13px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg-soft);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    th {
+      background: var(--bg-elev);
+      color: var(--ink-soft);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: lowercase;
+      letter-spacing: 0.04em;
+    }
+    tr:last-child td { border-bottom: none; }
+    code {
+      font-family: 'SF Mono', Menlo, Monaco, Consolas, monospace;
+      background: var(--bg);
+      color: var(--ochre);
+      padding: 1px 4px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .field-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--ink-soft);
+      font-size: 11px;
+    }
+    .actions { white-space: nowrap; }
+    .actions button {
+      border: none;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 4px;
+    }
+    .actions button.approve { background: var(--green); color: var(--bg); }
+    .actions button.dismiss { background: var(--rose); color: var(--bg); }
+    .ai-notes {
+      font-style: italic;
+      color: var(--ink-faint);
+      font-size: 12px;
+      max-width: 320px;
+    }
+    .body-text {
+      font-size: 12px;
+      color: var(--ink-soft);
+      max-width: 280px;
+      white-space: pre-wrap;
+    }
+    .empty {
+      text-align: center;
+      padding: 40px;
+      color: var(--ink-faint);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Catalog Correction Triage</h1>
+    <span class="pill">phase 4d · status='reviewed'</span>
+    <span class="grow"></span>
+    <input id="secret" type="password" placeholder="X-Admin-Secret" autocomplete="off">
+    <button id="reload">reload</button>
+  </header>
+  <main>
+    <div id="status">Enter the admin secret and hit reload.</div>
+    <div id="table-wrap"></div>
+  </main>
+  <script>
+    'use strict';
+
+    const SECRET_KEY = 'seedkeep.admin.secret';
+    const secretInput = document.getElementById('secret');
+    const statusEl = document.getElementById('status');
+    const tableWrap = document.getElementById('table-wrap');
+    const reloadBtn = document.getElementById('reload');
+
+    secretInput.value = localStorage.getItem(SECRET_KEY) || '';
+    secretInput.addEventListener('change', () => {
+      localStorage.setItem(SECRET_KEY, secretInput.value);
+    });
+
+    function escapeHTML(s) {
+      if (s === null || s === undefined) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function fmtTime(ms) {
+      if (!ms) return '';
+      const d = new Date(Number(ms));
+      return d.toISOString().replace('T', ' ').slice(0, 16);
+    }
+
+    async function reload() {
+      const secret = secretInput.value.trim();
+      if (!secret) {
+        statusEl.textContent = 'Enter the admin secret first.';
+        tableWrap.innerHTML = '';
+        return;
+      }
+      statusEl.textContent = 'Loading…';
+      tableWrap.innerHTML = '';
+
+      let res;
+      try {
+        res = await fetch('/admin/corrections', {
+          headers: { 'X-Admin-Secret': secret },
+        });
+      } catch (err) {
+        statusEl.textContent = 'Network error: ' + err.message;
+        return;
+      }
+      if (!res.ok) {
+        statusEl.textContent = 'Failed: HTTP ' + res.status;
+        return;
+      }
+      const json = await res.json();
+      const items = (json && json.data && json.data.items) || [];
+      if (items.length === 0) {
+        tableWrap.innerHTML = '<div class="empty">no rows awaiting review · queue is clean</div>';
+        statusEl.textContent = 'Loaded 0 rows.';
+        return;
+      }
+
+      const rows = items.map((row) => {
+        const fieldDisplay = row.field_name
+          ? '<span class="field-pill">' + escapeHTML(row.field_name) + '</span>'
+          : '<span class="field-pill" style="color:var(--ink-faint)">uncategorized</span>';
+        const suggested = row.suggested_value ? '<code>' + escapeHTML(row.suggested_value) + '</code>' : '<span style="color:var(--ink-faint)">—</span>';
+        const clientSeen = row.client_seen_value ? '<code>' + escapeHTML(row.client_seen_value) + '</code>' : '';
+        const aiScore = row.ai_review_score !== null && row.ai_review_score !== undefined
+          ? row.ai_review_score.toFixed(2)
+          : '—';
+        const aiNotes = row.ai_notes ? '<div class="ai-notes">' + escapeHTML(row.ai_notes) + '</div>' : '';
+        const body = row.body ? '<div class="body-text">' + escapeHTML(row.body) + '</div>' : '';
+        const reason = row.dismissed_reason ? '<div style="color:var(--ink-faint);font-size:11px">' + escapeHTML(row.dismissed_reason) + '</div>' : '';
+        return (
+          '<tr data-id="' + escapeHTML(row.id) + '">' +
+          '<td>' + escapeHTML(row.catalog_seed_name || row.catalog_seed_id || '—') + '</td>' +
+          '<td>' + fieldDisplay + '</td>' +
+          '<td>' + suggested + (clientSeen ? '<div style="font-size:11px;color:var(--ink-faint)">was ' + clientSeen + '</div>' : '') + '</td>' +
+          '<td>' + aiScore + aiNotes + reason + '</td>' +
+          '<td>' + body + '</td>' +
+          '<td>' + fmtTime(row.updated_at || row.created_at) + '</td>' +
+          '<td class="actions">' +
+            '<button class="approve" data-action="approve">approve</button>' +
+            '<button class="dismiss" data-action="dismiss">dismiss</button>' +
+          '</td>' +
+          '</tr>'
+        );
+      });
+
+      tableWrap.innerHTML =
+        '<table><thead><tr>' +
+        '<th>catalog</th><th>field</th><th>suggested</th><th>ai</th><th>body</th><th>updated</th><th></th>' +
+        '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+      statusEl.textContent = 'Loaded ' + items.length + ' rows.';
+
+      tableWrap.querySelectorAll('button[data-action]').forEach((btn) => {
+        btn.addEventListener('click', async (ev) => {
+          const target = ev.currentTarget;
+          const tr = target.closest('tr');
+          const id = tr.dataset.id;
+          const action = target.dataset.action;
+          const secret = secretInput.value.trim();
+          if (!secret) {
+            alert('admin secret missing');
+            return;
+          }
+          const url = '/admin/corrections/' + encodeURIComponent(id) + '/' + action;
+          const init = {
+            method: 'POST',
+            headers: { 'X-Admin-Secret': secret, 'Content-Type': 'application/json' },
+          };
+          if (action === 'dismiss') {
+            const reason = prompt('reason for dismissal?', 'rejected_by_admin');
+            if (!reason) return;
+            init.body = JSON.stringify({ reason });
+          } else {
+            init.body = '{}';
+          }
+          const res = await fetch(url, init);
+          if (res.ok) {
+            tr.style.opacity = '0.4';
+            tr.querySelectorAll('button').forEach((b) => (b.disabled = true));
+          } else {
+            const text = await res.text();
+            alert('action failed: HTTP ' + res.status + '\n' + text);
+          }
+        });
+      });
+    }
+
+    reloadBtn.addEventListener('click', reload);
+    if (secretInput.value) {
+      reload();
+    }
+  </script>
+</body>
+</html>
