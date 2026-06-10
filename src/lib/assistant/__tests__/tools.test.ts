@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { TOOL_REGISTRY, validateToolArgs, anthropicTools, type ToolName } from '../tools';
 
 describe('TOOL_REGISTRY', () => {
-  it('has all expected tools (24 total)', () => {
+  it('has all expected tools (25 total)', () => {
     const names = Object.keys(TOOL_REGISTRY).sort();
-    expect(names.length).toBe(24);
+    expect(names.length).toBe(25);
   });
 
   it('every tool has a name, description, schema, and confirmation flag', () => {
@@ -41,14 +41,14 @@ describe('TOOL_REGISTRY', () => {
     }
   });
 
-  it('has 11 read auto, 4 write auto, 9 confirm-required', () => {
+  it('has 12 read auto, 4 write auto, 9 confirm-required', () => {
     const counts = { read: 0, writeAuto: 0, confirm: 0 };
     for (const def of Object.values(TOOL_REGISTRY)) {
       if (def.requires_confirmation) counts.confirm++;
       else if (def.name.startsWith('create_') || def.name.includes('_checklist_item')) counts.writeAuto++;
       else counts.read++;
     }
-    expect(counts).toEqual({ read: 11, writeAuto: 4, confirm: 9 });
+    expect(counts).toEqual({ read: 12, writeAuto: 4, confirm: 9 });
   });
 });
 

@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../index';
 import { getSql } from '../db/client';
-import { dbGet, dbRun } from '../db/helpers';
+import { dbGet } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 
