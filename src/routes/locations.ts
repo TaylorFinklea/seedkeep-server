@@ -163,5 +163,13 @@ locationRoutes.delete('/locations/:id', ...auth, async (c) => {
   if (result.meta.changes === 0) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Location not found' } }, 404);
   }
+  // Null out location_id on seeds that still reference this tombstoned location
+  // and bump their updated_at so delta-syncing clients pull the cleared field.
+  await dbRun(
+    sql,
+    `UPDATE seeds SET location_id = NULL, updated_at = $1
+       WHERE household_id = $2 AND location_id = $3 AND deleted_at IS NULL`,
+    [now, householdId, id],
+  );
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

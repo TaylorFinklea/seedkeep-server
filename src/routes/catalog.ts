@@ -611,9 +611,32 @@ catalogRoutes.get('/catalog/corrections/mine', ...mineAuth, async (c) => {
   const sinceParam = c.req.query('since');
   const sinceIdParam = c.req.query('since_id');
   const limitParam = c.req.query('limit');
-  const since = sinceParam ? Number(sinceParam) : 0;
+
+  // Validate numeric query params — Number('abc') / NaN would produce invalid
+  // SQL parameters and result in a 500. Return 400 for malformed values.
+  let since = 0;
+  if (sinceParam !== undefined && sinceParam !== '') {
+    const v = Number(sinceParam);
+    if (!Number.isFinite(v) || v < 0) {
+      return c.json(
+        { ok: false, error: { code: 'bad_request', message: 'since must be a non-negative integer (epoch ms)' } },
+        400,
+      );
+    }
+    since = Math.floor(v);
+  }
+  let limit = 50;
+  if (limitParam !== undefined && limitParam !== '') {
+    const v = Number(limitParam);
+    if (!Number.isInteger(v) || v < 1) {
+      return c.json(
+        { ok: false, error: { code: 'bad_request', message: 'limit must be a positive integer' } },
+        400,
+      );
+    }
+    limit = Math.min(50, v);
+  }
   const sinceId = sinceIdParam ? sinceIdParam : null;
-  const limit = Math.max(1, Math.min(50, limitParam ? Number(limitParam) : 50));
 
   // Composite cursor (contract decision 9): with `since_id`, rows tied at
   // the cursor millisecond resume from the id tiebreaker instead of being

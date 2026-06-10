@@ -12,6 +12,7 @@ import { extractFromPhotos, type ExtractionResult } from '../lib/extraction/anth
 import { reviewExtraction } from '../lib/extraction/review';
 import { decideCatalogStatus, type CatalogDecision } from '../lib/extraction/confidence';
 import { checkRateLimit } from '../lib/rateLimit';
+import { scrubText } from '../lib/catalog/sanitize';
 
 // 20 pre-extracted submissions per user per hour.
 const PRE_EXTRACTED_LIMIT = 20;
@@ -363,8 +364,10 @@ const preExtractedSchema = z.object({
   model_id: z.string().trim().min(1).max(100),
   barcode: z.string().trim().max(40).optional(),
   perceptual_hash: z.string().trim().max(80).optional(),
-  front_jpeg_b64: z.string().optional(),
-  back_jpeg_b64: z.string().optional(),
+  // 5 MB decoded ≈ 6.8 MB base64 (4/3 expansion). Cap the raw string here
+  // so a huge base64 payload is rejected before decoding.
+  front_jpeg_b64: z.string().max(7_000_000).optional(),
+  back_jpeg_b64: z.string().max(7_000_000).optional(),
 });
 
 extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
@@ -405,27 +408,85 @@ extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
   }
   const input = parsed.data;
 
+  // Scrub free-text fields before any storage — mirrors the catalog.ts POST gate.
+  const textsToScrub: [string, string][] = [
+    ['common_name', input.common_name ?? ''],
+    ['variety', input.variety ?? ''],
+    ['company', input.company ?? ''],
+    ['instructions', input.instructions ?? ''],
+  ];
+  for (const [field, text] of textsToScrub) {
+    if (text) {
+      const s = scrubText(text);
+      if (!s.ok) {
+        return c.json(
+          { ok: false, error: { code: 'bad_request', message: `${field} rejected: ${s.reason}` } },
+          400,
+        );
+      }
+    }
+  }
+
+  // Account-age gate: new accounts (< 7 days) can submit but never publish
+  // directly — their decisions are capped at 'pending' for human review.
+  const accountAgeDays = await fetchAccountAgeDays(sql, userId, Date.now());
+  const newAccountGate = accountAgeDays < 7;
+
+  // Per-user daily publish quota: max 5 catalog inserts per day per user.
+  // Mirrors the auto-apply daily quota in the correction worker.
+  const PRE_EXTRACTED_DAILY_PUBLISH_LIMIT = 5;
+  const oneDayAgo = Date.now() - 86_400_000;
+  const dailyPublishCount = await dbGet<{ n: number }>(
+    sql,
+    `SELECT count(*)::int AS n
+       FROM catalog_extractions
+      WHERE submitted_by_user = $1
+        AND catalog_seed_id IS NOT NULL
+        AND created_at >= $2`,
+    [userId, oneDayAgo],
+  );
+  const publishQuotaExhausted = (dailyPublishCount?.n ?? 0) >= PRE_EXTRACTED_DAILY_PUBLISH_LIMIT;
+
   const extractionId = nanoid();
   const now = Date.now();
 
   // Upload optional packet photos to S3. Photos let us re-extract / curate
   // the catalog later. Skipping them is allowed but not recommended.
+  //
+  // Validate decoded size + magic bytes before upload — the client claims
+  // 'image/jpeg' for the field name but the bytes are the ground truth.
   const photoKeys: string[] = [];
   if (input.front_jpeg_b64) {
     const front = decodeBase64(input.front_jpeg_b64);
-    if (front) {
-      const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'front' });
-      await putPhoto(c.env, key, front, 'image/jpeg');
-      photoKeys.push(key);
+    if (!front) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: 'front_jpeg_b64 is not valid base64' } }, 400);
     }
+    if (front.byteLength > MAX_PHOTO_BYTES) {
+      return c.json({ ok: false, error: { code: 'payload_too_large', message: `front photo too large (${front.byteLength} bytes). Max ${MAX_PHOTO_BYTES}.` } }, 413);
+    }
+    const mime = sniffImageMime(front);
+    if (!mime) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: 'front_jpeg_b64 is not a recognised image format (jpeg/png/heic)' } }, 400);
+    }
+    const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'front' });
+    await putPhoto(c.env, key, front, mime);
+    photoKeys.push(key);
   }
   if (input.back_jpeg_b64) {
     const back = decodeBase64(input.back_jpeg_b64);
-    if (back) {
-      const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'back' });
-      await putPhoto(c.env, key, back, 'image/jpeg');
-      photoKeys.push(key);
+    if (!back) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: 'back_jpeg_b64 is not valid base64' } }, 400);
     }
+    if (back.byteLength > MAX_PHOTO_BYTES) {
+      return c.json({ ok: false, error: { code: 'payload_too_large', message: `back photo too large (${back.byteLength} bytes). Max ${MAX_PHOTO_BYTES}.` } }, 413);
+    }
+    const mime = sniffImageMime(back);
+    if (!mime) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: 'back_jpeg_b64 is not a recognised image format (jpeg/png/heic)' } }, 400);
+    }
+    const key = newPhotoKey({ householdId, scope: 'extractions', ownerId: extractionId, role: 'back' });
+    await putPhoto(c.env, key, back, mime);
+    photoKeys.push(key);
   }
 
   // Build the extraction shape the rest of the pipeline expects.
@@ -460,11 +521,20 @@ extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
   // review score for the policy decision so the same `decideCatalogStatus`
   // gate applies. Future hardening: run a cheap reviewer pass for
   // submissions whose `self_confidence` is borderline.
-  const decision = decideCatalogStatus({
+  let decision = decideCatalogStatus({
     selfConfidence: input.self_confidence,
     reviewScore: input.self_confidence,
     extraction,
   });
+
+  // Abuse gate: cap publish status to 'pending' for new accounts and when
+  // the per-user daily publish quota is exhausted.
+  if (decision.status === 'published' && (newAccountGate || publishQuotaExhausted)) {
+    const gateReason = newAccountGate
+      ? 'account too new; queued for human review'
+      : 'daily publish quota exhausted; queued for human review';
+    decision = { status: 'pending', reason: gateReason };
+  }
 
   let catalogSeedId: string | null = null;
   if (decision.status !== 'rejected') {
@@ -525,6 +595,55 @@ function decodeBase64(b64: string): Uint8Array | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Sniff the MIME type from the first magic bytes of an image buffer.
+ * Returns 'image/jpeg', 'image/png', 'image/heic', or null (unknown).
+ *
+ * Used to enforce content-type on base64-submitted photos in the
+ * pre-extracted route — the client claims 'image/jpeg' but the bytes
+ * tell the truth.
+ */
+function sniffImageMime(bytes: Uint8Array): string | null {
+  // JPEG: FF D8 FF
+  if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+    return 'image/jpeg';
+  }
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+    bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A
+  ) {
+    return 'image/png';
+  }
+  // HEIC / HEIF: ftyp box at bytes 4–8
+  // Offset 4: 'f','t','y','p'; brand bytes 8–12 include 'heic','heix','mif1','hevc' etc.
+  if (bytes.length >= 12) {
+    const ftyp =
+      bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+    if (ftyp) {
+      const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+      if (['heic', 'heix', 'mif1', 'msf1', 'hevc', 'hevx'].includes(brand.toLowerCase())) {
+        return 'image/heic';
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchAccountAgeDays(sql: Sql, userId: string, now: number): Promise<number> {
+  const row = await dbGet<{ created_at_ms: number | null }>(
+    sql,
+    `SELECT (EXTRACT(EPOCH FROM "createdAt") * 1000)::BIGINT AS created_at_ms
+       FROM "user" WHERE id = $1 LIMIT 1`,
+    [userId],
+  );
+  const createdMs = row?.created_at_ms;
+  if (!createdMs) return 0;
+  const ageMs = now - Number(createdMs);
+  return Math.max(0, Math.floor(ageMs / 86_400_000));
 }
 
 /**

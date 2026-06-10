@@ -8,6 +8,7 @@ import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation } from '
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 import type { Sql } from 'postgres';
+import { deletePhoto } from '../lib/storage';
 
 export const seedRoutes = new Hono<AppEnv>();
 
@@ -463,5 +464,17 @@ seedRoutes.delete('/seeds/:id', ...auth, async (c) => {
     `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
        WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
     [now, id, householdId]);
+  // Delete S3 objects for all photos belonging to this seed, then delete
+  // the photo rows. Best-effort on S3 — row deletion still runs even if
+  // storage is unavailable to avoid leaving orphaned DB rows.
+  const photos = await dbAll<{ r2_key: string }>(
+    sql,
+    `SELECT r2_key FROM seed_photos WHERE seed_id = $1 AND household_id = $2`,
+    [id, householdId],
+  );
+  await Promise.allSettled(photos.map((p) => deletePhoto(c.env, p.r2_key)));
+  await dbRun(sql,
+    `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`,
+    [id, householdId]);
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

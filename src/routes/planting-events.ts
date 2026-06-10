@@ -14,7 +14,9 @@ export const plantingEventRoutes = new Hono<AppEnv>();
 
 const auth = [requireAuth(), requireHousehold()] as const;
 
-const KINDS = ['sowing', 'transplant', 'harvest', 'note'] as const;
+// 'note' was accepted by zod but the DB CHECK (migration 0011) rejects it,
+// causing a guaranteed 500. Dropped here so the server returns 400 instead.
+const KINDS = ['sowing', 'transplant', 'harvest'] as const;
 type PlantingEventKind = (typeof KINDS)[number];
 
 interface PlantingEventRow {

@@ -14,6 +14,11 @@ const app = createApp(env);
 const server = Bun.serve({
   port: env.PORT,
   fetch: app.fetch,
+  // 16 MB ceiling: large enough for a direct-bytes photo (iOS resizes to
+  // well under 10 MB) but well below the 256 MB Fly VM RAM. Without this
+  // Bun buffers up to its 128 MB default before the route handler sees
+  // the body, making the server trivially OOM-able.
+  maxRequestBodySize: 16 * 1024 * 1024,
 });
 
 console.log(`seedkeep-server listening on http://localhost:${server.port} (env=${env.APP_ENV})`);

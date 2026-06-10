@@ -153,5 +153,20 @@ tagRoutes.delete('/tags/:id', ...auth, async (c) => {
   if (result.meta.changes === 0) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Tag not found' } }, 404);
   }
+  // Remove join rows so seeds no longer surface the deleted tag_id in their
+  // tag_ids array.  Bump updated_at on affected seeds so delta-syncing clients
+  // re-pull them and drop the stale tag_id from local state.
+  await dbRun(
+    sql,
+    `UPDATE seeds SET updated_at = $1
+       WHERE household_id = $2
+         AND id IN (SELECT seed_id FROM seed_tags WHERE tag_id = $3 AND household_id = $2)`,
+    [now, householdId, id],
+  );
+  await dbRun(
+    sql,
+    `DELETE FROM seed_tags WHERE tag_id = $1 AND household_id = $2`,
+    [id, householdId],
+  );
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

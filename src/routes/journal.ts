@@ -252,12 +252,6 @@ journalRoutes.patch('/:id', ...auth, async (c) => {
   if (!body || typeof body !== 'object') {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'JSON body required' } }, 400);
   }
-  const v = validateAtMostOneAttach({
-    seed_id: body.seed_id, bed_id: body.bed_id, planting_event_id: body.planting_event_id,
-  });
-  if (!v.ok) {
-    return c.json({ ok: false, error: { code: 'bad_request', message: v.reason } }, 400);
-  }
   if ('occurred_on' in body && body.occurred_on != null) {
     if (typeof body.occurred_on !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.occurred_on)) {
       return c.json(
@@ -265,6 +259,28 @@ journalRoutes.patch('/:id', ...auth, async (c) => {
         400,
       );
     }
+  }
+
+  // Validate at-most-one-attach against the MERGED row state, not just the
+  // request payload — switching an attachment without nulling the other one
+  // would otherwise pass the payload check but hit the DB CHECK as a 500.
+  const existing = await dbGet<Pick<EntryRow, 'seed_id' | 'bed_id' | 'planting_event_id'>>(
+    sql,
+    `SELECT seed_id, bed_id, planting_event_id
+       FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
+    [id, householdId],
+  );
+  if (!existing) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  }
+  const mergedSeedId = 'seed_id' in body ? (body.seed_id ?? null) : existing.seed_id;
+  const mergedBedId = 'bed_id' in body ? (body.bed_id ?? null) : existing.bed_id;
+  const mergedEventId = 'planting_event_id' in body ? (body.planting_event_id ?? null) : existing.planting_event_id;
+  const v = validateAtMostOneAttach({
+    seed_id: mergedSeedId, bed_id: mergedBedId, planting_event_id: mergedEventId,
+  });
+  if (!v.ok) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: v.reason } }, 400);
   }
 
   const sets: string[] = ['updated_at = $1'];
