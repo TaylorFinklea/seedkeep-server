@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbBatch, dbGet, dbRun, isFkViolation } from '../db/helpers';
+import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 import type { Sql } from 'postgres';
@@ -81,14 +81,13 @@ const listFiltersSchema = z.object({
   tag_id: z.string().optional(),
 });
 
-async function setSeedTags(
-  sql: Sql,
+function seedTagStatements(
   seedId: string,
   householdId: string,
   tagIds: string[],
   now: number,
-): Promise<void> {
-  const statements: { sql: string; params: unknown[] }[] = [
+): { sql: string; params: unknown[] }[] {
+  return [
     {
       sql: `DELETE FROM seed_tags WHERE seed_id = $1 AND household_id = $2`,
       params: [seedId, householdId],
@@ -102,7 +101,16 @@ async function setSeedTags(
       params: [now, seedId, householdId],
     },
   ];
-  await dbBatch(sql, statements);
+}
+
+async function setSeedTags(
+  sql: Sql,
+  seedId: string,
+  householdId: string,
+  tagIds: string[],
+  now: number,
+): Promise<void> {
+  await dbBatch(sql, seedTagStatements(seedId, householdId, tagIds, now));
 }
 
 // SQL fragment: aggregates a seed's tag_ids into a Postgres TEXT[] (native
@@ -241,26 +249,56 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
   const now = Date.now();
   const data = parsed.data;
   try {
-    await dbRun(
-      sql,
-      `INSERT INTO seeds (
-         id, household_id, catalog_id, state, packet_count,
-         location_id, year_packed, source, custom_name,
-         custom_variety, custom_company, notes,
-         created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-      [
-        id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
-        data.location_id ?? null, data.year_packed ?? null, data.source,
-        data.custom_name ?? null, data.custom_variety ?? null,
-        data.custom_company ?? null, data.notes ?? null,
-        now, now,
-      ],
-    );
-    if (data.tag_ids && data.tag_ids.length > 0) {
-      await setSeedTags(sql, id, householdId, data.tag_ids, now);
-    }
+    // Seed INSERT + tag attachment run in ONE transaction. If a tag FK
+    // fails, the seed insert rolls back too — so the 'invalid_reference'
+    // retry advice below is actually safe to follow (the retry won't hit
+    // a duplicate-id violation from a half-committed first attempt).
+    await dbBatch(sql, [
+      {
+        sql: `INSERT INTO seeds (
+           id, household_id, catalog_id, state, packet_count,
+           location_id, year_packed, source, custom_name,
+           custom_variety, custom_company, notes,
+           created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        params: [
+          id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
+          data.location_id ?? null, data.year_packed ?? null, data.source,
+          data.custom_name ?? null, data.custom_variety ?? null,
+          data.custom_company ?? null, data.notes ?? null,
+          now, now,
+        ],
+      },
+      ...(data.tag_ids && data.tag_ids.length > 0
+        ? seedTagStatements(id, householdId, data.tag_ids, now)
+        : []),
+    ]);
   } catch (err) {
+    if (isUniqueViolation(err)) {
+      // Retry of a create that already committed (response lost on the
+      // wire). Replay the existing row as a success when it belongs to
+      // this household — same response shape as a fresh create.
+      const existing = await dbGet<SeedListRow>(
+        sql,
+        `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
+                s.location_id, s.year_packed, s.source, s.custom_name,
+                s.custom_variety, s.custom_company, s.notes,
+                s.created_at, s.updated_at, s.deleted_at,
+                ${TAG_IDS_AGG}
+           FROM seeds s
+          WHERE s.id = $1 AND s.household_id = $2
+          LIMIT 1`,
+        [id, householdId],
+      );
+      if (existing) {
+        const { tag_ids, ...rest } = existing;
+        return c.json({ ok: true, data: { seed: { ...rest, tag_ids: tag_ids ?? [] } } });
+      }
+      return c.json({
+        ok: false,
+        error: { code: 'conflict', message: 'A record with this id already exists.' },
+      }, 409);
+    }
     if (isFkViolation(err)) {
       return c.json({
         ok: false,

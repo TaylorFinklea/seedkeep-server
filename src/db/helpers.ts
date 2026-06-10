@@ -77,3 +77,13 @@ export async function dbBatch(
 export function isFkViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23503';
 }
+
+/**
+ * Detect a Postgres unique violation. The iOS sync engine retries create
+ * requests with the same client-supplied id when the response is lost
+ * after the server committed; create routes catch 23505 and replay the
+ * already-committed row as a success instead of bubbling a 500.
+ */
+export function isUniqueViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23505';
+}
