@@ -11,6 +11,8 @@
 
 import {
   AUTO_APPLY_FIELDS,
+  ENUM_VALUES,
+  SANITY_BOUNDS,
   validateFieldValue,
 } from './fieldBounds';
 
@@ -139,8 +141,10 @@ export function decideCorrectionOutcome(input: DecideInput): DecideOutput {
     };
   }
 
-  // Gate 6 — OCC match.
-  if ((input.clientSeenValue ?? '') !== (input.currentValue ?? '')) {
+  // Gate 6 — OCC match. Numeric fields compare numerically: Postgres
+  // renders NUMERIC(3,2) text as '0.50' while clients echo the JS-number
+  // form '0.5' — text equality would mislabel that as occ_conflict.
+  if (!occValuesMatch(input.fieldName, input.clientSeenValue, input.currentValue)) {
     return {
       action: 'queue_for_review',
       reason: 'occ_conflict',
@@ -203,4 +207,22 @@ export function decideCorrectionOutcome(input: DecideInput): DecideOutput {
     reason: 'auto_apply',
     normalizedValue: validated.normalized,
   };
+}
+
+function occValuesMatch(field: string, clientSeen: string | null, current: string | null): boolean {
+  const isNumeric = SANITY_BOUNDS[field] !== undefined && ENUM_VALUES[field] === undefined;
+  if (!isNumeric) {
+    return (clientSeen ?? '') === (current ?? '');
+  }
+  const seen = parseOccNumber(clientSeen);
+  const cur = parseOccNumber(current);
+  if (seen === null || cur === null) return seen === cur;
+  return Number.isFinite(seen) && Number.isFinite(cur) && seen === cur;
+}
+
+function parseOccNumber(raw: string | null): number | null {
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  return Number(trimmed);
 }

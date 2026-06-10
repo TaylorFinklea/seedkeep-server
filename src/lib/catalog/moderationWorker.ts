@@ -30,9 +30,17 @@ import type { AiReviewError, AiReviewResult, ReviewCorrectionArgs } from './aiRe
 import { decideCorrectionOutcome } from './correctionDecision';
 import type { DecideOutput, NeighborStats } from './correctionDecision';
 import { computeUserQuota, fetchUserQuotaStats } from './userQuota';
-import { AUTO_APPLY_FIELDS, ENUM_VALUES, SANITY_BOUNDS } from './fieldBounds';
+import { AUTO_APPLY_FIELDS, CORRECTABLE_FIELDS, ENUM_VALUES, SANITY_BOUNDS } from './fieldBounds';
 
 export const POLL_INTERVAL_MS = 5_000;
+
+/**
+ * Claim filter allowlist. field_name='other' (and any future
+ * non-column value the CHECK admits) must never be claimed: step 4
+ * interpolates the field into SQL against catalog_seeds columns.
+ * Server-controlled constants — safe to inline as literals.
+ */
+const CLAIMABLE_FIELDS_SQL = [...CORRECTABLE_FIELDS].map((f) => `'${f}'`).join(', ');
 export const MAX_ATTEMPTS = 5;
 export const BACKOFF_MS = [60_000, 300_000, 1_800_000] as const;
 export const REAPER_TIMEOUT_MS = 10 * 60_000;
@@ -191,9 +199,10 @@ function stringifyForOcc(v: string | number | null): string | null {
 }
 
 /**
- * Apply the decision in ONE transaction. Both UPDATE statements include
- * `WHERE ai_locked_at IS NOT NULL` guards so a zombie worker's late
- * apply UPDATE affects 0 rows.
+ * Apply the decision in ONE transaction. Every catalog_feedback UPDATE
+ * includes `WHERE status = 'open' AND ai_locked_at IS NOT NULL` guards:
+ * a zombie worker's late apply, or a row the user withdrew mid-claim,
+ * affects 0 rows and the path aborts cleanly.
  */
 export async function applyCorrectionOutcome(
   sql: Sql,
@@ -209,7 +218,16 @@ export async function applyCorrectionOutcome(
       if (normalized === undefined) {
         throw new Error('auto_apply outcome missing normalizedValue');
       }
-      const occ = stringifyForOcc(row.client_seen_value as string | number | null);
+      let occ = stringifyForOcc(row.client_seen_value as string | number | null);
+      // Numeric/integer columns compare numerically so Postgres's
+      // scale-padded text rendering ('0.50') matches the client's
+      // JS-number form ('0.5'). Text/enum columns keep text equality.
+      const occClause = colType === 'text'
+        ? `CAST(${row.field_name} AS TEXT) IS NOT DISTINCT FROM $4`
+        : `${row.field_name} IS NOT DISTINCT FROM $4::numeric`;
+      if (colType !== 'text' && occ !== null && occ.trim() === '') {
+        occ = null;
+      }
 
       // Fetch current value to write to audit log.
       const cur = await tx.unsafe<{ old_value: string | null }[]>(
@@ -223,7 +241,7 @@ export async function applyCorrectionOutcome(
         `UPDATE catalog_seeds
             SET ${row.field_name} = $2::${colType}, updated_at = $3
           WHERE id = $1
-            AND CAST(${row.field_name} AS TEXT) IS NOT DISTINCT FROM $4
+            AND ${occClause}
             AND status = 'published'`,
         [row.catalog_seed_id, normalized, now, occ],
       );
@@ -256,7 +274,7 @@ export async function applyCorrectionOutcome(
         `UPDATE catalog_feedback
             SET status = 'applied', applied_at = $2, reviewed_at = $2,
                 updated_at = $2, ai_locked_at = NULL
-          WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+          WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
         [row.id, now],
       );
       if (Number((feedbackResult as { count?: number }).count ?? 0) === 0) {
@@ -272,7 +290,7 @@ export async function applyCorrectionOutcome(
       `UPDATE catalog_feedback
           SET status = 'dismissed', dismissed_reason = $2, reviewed_at = $3,
               updated_at = $3, ai_locked_at = NULL
-        WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+        WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
       [row.id, outcome.reason, now],
     );
     return;
@@ -284,7 +302,7 @@ export async function applyCorrectionOutcome(
     `UPDATE catalog_feedback
         SET status = 'reviewed', dismissed_reason = $2, reviewed_at = $3,
             updated_at = $3, ai_locked_at = NULL
-      WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+      WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
     [row.id, outcome.reason, now],
   );
 }
@@ -301,7 +319,12 @@ class ZombieGuardError extends Error {
  * AI failures land in the row's `ai_last_error` field, never as throws.
  */
 export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}): Promise<boolean> {
-  const now = deps.now ? deps.now() : Date.now();
+  // Tick-start `now` drives the claim filter + guard windows. Every
+  // terminal write stamps a FRESH `nowFn()` instead — the delta feed is
+  // a strict `updated_at > since` cursor, and a write backdated to
+  // tick-start can land behind a cursor that already advanced past it.
+  const nowFn = deps.now ?? Date.now;
+  const now = nowFn();
 
   // Step 1 — daily sweep gate (best-effort, swallow errors so a sweep
   // failure can't crash the tick).
@@ -328,7 +351,7 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
              user_acknowledged_bounds, idempotency_key
         FROM catalog_feedback
        WHERE status = 'open'
-         AND field_name IS NOT NULL
+         AND field_name IN (${CLAIMABLE_FIELDS_SQL})
          AND ai_locked_at IS NULL
          AND (ai_next_attempt_at IS NULL OR ai_next_attempt_at <= $1)
        ORDER BY COALESCE(ai_next_attempt_at, created_at)
@@ -365,8 +388,8 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
       `UPDATE catalog_feedback
           SET status = 'dismissed', dismissed_reason = 'catalog_entry_unavailable',
               reviewed_at = $2, updated_at = $2, ai_locked_at = NULL
-        WHERE id = $1 AND ai_locked_at IS NOT NULL`,
-      [claimed.id, now],
+        WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
+      [claimed.id, nowFn()],
     );
     return true;
   }
@@ -382,21 +405,22 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
   if (differing) {
     hasConflict = true;
     // Cross-link and mark both as reviewed with concurrent_conflict.
+    const conflictNow = nowFn();
     await sql.begin(async (tx) => {
       await tx.unsafe(
         `UPDATE catalog_feedback
             SET status = 'reviewed', dismissed_reason = 'concurrent_conflict',
                 conflict_with_id = $2, reviewed_at = $3, updated_at = $3,
                 ai_locked_at = NULL
-          WHERE id = $1 AND ai_locked_at IS NOT NULL`,
-        [claimed.id, differing.id, now],
+          WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
+        [claimed.id, differing.id, conflictNow],
       );
       await tx.unsafe(
         `UPDATE catalog_feedback
             SET status = 'reviewed', dismissed_reason = 'concurrent_conflict',
                 conflict_with_id = $2, reviewed_at = $3, updated_at = $3
-          WHERE id = $1`,
-        [differing.id, claimed.id, now],
+          WHERE id = $1 AND status = 'open'`,
+        [differing.id, claimed.id, conflictNow],
       );
     });
     return true;
@@ -417,8 +441,8 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
       `UPDATE catalog_feedback
           SET status = 'reviewed', dismissed_reason = 'recent_change',
               reviewed_at = $2, updated_at = $2, ai_locked_at = NULL
-        WHERE id = $1 AND ai_locked_at IS NOT NULL`,
-      [claimed.id, now],
+        WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
+      [claimed.id, nowFn()],
     );
     return true;
   }
@@ -442,8 +466,8 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
       `UPDATE catalog_feedback
           SET status = 'reviewed', dismissed_reason = 'ai_unconfigured',
               reviewed_at = $2, updated_at = $2, ai_locked_at = NULL
-        WHERE id = $1 AND ai_locked_at IS NOT NULL`,
-      [claimed.id, now],
+        WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
+      [claimed.id, nowFn()],
     );
     return true;
   } else {
@@ -465,22 +489,26 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
     // Step 8 — persist AI result in a SEPARATE tx before apply so a
     // crash on apply doesn't re-bill Anthropic.
     if (aiResult.ok) {
-      await dbRun(
+      const persisted = await dbRun(
         sql,
         `UPDATE catalog_feedback
             SET ai_review_score = $2, ai_self_confidence = $3, ai_notes = $4,
                 ai_raw_response = $5, ai_attempts = ai_attempts + 1, ai_last_error = NULL,
                 updated_at = $6
-          WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+          WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
         [
           claimed.id,
           aiResult.reviewScore,
           aiResult.selfConfidence,
           aiResult.notes,
           JSON.stringify(aiResult.raw),
-          now,
+          nowFn(),
         ],
       );
+      if (persisted.meta.changes === 0) {
+        // Row escaped (withdrawn / reaped + reclaimed) mid-AI-call.
+        return true;
+      }
     } else {
       // Step 9 — failure dispatch.
       const firstFailureAt = await firstUnauthorizedAt(sql, claimed.id);
@@ -497,13 +525,13 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
               SET status = 'reviewed', dismissed_reason = $2,
                   ai_attempts = ai_attempts + $3, ai_last_error = $4,
                   reviewed_at = $5, updated_at = $5, ai_locked_at = NULL
-            WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+            WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
           [
             claimed.id,
             plan.terminalReason,
             plan.attemptsIncrement,
             describeError(aiResult.error),
-            now,
+            nowFn(),
           ],
         );
         return true;
@@ -519,28 +547,32 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
           notes: 'unparseable',
           raw: { parse_error: aiResult.error.raw },
         };
-        await dbRun(
+        const persisted = await dbRun(
           sql,
           `UPDATE catalog_feedback
               SET ai_review_score = 0, ai_self_confidence = 0, ai_notes = 'unparseable',
                   ai_raw_response = $2, ai_attempts = ai_attempts,
                   ai_last_error = $3, updated_at = $4
-            WHERE id = $1 AND ai_locked_at IS NOT NULL`,
-          [claimed.id, JSON.stringify({ parse_error: true }), 'parse_error', now],
+            WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
+          [claimed.id, JSON.stringify({ parse_error: true }), 'parse_error', nowFn()],
         );
+        if (persisted.meta.changes === 0) {
+          // Row escaped (withdrawn / reaped + reclaimed) mid-AI-call.
+          return true;
+        }
       } else {
         await dbRun(
           sql,
           `UPDATE catalog_feedback
               SET ai_attempts = ai_attempts + $2, ai_last_error = $3,
                   ai_next_attempt_at = $4, updated_at = $5, ai_locked_at = NULL
-            WHERE id = $1 AND ai_locked_at IS NOT NULL`,
+            WHERE id = $1 AND status = 'open' AND ai_locked_at IS NOT NULL`,
           [
             claimed.id,
             plan.attemptsIncrement,
             describeError(aiResult.error),
             plan.nextAttemptAt,
-            now,
+            nowFn(),
           ],
         );
         return true;
@@ -580,7 +612,7 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
 
   // Step 11 — apply.
   try {
-    await applyCorrectionOutcome(sql, claimed, outcome, aiResult, now);
+    await applyCorrectionOutcome(sql, claimed, outcome, aiResult, nowFn());
   } catch (err) {
     if (err instanceof ZombieGuardError) {
       if (err.code === 'occ_conflict') {
@@ -592,17 +624,20 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
         };
         // Re-acquire the lock-flag invariant by reasserting ai_locked_at
         // is NULL via a fresh UPDATE that doesn't depend on the apply tx.
+        // status='open' guard: a row that escaped (withdrawn, or a
+        // zombie's target already finalized) must not be overwritten.
         await dbRun(
           sql,
           `UPDATE catalog_feedback
               SET status = 'reviewed', dismissed_reason = $2,
                   reviewed_at = $3, updated_at = $3, ai_locked_at = NULL
-            WHERE id = $1`,
-          [claimed.id, fallback.reason, now],
+            WHERE id = $1 AND status = 'open'`,
+          [claimed.id, fallback.reason, nowFn()],
         );
         return true;
       }
-      // zombie_apply — another worker beat us. Leave row as-is.
+      // zombie_apply — the row escaped (withdrawn or another worker
+      // finalized it). Leave row as-is.
       return true;
     }
     // Cross-field invariant violation surfaces as Postgres 23514.
@@ -613,8 +648,8 @@ export async function processOne(env: Env, sql: Sql, deps: ProcessOneDeps = {}):
         `UPDATE catalog_feedback
             SET status = 'reviewed', dismissed_reason = 'cross_field_invariant',
                 reviewed_at = $2, updated_at = $2, ai_locked_at = NULL
-          WHERE id = $1`,
-        [claimed.id, now],
+          WHERE id = $1 AND status = 'open'`,
+        [claimed.id, nowFn()],
       );
       return true;
     }

@@ -124,6 +124,7 @@ async function seedCatalog(opts: {
   commonName?: string;
   daysToMaturityMin?: number | null;
   daysToMaturityMax?: number | null;
+  seedDepthInches?: number | null;
   status?: 'pending' | 'published';
 } = {}): Promise<string> {
   const id = uid('cw-cat');
@@ -131,14 +132,15 @@ async function seedCatalog(opts: {
   await sql.unsafe(
     `INSERT INTO catalog_seeds
        (id, common_name, days_to_maturity_min, days_to_maturity_max,
-        status, created_at, updated_at, published_at)
-     VALUES ($1, $2, $3, $4, $5, $6::BIGINT, $6::BIGINT,
-             CASE WHEN $5 = 'published' THEN $6::BIGINT ELSE NULL END)`,
+        seed_depth_inches, status, created_at, updated_at, published_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::BIGINT, $7::BIGINT,
+             CASE WHEN $6 = 'published' THEN $7::BIGINT ELSE NULL END)`,
     [
       id,
       opts.commonName ?? 'Tomato',
       opts.daysToMaturityMin ?? 60,
       opts.daysToMaturityMax ?? 80,
+      opts.seedDepthInches ?? null,
       opts.status ?? 'published',
       now,
     ],
@@ -345,6 +347,274 @@ describe('processOne — auto_apply happy path', () => {
     expect(audit[0]?.source).toBe('auto_apply');
     expect(audit[0]?.old_value).toBe('60');
     expect(audit[0]?.new_value).toBe('65');
+  });
+});
+
+describe('processOne — terminal writes stamp fresh time, not tick-start', () => {
+  it('updated_at on the applied row is later than the tick-start now', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+    const id = await seedCorrection({
+      userId: fx.userId,
+      householdId: fx.householdId,
+      catalogId,
+      suggestedValue: '65',
+      clientSeenValue: '60',
+    });
+
+    // Injected clock: first call (tick start) returns base, every later
+    // call advances by 1s — models the sweep/AI-call latency inside a
+    // tick. The terminal write must carry a LATER stamp than tick start.
+    const base = Date.now();
+    let calls = 0;
+    const now = () => base + calls++ * 1_000;
+
+    const ok = await processOne(TEST_ENV, sql, {
+      now,
+      review: mockReviewer({
+        ok: true,
+        reviewScore: 0.95,
+        selfConfidence: 0.9,
+        normalizedValue: 65,
+        notes: '',
+        raw: {},
+      }),
+    });
+    expect(ok).toBe(true);
+
+    const feedback = await sql.unsafe<{ status: string; updated_at: number }[]>(
+      `SELECT status, updated_at FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('applied');
+    expect(feedback[0]!.updated_at).toBeGreaterThan(base);
+  });
+});
+
+describe('processOne — user withdrawal mid-claim', () => {
+  it('row withdrawn during the AI call is neither applied nor overwritten', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+    const id = await seedCorrection({
+      userId: fx.userId,
+      householdId: fx.householdId,
+      catalogId,
+      suggestedValue: '65',
+      clientSeenValue: '60',
+    });
+
+    // The review seam runs while the claim is held — withdraw the row
+    // exactly as the DELETE route does (flips status, leaves the lock).
+    const review = async (): Promise<AiReviewResult> => {
+      await sql.unsafe(
+        `UPDATE catalog_feedback
+            SET status = 'dismissed', dismissed_reason = 'user_withdrawn',
+                reviewed_at = $1, updated_at = $1
+          WHERE id = $2`,
+        [Date.now(), id],
+      );
+      return { ok: true, reviewScore: 0.95, selfConfidence: 0.9, normalizedValue: 65, notes: '', raw: {} };
+    };
+
+    const ok = await processOne(TEST_ENV, sql, { review });
+    expect(ok).toBe(true);
+
+    const feedback = await sql.unsafe<{ status: string; dismissed_reason: string | null }[]>(
+      `SELECT status, dismissed_reason FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('dismissed');
+    expect(feedback[0]?.dismissed_reason).toBe('user_withdrawn');
+
+    const cat = await sql.unsafe<{ days_to_maturity_min: number | null }[]>(
+      `SELECT days_to_maturity_min FROM catalog_seeds WHERE id = $1`,
+      [catalogId],
+    );
+    expect(cat[0]?.days_to_maturity_min).toBe(60);
+  });
+});
+
+describe('applyCorrectionOutcome — withdrawn-row guards', () => {
+  function claimedRow(id: string, catalogId: string, fx: Fixture): ClaimedCorrection {
+    return {
+      id,
+      catalog_seed_id: catalogId,
+      household_id: fx.householdId,
+      user_id: fx.userId,
+      field_name: 'days_to_maturity_min',
+      suggested_value: '65',
+      client_seen_value: '60',
+      ai_attempts: 0,
+      ai_review_score: 0.95,
+      ai_self_confidence: 0.9,
+      ai_notes: null,
+      ai_raw_response: null,
+      user_acknowledged_bounds: false,
+      idempotency_key: null,
+    };
+  }
+
+  async function seedWithdrawnButLocked(fx: Fixture, catalogId: string): Promise<string> {
+    const id = await seedCorrection({
+      userId: fx.userId,
+      householdId: fx.householdId,
+      catalogId,
+      suggestedValue: '65',
+      clientSeenValue: '60',
+    });
+    // Claimed (lock set), then withdrawn — the DELETE route never clears the lock.
+    await sql.unsafe(
+      `UPDATE catalog_feedback
+          SET ai_locked_at = $1, status = 'dismissed',
+              dismissed_reason = 'user_withdrawn', reviewed_at = $1
+        WHERE id = $2`,
+      [Date.now(), id],
+    );
+    return id;
+  }
+
+  it('auto_apply rolls back the catalog mutation', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+    const id = await seedWithdrawnButLocked(fx, catalogId);
+
+    try {
+      await applyCorrectionOutcome(
+        sql,
+        claimedRow(id, catalogId, fx),
+        { action: 'auto_apply', normalizedValue: 65, reason: 'auto_apply' },
+        { ok: true, reviewScore: 0.95, selfConfidence: 0.9, normalizedValue: 65, notes: '', raw: {} },
+      );
+    } catch {
+      // ZombieGuardError — the guard fired; tx rolled back.
+    }
+
+    const cat = await sql.unsafe<{ days_to_maturity_min: number | null }[]>(
+      `SELECT days_to_maturity_min FROM catalog_seeds WHERE id = $1`,
+      [catalogId],
+    );
+    expect(cat[0]?.days_to_maturity_min).toBe(60);
+    const feedback = await sql.unsafe<{ status: string; dismissed_reason: string | null }[]>(
+      `SELECT status, dismissed_reason FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('dismissed');
+    expect(feedback[0]?.dismissed_reason).toBe('user_withdrawn');
+  });
+
+  it('auto_dismiss does not overwrite the user_withdrawn record', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+    const id = await seedWithdrawnButLocked(fx, catalogId);
+
+    await applyCorrectionOutcome(
+      sql,
+      claimedRow(id, catalogId, fx),
+      { action: 'auto_dismiss', reason: 'ai_low_confidence' },
+      null,
+    );
+
+    const feedback = await sql.unsafe<{ status: string; dismissed_reason: string | null }[]>(
+      `SELECT status, dismissed_reason FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('dismissed');
+    expect(feedback[0]?.dismissed_reason).toBe('user_withdrawn');
+  });
+
+  it('queue_for_review does not overwrite the user_withdrawn record', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+    const id = await seedWithdrawnButLocked(fx, catalogId);
+
+    await applyCorrectionOutcome(
+      sql,
+      claimedRow(id, catalogId, fx),
+      { action: 'queue_for_review', reason: 'ai_review_score_below_threshold' },
+      null,
+    );
+
+    const feedback = await sql.unsafe<{ status: string; dismissed_reason: string | null }[]>(
+      `SELECT status, dismissed_reason FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('dismissed');
+    expect(feedback[0]?.dismissed_reason).toBe('user_withdrawn');
+  });
+});
+
+describe("processOne — field_name='other' is never claimed", () => {
+  it('leaves the row open + unlocked and never calls the reviewer', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const id = `cf_${nanoid(12)}`;
+    const now = Date.now();
+    await sql.unsafe(
+      `INSERT INTO catalog_feedback
+         (id, catalog_seed_id, household_id, user_id, body, field_name,
+          suggested_value, value_type, catalog_seed_name,
+          user_acknowledged_bounds, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'body', 'other', 'free-form text', 'free_form',
+               'Tomato', FALSE, 'open', $5::BIGINT, $5::BIGINT)`,
+      [id, catalogId, fx.householdId, fx.userId, now],
+    );
+    cleanup.correctionIds.add(id);
+
+    let reviewCalled = false;
+    const review = async (): Promise<AiReviewResult> => {
+      reviewCalled = true;
+      return { ok: true, reviewScore: 0.95, selfConfidence: 0.9, normalizedValue: null, notes: '', raw: {} };
+    };
+    const didWork = await processOne(TEST_ENV, sql, { review });
+
+    expect(didWork).toBe(false);
+    expect(reviewCalled).toBe(false);
+    const rows = await sql.unsafe<{ status: string; ai_locked_at: number | null }[]>(
+      `SELECT status, ai_locked_at FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(rows[0]?.status).toBe('open');
+    expect(rows[0]?.ai_locked_at).toBeNull();
+  });
+});
+
+describe('processOne — numeric OCC ignores Postgres trailing-zero rendering', () => {
+  it("seed_depth_inches 0.50 in the DB matches client_seen_value '0.5' and auto-applies", async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog({ seedDepthInches: 0.5 });
+    const id = await seedCorrection({
+      userId: fx.userId,
+      householdId: fx.householdId,
+      catalogId,
+      fieldName: 'seed_depth_inches',
+      suggestedValue: '0.6',
+      // iOS builds client_seen_value with Swift String(Double) — '0.5',
+      // while CAST(seed_depth_inches AS TEXT) renders the scale-2 '0.50'.
+      clientSeenValue: '0.5',
+    });
+
+    await processOne(TEST_ENV, sql, {
+      review: mockReviewer({
+        ok: true,
+        reviewScore: 0.95,
+        selfConfidence: 0.9,
+        normalizedValue: 0.6,
+        notes: '',
+        raw: {},
+      }),
+    });
+
+    const feedback = await sql.unsafe<{ status: string; dismissed_reason: string | null }[]>(
+      `SELECT status, dismissed_reason FROM catalog_feedback WHERE id = $1`,
+      [id],
+    );
+    expect(feedback[0]?.status).toBe('applied');
+
+    const cat = await sql.unsafe<{ seed_depth_inches: number | null }[]>(
+      `SELECT seed_depth_inches FROM catalog_seeds WHERE id = $1`,
+      [catalogId],
+    );
+    expect(cat[0]?.seed_depth_inches).toBe(0.6);
   });
 });
 

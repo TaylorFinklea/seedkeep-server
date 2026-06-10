@@ -210,6 +210,78 @@ describe('conflict / recent / OCC gates', () => {
     expect(r.action).toBe('queue_for_review');
     expect(r.reason).toBe('occ_conflict');
   });
+
+  it("numeric OCC: Postgres scale-padded '0.50' matches client '0.5'", () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'seed_depth_inches',
+      suggestedValueRaw: '0.6',
+      aiNormalizedValue: 0.6,
+      currentValue: '0.50',
+      clientSeenValue: '0.5',
+    }));
+    expect(r.action).toBe('auto_apply');
+    expect(r.normalizedValue).toBe(0.6);
+  });
+
+  it('numeric OCC: genuinely different numbers still queue occ_conflict', () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'seed_depth_inches',
+      suggestedValueRaw: '0.6',
+      aiNormalizedValue: 0.6,
+      currentValue: '0.75',
+      clientSeenValue: '0.5',
+    }));
+    expect(r.action).toBe('queue_for_review');
+    expect(r.reason).toBe('occ_conflict');
+  });
+
+  it('numeric OCC: null client_seen vs populated current → occ_conflict', () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'viability_years',
+      suggestedValueRaw: '4',
+      aiNormalizedValue: 4,
+      currentValue: '3',
+      clientSeenValue: null,
+    }));
+    expect(r.action).toBe('queue_for_review');
+    expect(r.reason).toBe('occ_conflict');
+  });
+
+  it('numeric OCC: both null → match', () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'viability_years',
+      suggestedValueRaw: '4',
+      aiNormalizedValue: 4,
+      currentValue: null,
+      clientSeenValue: null,
+      neighborStats: { median: 4, stdev: 1, count: 6 },
+    }));
+    expect(r.action).toBe('auto_apply');
+  });
+
+  it('numeric OCC: unparseable client_seen for a numeric field → occ_conflict', () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'viability_years',
+      suggestedValueRaw: '4',
+      aiNormalizedValue: 4,
+      currentValue: '3',
+      clientSeenValue: 'about three',
+    }));
+    expect(r.action).toBe('queue_for_review');
+    expect(r.reason).toBe('occ_conflict');
+  });
+
+  it('enum field OCC stays text equality', () => {
+    const r = decideCorrectionOutcome(baseInput({
+      fieldName: 'sun_requirement',
+      suggestedValueRaw: 'partial',
+      aiNormalizedValue: 'partial',
+      currentValue: 'full',
+      clientSeenValue: 'shade',
+    }));
+    expect(r.action).toBe('queue_for_review');
+    expect(r.reason).toBe('occ_conflict');
+  });
 });
 
 describe('auto_dismiss', () => {
