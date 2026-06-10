@@ -331,14 +331,17 @@ const DEFAULT_MODEL = 'claude-opus-4-7';
 const STREAM_LOCK_TTL_MS = 10 * 60 * 1000;  // stale locks auto-expire after 10 min
 
 /**
- * Try to take the per-thread stream lock. Returns true if we hold it,
- * false if another stream is already running. A stale lock (older than
- * STREAM_LOCK_TTL_MS) is treated as released.
+ * Try to take the per-thread stream lock. Returns the acquired timestamp
+ * (the lock token) if we hold it, or null if another active stream holds
+ * it. A stale lock (older than STREAM_LOCK_TTL_MS) is treated as released.
+ *
+ * The returned token must be passed to releaseStreamLock so releases are
+ * holder-fenced — a concurrent stream's release can't clear our lock.
  */
 async function acquireStreamLock(
   sql: ReturnType<typeof getSql>,
   threadId: string,
-): Promise<boolean> {
+): Promise<number | null> {
   const now = Date.now();
   const staleBefore = now - STREAM_LOCK_TTL_MS;
   const got = await dbGet<{ id: string }>(sql,
@@ -348,16 +351,42 @@ async function acquireStreamLock(
         AND (stream_lock_at IS NULL OR stream_lock_at < $3)
     RETURNING id`,
     [now, threadId, staleBefore]);
-  return got !== null;
+  return got !== null ? now : null;
 }
 
+/**
+ * Release the stream lock only if we still hold it (holder-fenced).
+ * `acquiredAt` is the token returned by acquireStreamLock.
+ */
 async function releaseStreamLock(
   sql: ReturnType<typeof getSql>,
   threadId: string,
+  acquiredAt: number,
 ): Promise<void> {
   await dbRun(sql,
-    `UPDATE assistant_threads SET stream_lock_at = NULL WHERE id = $1`,
-    [threadId]);
+    `UPDATE assistant_threads SET stream_lock_at = NULL
+      WHERE id = $1 AND stream_lock_at = $2`,
+    [threadId, acquiredAt]);
+}
+
+/**
+ * Renew the stream lock between turns so it never goes stale during a
+ * long multi-turn conversation. Returns the new token, or the old one if
+ * the UPDATE found no rows (lock was stolen — caller should abort).
+ */
+async function renewStreamLock(
+  sql: ReturnType<typeof getSql>,
+  threadId: string,
+  acquiredAt: number,
+): Promise<number> {
+  const now = Date.now();
+  const got = await dbGet<{ id: string }>(sql,
+    `UPDATE assistant_threads
+        SET stream_lock_at = $1
+      WHERE id = $2 AND stream_lock_at = $3
+    RETURNING id`,
+    [now, threadId, acquiredAt]);
+  return got !== null ? now : acquiredAt;
 }
 
 assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
@@ -402,18 +431,8 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
       message: 'A previous tool call is still awaiting user confirmation' } }, 409);
   }
 
-  // Acquire a thread-level stream lock so two devices sending
-  // simultaneously can't both fan out an orchestration on the same
-  // thread (which would corrupt history). The lock is opportunistic:
-  // a UPSERT that fails when another stream is in-flight. The lock
-  // row gets cleared in streamSSE's finally block.
-  const lockAcquired = await acquireStreamLock(sql, threadId);
-  if (!lockAcquired) {
-    return c.json({ ok: false, error: { code: 'stream_busy',
-      message: 'Another stream is already in progress for this thread. Wait for it to finish or refresh.' } }, 409);
-  }
-
-  // Load the encrypted Anthropic key.
+  // Load the encrypted Anthropic key BEFORE acquiring the stream lock so
+  // that key-missing / decrypt-fail early returns don't leak the lock.
   interface KeyRow { encrypted_key: Buffer; key_iv: Buffer; key_tag: Buffer }
   const keyRow = await dbGet<KeyRow>(
     sql,
@@ -434,6 +453,17 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   } catch (err) {
     return c.json({ ok: false, error: { code: 'key_decrypt_failed',
       message: 'Stored API key could not be decrypted (master key rotated?). Re-enter your key in Settings.' } }, 500);
+  }
+
+  // Acquire a thread-level stream lock so two devices sending
+  // simultaneously can't both fan out an orchestration on the same
+  // thread (which would corrupt history). The lock is opportunistic:
+  // a UPSERT that fails when another stream is in-flight. The lock
+  // row gets cleared in streamSSE's finally block.
+  const lockToken = await acquireStreamLock(sql, threadId);
+  if (lockToken === null) {
+    return c.json({ ok: false, error: { code: 'stream_busy',
+      message: 'Another stream is already in progress for this thread. Wait for it to finish or refresh.' } }, 409);
   }
 
   // Persist the user message.
@@ -472,6 +502,7 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   const tools = anthropicTools();
 
   return streamSSE(c, async (stream) => {
+    let currentToken = lockToken;
     try {
       await orchestrateConversation({
         sql, householdId, threadId,
@@ -479,6 +510,11 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
         messages: history, tools,
         stream,
         clientPetState: parsed.data.client_pet_state,
+        // Renew the stream lock between turns to prevent TTL expiry on
+        // long multi-turn conversations.
+        onTurnEnd: async () => {
+          currentToken = await renewStreamLock(sql, threadId, currentToken);
+        },
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -486,7 +522,7 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
         data: JSON.stringify({ type: 'error', code: 'orchestration_error', message }),
       });
     } finally {
-      await releaseStreamLock(sql, threadId);
+      await releaseStreamLock(sql, threadId, currentToken);
     }
   });
 });
@@ -572,50 +608,64 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
 
   // Lock the thread for the confirmation stream so simultaneous
   // confirm-clicks from two devices don't both fan out.
-  const lockAcquired = await acquireStreamLock(sql, tc.thread_id);
-  if (!lockAcquired) {
+  const confirmLockToken = await acquireStreamLock(sql, tc.thread_id);
+  if (confirmLockToken === null) {
     return c.json({ ok: false, error: { code: 'stream_busy',
       message: 'Another stream is already in progress for this thread.' } }, 409);
   }
 
-  // Apply the deferred change. The stored proposed_change.was snapshot
-  // is the row at preview time; executeProposedChange re-reads the
-  // current row and refuses with stale_proposal if it changed.
-  const args = JSON.parse(tc.args_json);
-  let storedWas: unknown;
+  // Apply the deferred change in a try/finally so the lock is always released
+  // on any DB error thrown before we enter streamSSE. The stored
+  // proposed_change.was snapshot is the row at preview time;
+  // executeProposedChange re-reads the current row and refuses with
+  // stale_proposal if it changed.
+  let applyResult: Awaited<ReturnType<typeof executeProposedChange>>;
+  let now: number;
+  let toolResultBlock: AnthropicContentBlock;
+  let snapshot: Awaited<ReturnType<typeof loadHouseholdSnapshot>>;
+  let systemPrompt: string;
+  let history: AnthropicMessage[];
+  let tools: ReturnType<typeof anthropicTools>;
   try {
-    const proposed = tc.proposed_change_json ? JSON.parse(tc.proposed_change_json) : null;
-    storedWas = (proposed as { was?: unknown } | null)?.was;
-  } catch {
-    storedWas = undefined;
+    const args = JSON.parse(tc.args_json);
+    let storedWas: unknown;
+    try {
+      const proposed = tc.proposed_change_json ? JSON.parse(tc.proposed_change_json) : null;
+      storedWas = (proposed as { was?: unknown } | null)?.was;
+    } catch {
+      storedWas = undefined;
+    }
+    applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId }, storedWas);
+    now = Date.now();
+    await dbRun(sql,
+      `UPDATE assistant_tool_calls
+          SET status = $1, result_json = $2, confirmed_at = $3, updated_at = $3
+        WHERE id = $4`,
+      [applyResult.status, JSON.stringify(applyResult.result ?? applyResult.error ?? null), now, id]);
+
+    // Build a tool_result message and append to the thread, then resume the LLM.
+    toolResultBlock = {
+      type: 'tool_result',
+      tool_use_id: id,
+      content: JSON.stringify(applyResult.result ?? applyResult.error ?? null),
+      is_error: applyResult.status === 'failed' ? true : undefined,
+    };
+    const toolMessageId = nanoid();
+    await dbRun(sql,
+      `INSERT INTO assistant_messages
+         (id, thread_id, role, content_json, created_at)
+       VALUES ($1, $2, 'user', $3, $4)`,
+      [toolMessageId, tc.thread_id, JSON.stringify([toolResultBlock]), now + 1]);
+
+    // Resume the conversation in an SSE stream.
+    snapshot = await loadHouseholdSnapshot(sql, householdId);
+    systemPrompt = buildSystemPrompt(snapshot, null, new Date());
+    history = await loadConversationHistory(sql, tc.thread_id);
+    tools = anthropicTools();
+  } catch (err) {
+    await releaseStreamLock(sql, tc.thread_id, confirmLockToken);
+    throw err;
   }
-  const applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId }, storedWas);
-  const now = Date.now();
-  await dbRun(sql,
-    `UPDATE assistant_tool_calls
-        SET status = $1, result_json = $2, confirmed_at = $3, updated_at = $3
-      WHERE id = $4`,
-    [applyResult.status, JSON.stringify(applyResult.result ?? applyResult.error ?? null), now, id]);
-
-  // Build a tool_result message and append to the thread, then resume the LLM.
-  const toolResultBlock: AnthropicContentBlock = {
-    type: 'tool_result',
-    tool_use_id: id,
-    content: JSON.stringify(applyResult.result ?? applyResult.error ?? null),
-    is_error: applyResult.status === 'failed' ? true : undefined,
-  };
-  const toolMessageId = nanoid();
-  await dbRun(sql,
-    `INSERT INTO assistant_messages
-       (id, thread_id, role, content_json, created_at)
-     VALUES ($1, $2, 'user', $3, $4)`,
-    [toolMessageId, tc.thread_id, JSON.stringify([toolResultBlock]), now + 1]);
-
-  // Resume the conversation in an SSE stream.
-  const snapshot = await loadHouseholdSnapshot(sql, householdId);
-  const systemPrompt = buildSystemPrompt(snapshot, null, new Date());
-  const history = await loadConversationHistory(sql, tc.thread_id);
-  const tools = anthropicTools();
 
   return streamSSE(c, async (stream) => {
     // Emit a tool_result event first so the client updates the card.
@@ -627,12 +677,16 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
         result_json: JSON.stringify(applyResult.result ?? applyResult.error ?? null),
       }),
     });
+    let currentConfirmToken = confirmLockToken;
     try {
       await orchestrateConversation({
         sql, householdId, threadId: tc.thread_id,
         apiKey, model: DEFAULT_MODEL, system: systemPrompt,
         messages: history, tools,
         stream,
+        onTurnEnd: async () => {
+          currentConfirmToken = await renewStreamLock(sql, tc.thread_id, currentConfirmToken);
+        },
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -640,7 +694,7 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
         data: JSON.stringify({ type: 'error', code: 'orchestration_error', message }),
       });
     } finally {
-      await releaseStreamLock(sql, tc.thread_id);
+      await releaseStreamLock(sql, tc.thread_id, currentConfirmToken);
     }
   });
 });
@@ -663,6 +717,10 @@ interface OrchestrateOptions {
   /// `query_pet` via the ToolExecutionContext so the response can fill
   /// `mood` + `age_stars`. Optional + sparse.
   clientPetState?: Record<string, { mood: string; age_stars: number }>;
+  /// Called after each completed turn to renew the stream lock. Without
+  /// this, a long multi-turn conversation exceeds STREAM_LOCK_TTL_MS and
+  /// another device steals the lock, corrupting history.
+  onTurnEnd?: () => Promise<void>;
 }
 
 /**
@@ -671,7 +729,7 @@ interface OrchestrateOptions {
  * (no pending tool call) OR a proposed_change pauses the stream.
  */
 async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> {
-  const { sql, householdId, threadId, apiKey, model, system, tools, stream, clientPetState } = opts;
+  const { sql, householdId, threadId, apiKey, model, system, tools, stream, clientPetState, onTurnEnd } = opts;
   let messages = [...opts.messages];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -912,6 +970,11 @@ async function orchestrateConversation(opts: OrchestrateOptions): Promise<void> 
     }
     if (toolResults.length > 0) {
       messages.push({ role: 'user', content: toolResults });
+    }
+    // Renew the stream lock between turns so a long multi-turn session
+    // doesn't exceed STREAM_LOCK_TTL_MS and have its lock stolen.
+    if (onTurnEnd) {
+      await onTurnEnd();
     }
     // Loop and call Anthropic again with the tool result fed back in.
   }

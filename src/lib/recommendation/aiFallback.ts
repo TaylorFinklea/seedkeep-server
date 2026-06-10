@@ -83,31 +83,62 @@ export function parseAiBaseline(text: string): AiBaseline | null {
   };
 }
 
-// Thin Anthropic call. Mirrors extractFromPhotos in extraction/anthropic.ts.
+const DEFAULT_TIMEOUT_MS = 60_000; // 60s — mirrors aiReview.ts budget
+
+// Thin Anthropic call. Mirrors aiReview.ts AbortController pattern.
+// `timeoutMs` defaults to 60s; pass 0 to disable (tests only).
 export async function fetchAiBaseline(
   apiKey: string,
   model: string,
   cat: AiCatalogInput,
   loc: HouseholdLocation,
   currentYear: number,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<AiBaseline | null> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 512,
-      messages: [{ role: 'user', content: buildAiPrompt(cat, loc, currentYear) }],
-    }),
-  });
+  const controller = new AbortController();
+  const timer = timeoutMs > 0
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+
+  let res: Response;
+  try {
+    res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 512,
+        messages: [{ role: 'user', content: buildAiPrompt(cat, loc, currentYear) }],
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    const isAbort =
+      (err as { name?: string } | null)?.name === 'AbortError' ||
+      (typeof err === 'object' && err !== null && 'code' in err &&
+       (err as { code?: string }).code === 'ABORT_ERR');
+    if (isAbort) throw new Error('fetchAiBaseline timed out');
+    throw err;
+  }
+
   if (!res.ok) {
+    if (timer) clearTimeout(timer);
     throw new Error(`Anthropic recommendation call returned ${res.status}`);
   }
-  const raw = (await res.json()) as { content?: { type: string; text?: string }[] };
+
+  let raw: { content?: { type: string; text?: string }[] };
+  try {
+    raw = (await res.json()) as typeof raw;
+  } finally {
+    // Clear AFTER body is consumed so the signal also covers the body read.
+    if (timer) clearTimeout(timer);
+  }
+
   const textPart = raw.content?.find((p) => p.type === 'text')?.text ?? '';
   return parseAiBaseline(textPart);
 }

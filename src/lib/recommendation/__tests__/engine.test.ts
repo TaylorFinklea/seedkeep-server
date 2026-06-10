@@ -55,4 +55,29 @@ describe('computeRuleBaseline', () => {
     expect(b.inputsUsed).toContain('frost_tolerance');
     expect(b.inputsUsed).toContain('avg_last_frost');
   });
+
+  it('inverted window (season too short): returns null window and drops confidence below threshold', () => {
+    // Zone 3: last frost ~May-28, first frost ~Sep-12. A tender 110-day crop:
+    // latest = Sep-12 - (110+14) = May-11, which is before earliest = May-28.
+    const ZONE_3: HouseholdLocation = {
+      usdaZone: '3', avgLastFrost: '05-28', avgFirstFrost: '09-12',
+    };
+    const LONG_TENDER: CatalogHorticultural = {
+      ...FULL_TENDER_DIRECT,
+      days_to_maturity_min: 100,
+      days_to_maturity_max: 110,
+    };
+    const b = computeRuleBaseline(LONG_TENDER, ZONE_3, 2026);
+    expect(b.windowStart).toBeNull();
+    expect(b.windowEnd).toBeNull();
+    expect(b.confidence).toBeLessThan(CONFIDENCE_THRESHOLD);
+  });
+
+  it('valid window passes unchanged when latest >= earliest', () => {
+    // Confirm the guard does not affect normal seasons.
+    const b = computeRuleBaseline(FULL_TENDER_DIRECT, ZONE_7A, 2026);
+    expect(b.windowStart).not.toBeNull();
+    expect(b.windowEnd).not.toBeNull();
+    expect(b.confidence).toBeGreaterThanOrEqual(CONFIDENCE_THRESHOLD);
+  });
 });

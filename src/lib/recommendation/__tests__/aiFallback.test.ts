@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildAiPrompt, parseAiBaseline } from '../aiFallback';
+import { buildAiPrompt, parseAiBaseline, fetchAiBaseline } from '../aiFallback';
 
 describe('buildAiPrompt', () => {
   it('includes the variety, location, and prose instructions', () => {
@@ -42,5 +42,40 @@ describe('parseAiBaseline', () => {
 
   it('returns null on non-JSON', () => {
     expect(parseAiBaseline('I could not determine a window.')).toBeNull();
+  });
+});
+
+type FetchLike = (input: unknown, init?: unknown) => Promise<Response>;
+
+describe('fetchAiBaseline timeout', () => {
+  it('throws on AbortError when the timeout fires before the server responds', async () => {
+    // A fetch that observes the abort signal and rejects with AbortError.
+    const abortAwareFetch: FetchLike = (_url, init) => {
+      return new Promise((_resolve, reject) => {
+        const signal = (init as RequestInit | undefined)?.signal;
+        if (!signal) return; // fallback: hang
+        if (signal.aborted) {
+          reject(Object.assign(new Error('AbortError'), { name: 'AbortError' }));
+          return;
+        }
+        signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('AbortError'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = abortAwareFetch as typeof fetch;
+    try {
+      await expect(
+        fetchAiBaseline('key', 'model',
+          { commonName: 'Tomato', variety: null, instructions: null },
+          { usdaZone: '7a', avgLastFrost: '04-10', avgFirstFrost: '11-01' },
+          2026,
+          1, // 1ms timeout
+        ),
+      ).rejects.toThrow(/timed out/i);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });

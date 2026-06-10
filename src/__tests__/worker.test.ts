@@ -9,7 +9,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import postgres from 'postgres';
-import { applyJobOutcome, outcomeStatus, type JobRow } from '../worker';
+import { applyJobOutcome, outcomeStatus, reapStrandedJobs, type JobRow } from '../worker';
 import type { Sql } from 'postgres';
 import type { AiBaseline } from '../lib/recommendation/aiFallback';
 
@@ -68,6 +68,60 @@ afterEach(async () => {
   }
 });
 
+// ── reaper ────────────────────────────────────────────────────────────────────
+
+describe('reapStrandedJobs', () => {
+  it('resets running rows older than 10 min back to pending', async () => {
+    const catalogId = uid();
+    const jobId = uid();
+    await insertCatalogSeed(catalogId);
+    const staleStartedAt = Date.now() - 11 * 60_000; // 11 minutes ago
+    await sql.unsafe(
+      `INSERT INTO recommendation_jobs
+         (id, catalog_seed_id, location_signature, status, attempts, started_at, created_at)
+       VALUES ($1, $2, 'reaper-test:0.0,0.0', 'running', 0, $3, $4)`,
+      [jobId, catalogId, staleStartedAt, Date.now()],
+    );
+    try {
+      const reaped = await reapStrandedJobs(sql);
+      expect(reaped).toBeGreaterThanOrEqual(1);
+      const rows = await sql.unsafe<{ status: string; started_at: number | null }[]>(
+        `SELECT status, started_at FROM recommendation_jobs WHERE id = $1`,
+        [jobId],
+      );
+      expect(rows[0]?.status).toBe('pending');
+      expect(rows[0]?.started_at).toBeNull();
+    } finally {
+      await sql.unsafe(`DELETE FROM recommendation_jobs WHERE id = $1`, [jobId]);
+      await sql.unsafe(`DELETE FROM catalog_seeds WHERE id = $1`, [catalogId]);
+    }
+  });
+
+  it('does not reap running rows that are still fresh', async () => {
+    const catalogId = uid();
+    const jobId = uid();
+    await insertCatalogSeed(catalogId);
+    const freshStartedAt = Date.now() - 60_000; // 1 minute ago — within 10 min window
+    await sql.unsafe(
+      `INSERT INTO recommendation_jobs
+         (id, catalog_seed_id, location_signature, status, attempts, started_at, created_at)
+       VALUES ($1, $2, 'reaper-fresh:0.0,0.0', 'running', 0, $3, $4)`,
+      [jobId, catalogId, freshStartedAt, Date.now()],
+    );
+    try {
+      await reapStrandedJobs(sql);
+      const rows = await sql.unsafe<{ status: string }[]>(
+        `SELECT status FROM recommendation_jobs WHERE id = $1`,
+        [jobId],
+      );
+      expect(rows[0]?.status).toBe('running');
+    } finally {
+      await sql.unsafe(`DELETE FROM recommendation_jobs WHERE id = $1`, [jobId]);
+      await sql.unsafe(`DELETE FROM catalog_seeds WHERE id = $1`, [catalogId]);
+    }
+  });
+});
+
 // ── pure logic ────────────────────────────────────────────────────────────────
 
 describe('outcomeStatus', () => {
@@ -96,6 +150,7 @@ describe('applyJobOutcome (against local Postgres)', () => {
       catalog_seed_id: testCatalogId,
       location_signature: 'test-zone:0.0,0.0',
       attempts: 0,
+      started_at: null,
     };
 
     const ai: AiBaseline = {
@@ -136,6 +191,7 @@ describe('applyJobOutcome (against local Postgres)', () => {
       catalog_seed_id: testCatalogId,
       location_signature: 'test-zone:0.0,0.0',
       attempts: 1,
+      started_at: null,
     };
 
     await applyJobOutcome(sql, job, { ok: false, err: new Error('transient network error') });
@@ -160,6 +216,7 @@ describe('applyJobOutcome (against local Postgres)', () => {
       catalog_seed_id: testCatalogId,
       location_signature: 'test-zone:0.0,0.0',
       attempts: 2,
+      started_at: null,
     };
 
     await applyJobOutcome(sql, job, { ok: false, err: new Error('persistent AI failure') });

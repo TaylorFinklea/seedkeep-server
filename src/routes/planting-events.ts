@@ -114,12 +114,26 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
     parsed.data.catalog_seed_id ?? null,
   );
   const bedName = await loadBedName(sql, householdId, parsed.data.bed_id ?? null);
+  // Short timeout (~8s) for the optional pet vignette — the planting-event
+  // create is a core sync write; a slow Anthropic response must not block
+  // it indefinitely. The existing deterministic fallback covers timeouts.
+  const SPAWN_TIMEOUT_MS = 8_000;
+  const spawnController = new AbortController();
+  const spawnTimer = setTimeout(() => spawnController.abort(), SPAWN_TIMEOUT_MS);
   const spawn = await spawnPet({
     plantingEventId: id,
     apiKey,
     spawnedAt: now,
     bedName,
     seedVariety,
+    anthropicCaller: async (args) => {
+      const { anthropicOneShot } = await import('../lib/pets/anthropicOneShot');
+      try {
+        return await anthropicOneShot({ ...args, signal: spawnController.signal });
+      } finally {
+        clearTimeout(spawnTimer);
+      }
+    },
   });
 
   // Phase 5.1.0 — alongside the event, seed a default journal entry +

@@ -92,19 +92,28 @@ export async function reviewCorrection(args: ReviewCorrectionArgs): Promise<AiRe
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: { kind: 'network_error', message } };
   }
-  clearTimeout(timer);
+  // Do NOT clearTimeout here — the abort signal must also cover body reads
+  // (res.json() / safeText) so a stalled body can't hang the worker past the
+  // zombie threshold. The timer is cleared in the finally blocks below.
 
   if (res.status === 401) {
+    clearTimeout(timer);
     return { ok: false, error: { kind: 'unauthorized', status: 401 } };
   }
   if (res.status === 429) {
+    clearTimeout(timer);
     const retryHeader = res.headers.get('retry-after');
     const retryAfterSec = retryHeader ? Math.max(0, parseInt(retryHeader, 10) || 60) : 60;
     return { ok: false, error: { kind: 'rate_limited', status: 429, retryAfterSec } };
   }
   if (!res.ok) {
-    const text = await safeText(res);
-    return { ok: false, error: { kind: 'server_error', status: res.status, body: text } };
+    let text: string;
+    try {
+      text = await safeText(res);
+    } finally {
+      clearTimeout(timer);
+    }
+    return { ok: false, error: { kind: 'server_error', status: res.status, body: text! } };
   }
 
   let raw: unknown;
@@ -118,6 +127,9 @@ export async function reviewCorrection(args: ReviewCorrectionArgs): Promise<AiRe
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, error: { kind: 'parse_error', raw: message } };
+  } finally {
+    // Clear after body is fully consumed.
+    clearTimeout(timer);
   }
 
   if (text.length === 0) {

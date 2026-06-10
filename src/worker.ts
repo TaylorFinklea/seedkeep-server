@@ -22,12 +22,15 @@ import { processOne as processOneCorrection } from './lib/catalog/moderationWork
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_ATTEMPTS = 3;
+const JOB_REAPER_TIMEOUT_MS = 10 * 60_000; // match corrections worker
+const FETCH_AI_TIMEOUT_MS = 60_000;
 
 export interface JobRow {
   id: string;
   catalog_seed_id: string;
   location_signature: string;
   attempts: number;
+  started_at: number | null;
 }
 
 interface CatalogRow {
@@ -41,6 +44,22 @@ function parseSignature(sig: string): { zone: string; lat: number; lon: number }
   const [zone, coords] = sig.split(':');
   const [lat, lon] = coords.split(',').map(Number);
   return { zone, lat, lon };
+}
+
+/**
+ * Reset recommendation_jobs rows stuck in 'running' for longer than
+ * JOB_REAPER_TIMEOUT_MS. Mirrors reapOrphanedClaims in the corrections worker.
+ * Returns the number of rows reaped.
+ */
+export async function reapStrandedJobs(sql: Sql, now: number = Date.now()): Promise<number> {
+  const cutoff = now - JOB_REAPER_TIMEOUT_MS;
+  const result = await sql.unsafe(
+    `UPDATE recommendation_jobs
+        SET status = 'pending', started_at = NULL
+      WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1`,
+    [cutoff],
+  );
+  return Number((result as { count?: number }).count ?? 0);
 }
 
 // Exported for unit-testing: applies the outcome of a completed (or failed)
@@ -89,14 +108,24 @@ export function outcomeStatus(attempts: number, maxAttempts: number): 'pending' 
 
 async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
   const sql = getSql(env);
+  const now = Date.now();
+
+  // Reap recommendation_jobs stuck in 'running' for > 10 min. Mirrors
+  // reapOrphanedClaims in the corrections worker.
+  try {
+    await reapStrandedJobs(sql, now);
+  } catch (err) {
+    console.error('[worker] recommendation reaper error', err);
+  }
 
   // Claim a job atomically: the SELECT ... FOR UPDATE SKIP LOCKED and the
   // status='running' UPDATE must be in the same transaction so the row lock
   // is held across both statements. Without a transaction the lock releases
   // immediately after the SELECT and two workers can claim the same job.
+  // Stamp started_at so the reaper can detect rows that never finish.
   const job = await sql.begin(async (tx) => {
     const rows = await tx.unsafe<JobRow[]>(
-      `SELECT id, catalog_seed_id, location_signature, attempts
+      `SELECT id, catalog_seed_id, location_signature, attempts, started_at
          FROM recommendation_jobs
         WHERE status = 'pending'
         ORDER BY created_at
@@ -107,8 +136,8 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
     const claimed = rows[0] as JobRow | undefined;
     if (!claimed) return null;
     await tx.unsafe(
-      `UPDATE recommendation_jobs SET status = 'running' WHERE id = $1`,
-      [claimed.id],
+      `UPDATE recommendation_jobs SET status = 'running', started_at = $2 WHERE id = $1`,
+      [claimed.id, now],
     );
     return claimed;
   });
@@ -126,13 +155,22 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
     );
     if (!cat) throw new Error('catalog seed gone');
 
-    const { zone } = parseSignature(job.location_signature);
+    // Resolve frost dates from the job's own location signature (lat/lon),
+    // not an arbitrary household in the same zone. The signature is
+    // "<zone>:<lat>,<lon>"; find the household whose stored coordinates
+    // round-trip back to the same signature so the worker and route agree.
+    const { zone, lat, lon } = parseSignature(job.location_signature);
     const frost = await dbGet<{ avg_last_frost: string; avg_first_frost: string }>(
-      sql, `SELECT avg_last_frost, avg_first_frost FROM households
-              WHERE usda_zone = $1 AND avg_last_frost IS NOT NULL LIMIT 1`,
-      [zone],
+      sql,
+      `SELECT avg_last_frost, avg_first_frost FROM households
+        WHERE usda_zone = $1
+          AND ROUND(latitude::numeric, 4) = ROUND($2::numeric, 4)
+          AND ROUND(longitude::numeric, 4) = ROUND($3::numeric, 4)
+          AND avg_last_frost IS NOT NULL
+        LIMIT 1`,
+      [zone, lat, lon],
     );
-    if (!frost) throw new Error('no frost data for zone');
+    if (!frost) throw new Error('no frost data for location');
 
     const loc: HouseholdLocation = {
       usdaZone: zone, avgLastFrost: frost.avg_last_frost, avgFirstFrost: frost.avg_first_frost,
@@ -140,7 +178,9 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
     const year = new Date().getUTCFullYear();
     const ai = await fetchAiBaseline(apiKey, env.DEFAULT_REVIEW_MODEL,
       { commonName: cat.common_name, variety: cat.variety, instructions: cat.instructions },
-      loc, year);
+      loc, year,
+      FETCH_AI_TIMEOUT_MS,
+    );
     if (!ai) throw new Error('AI returned no usable baseline');
     result = { ok: true, ai };
   } catch (err) {
@@ -151,6 +191,19 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
   return true;
 }
 
+const WORKER_HEARTBEAT_KEY = 'worker_last_tick';
+
+async function upsertHeartbeat(sql: Sql): Promise<void> {
+  await sql.unsafe(
+    `CREATE TABLE IF NOT EXISTS _seedkeep_kv (k TEXT PRIMARY KEY, v TEXT)`,
+  );
+  await sql.unsafe(
+    `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
+     ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+    [WORKER_HEARTBEAT_KEY, String(Date.now())],
+  );
+}
+
 async function main() {
   const env = loadEnv();
   console.log('[worker] recommendation fill-in worker started');
@@ -159,6 +212,18 @@ async function main() {
   process.on('SIGINT', () => { running = false; });
 
   while (running) {
+    // Heartbeat: upsert worker_last_tick once per loop iteration so the
+    // health-check / ops floor can detect a wedged worker.
+    try {
+      const sql = getSql(env);
+      await upsertHeartbeat(sql);
+    } catch (err) {
+      console.error('[worker] heartbeat error', err);
+    }
+
+    // Check SIGTERM between jobs — in-flight await finishes, no new claims.
+    if (!running) break;
+
     let didWork = false;
     try {
       didWork = await processOne(env);
@@ -167,7 +232,7 @@ async function main() {
     }
     // Phase 4D — catalog corrections piggyback. Independent try/catch:
     // a throw here cannot mask or crash the recommendation path's tick.
-    if (!didWork) {
+    if (running && !didWork) {
       try {
         const sql = getSql(env);
         didWork = await processOneCorrection(env, sql);

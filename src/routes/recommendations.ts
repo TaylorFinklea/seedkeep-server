@@ -140,13 +140,21 @@ async function loadLocation(sql: ReturnType<typeof getSql>, householdId: string)
 
 async function readCache(sql: ReturnType<typeof getSql>, catalogSeedId: string, signature: string)
   : Promise<CacheRow | null> {
+  // Treat cache rows computed for a prior calendar year as a miss:
+  // windows are absolute YYYY-MM-DD so a 2026 cache evaluated in 2027
+  // always yields 'too_late' with zero daily scores.
+  const currentYear = new Date().getUTCFullYear();
+  // Jan 1 of current year as epoch ms — any row computed before this is stale.
+  const yearStart = Date.UTC(currentYear, 0, 1);
   return dbGet<CacheRow>(
     sql,
     `SELECT source, confidence, window_start, window_end, indoor_start, indoor_end,
             reasoning, inputs_used, computed_at
        FROM recommendation_cache
-      WHERE catalog_seed_id = $1 AND location_signature = $2 LIMIT 1`,
-    [catalogSeedId, signature],
+      WHERE catalog_seed_id = $1 AND location_signature = $2
+        AND computed_at >= $3
+      LIMIT 1`,
+    [catalogSeedId, signature, yearStart],
   );
 }
 
@@ -261,12 +269,26 @@ recommendationRoutes.get('/recommendations/:catalogSeedId', ...auth, async (c) =
               ai.confidence, ai, ai.reasoning, ['ai_fallback'], loc.regionId);
           }
         } catch {
-          // fall through to the rule baseline below
+          // AI call failed — fall through to uncached rule baseline below.
         }
       }
       if (!cache) {
-        cache = await writeCache(sql, catalogSeedId, signature, 'rule',
-          ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed, loc.regionId);
+        // Sub-threshold rule output: return it uncached so the bulk POST's
+        // worker job remains the source of truth. A cached low-confidence row
+        // would prevent the worker from ever upgrading it (bulk POST readCache
+        // short-circuits enqueue when a cache entry exists).
+        const ruleOnlyCacheRow: CacheRow = {
+          source: 'rule',
+          confidence: ruleBase.confidence,
+          window_start: ruleBase.windowStart,
+          window_end: ruleBase.windowEnd,
+          indoor_start: ruleBase.indoorStart,
+          indoor_end: ruleBase.indoorEnd,
+          reasoning: null,
+          inputs_used: JSON.stringify(ruleBase.inputsUsed),
+          computed_at: Date.now(),
+        };
+        return c.json({ ok: true, data: assembleRecommendation(catalogSeedId, signature, ruleOnlyCacheRow) });
       }
     }
   }
@@ -347,14 +369,18 @@ recommendationRoutes.post('/recommendations/bulk', ...auth, async (c) => {
         // Low-confidence: enqueue job and return an unknown stub. Do NOT
         // write the cache — a stale rule-based entry would prevent the worker
         // from ever being the source of truth.
+        // Include 'running' jobs older than 10 min (stranded) so the
+        // re-enqueue can revive them; fresh 'running' rows are untouched.
         await dbRun(
           sql,
           `INSERT INTO recommendation_jobs (id, catalog_seed_id, location_signature, created_at)
            VALUES ($1,$2,$3,$4)
            ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE
-             SET status = 'pending', attempts = 0, last_error = NULL
-             WHERE recommendation_jobs.status IN ('done', 'failed')`,
-          [nanoid(), id, signature, Date.now()],
+             SET status = 'pending', attempts = 0, last_error = NULL, started_at = NULL
+             WHERE recommendation_jobs.status IN ('done', 'failed')
+                OR (recommendation_jobs.status = 'running'
+                    AND recommendation_jobs.started_at < $5)`,
+          [nanoid(), id, signature, Date.now(), Date.now() - 10 * 60_000],
         );
         pending.push(id);
         recommendations.push({

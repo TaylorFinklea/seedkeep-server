@@ -104,9 +104,23 @@ export function computeRuleBaseline(
   }
   confidence = Math.max(0, Math.round(confidence * 100) / 100);
 
-  // No window at all without a latest date.
-  const windowStart = latest ? fmt(earliest) : null;
-  const windowEnd = latest ? fmt(latest) : null;
+  // No window when latest is absent, or when latest < earliest (inverted
+  // window — crop cannot mature before frost in a short season). An inverted
+  // window must not be cached or projected: projectWindow masks the negative
+  // length and still emits 'plant_soon'/'plant_now' even though every daily
+  // score is 0, giving affirmatively wrong advice. Drop confidence below the
+  // AI fallback threshold so the AI path is consulted instead.
+  let windowStart: string | null = null;
+  let windowEnd: string | null = null;
+  if (latest !== null) {
+    if (latest >= earliest) {
+      windowStart = fmt(earliest);
+      windowEnd = fmt(latest);
+    } else {
+      // Season too short — penalise confidence so the AI fallback fires.
+      confidence = Math.min(confidence, CONFIDENCE_THRESHOLD - 0.01);
+    }
+  }
 
   return { windowStart, windowEnd, indoorStart, indoorEnd, confidence, inputsUsed };
 }
