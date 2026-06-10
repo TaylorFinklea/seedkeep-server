@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbGet, dbRun } from '../db/helpers';
+import { dbAll, dbGet, dbRun, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 
@@ -27,6 +27,13 @@ const upsertSchema = z.object({
   color: z.string().trim().max(20).nullish(),
 });
 
+// Create accepts an optional client-supplied id so the iOS sync engine
+// can push offline creates idempotently (seeds pattern — retries with
+// the same id replay the committed row instead of duplicating it).
+const createSchema = upsertSchema.extend({
+  id: z.string().min(1).max(80).optional(),
+});
+
 tagRoutes.get('/tags', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
@@ -47,19 +54,41 @@ tagRoutes.post('/tags', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
   const body = await c.req.json().catch(() => null);
-  const parsed = upsertSchema.safeParse(body);
+  const parsed = createSchema.safeParse(body);
   if (!parsed.success) {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
-  const id = nanoid();
+  const id = parsed.data.id ?? nanoid();
   const now = Date.now();
   const color = parsed.data.color ?? null;
-  await dbRun(
-    sql,
-    `INSERT INTO tags (id, household_id, name, color, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [id, householdId, parsed.data.name, color, now, now],
-  );
+  try {
+    await dbRun(
+      sql,
+      `INSERT INTO tags (id, household_id, name, color, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, householdId, parsed.data.name, color, now, now],
+    );
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      // Retry of a create that already committed (response lost on the
+      // wire). Replay the existing row as a success when it belongs to
+      // this household — same response shape as a fresh create.
+      const existing = await dbGet<TagRow>(
+        sql,
+        `SELECT id, household_id, name, color, created_at, updated_at, deleted_at
+           FROM tags WHERE id = $1 AND household_id = $2 LIMIT 1`,
+        [id, householdId],
+      );
+      if (existing) {
+        return c.json({ ok: true, data: { tag: existing } });
+      }
+      return c.json({
+        ok: false,
+        error: { code: 'conflict', message: 'A record with this id already exists.' },
+      }, 409);
+    }
+    throw err;
+  }
   return c.json({
     ok: true,
     data: {

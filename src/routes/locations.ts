@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbGet, dbRun } from '../db/helpers';
+import { dbAll, dbGet, dbRun, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
 
@@ -27,6 +27,13 @@ interface LocationRow {
 const upsertSchema = z.object({
   name: z.string().trim().min(1).max(80),
   sort_order: z.number().int().min(0).max(10000).optional(),
+});
+
+// Create accepts an optional client-supplied id so the iOS sync engine
+// can push offline creates idempotently (seeds pattern — retries with
+// the same id replay the committed row instead of duplicating it).
+const createSchema = upsertSchema.extend({
+  id: z.string().min(1).max(80).optional(),
 });
 
 /**
@@ -55,19 +62,41 @@ locationRoutes.post('/locations', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
   const body = await c.req.json().catch(() => null);
-  const parsed = upsertSchema.safeParse(body);
+  const parsed = createSchema.safeParse(body);
   if (!parsed.success) {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
-  const id = nanoid();
+  const id = parsed.data.id ?? nanoid();
   const now = Date.now();
   const sortOrder = parsed.data.sort_order ?? 0;
-  await dbRun(
-    sql,
-    `INSERT INTO locations (id, household_id, name, sort_order, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [id, householdId, parsed.data.name, sortOrder, now, now],
-  );
+  try {
+    await dbRun(
+      sql,
+      `INSERT INTO locations (id, household_id, name, sort_order, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, householdId, parsed.data.name, sortOrder, now, now],
+    );
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      // Retry of a create that already committed (response lost on the
+      // wire). Replay the existing row as a success when it belongs to
+      // this household — same response shape as a fresh create.
+      const existing = await dbGet<LocationRow>(
+        sql,
+        `SELECT id, household_id, name, sort_order, created_at, updated_at, deleted_at
+           FROM locations WHERE id = $1 AND household_id = $2 LIMIT 1`,
+        [id, householdId],
+      );
+      if (existing) {
+        return c.json({ ok: true, data: { location: existing } });
+      }
+      return c.json({
+        ok: false,
+        error: { code: 'conflict', message: 'A record with this id already exists.' },
+      }, 409);
+    }
+    throw err;
+  }
   return c.json({
     ok: true,
     data: {
