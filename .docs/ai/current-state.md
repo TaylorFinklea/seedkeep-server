@@ -8,6 +8,13 @@
 
 ## Last Session Summary
 
+**Date**: 2026-06-10 — Stabilization sprint B1+B3+B4 (umbrella repo owns the full narrative: `seedkeep/.docs/ai/{current-state.md, phases/2026-06-10-stabilization-sprint-spec.md, reviews/2026-06-10-bug-bash-arch-review.md}`)
+
+- B1 `3046d62..64e4046`: corrections wire contract (wrappers, applied_patch, ISO watering timestamps), worker integrity (status='open' guards, 'other' claim exclusion, fresh updated_at stamps), migration 0022 backfill, numeric OCC, idempotency replay.
+- B3 `a6b4a5a..6926981`: POST /seeds one-tx + 23505 replay; client-supplied ids on locations/tags/beds/planting-events; (updated_at,id) delta-cursor tiebreaker on all 9 feeds (`since_id` param + `cursor_id` in envelope).
+- B4 `b32200f..bacf0dc`: recommendation-job reaper (migration 0023 started_at), Anthropic timeouts everywhere, 8s spawnPet cap, year-rollover cache expiry, inverted-window guard, holder-fenced stream locks; ops floors — envelope 5xx logging, DB health check + worker heartbeat, nightly pg_dump→S3 backups + restore script, scripts/deploy.sh + rehearse-migrations.sh gates, reusable rate limiter (photos/mcp/pairing/pre-extracted), timingSafeEqual admin + ADMIN_SECRET set on Fly (keychain `seedkeep-admin-secret`); route hygiene — Bun maxRequestBodySize, pre-extracted caps/MIME/abuse gates, tag/photo cascade cleanup, admin approve re-validation.
+- Suites: 303 unit + 81 integration, typecheck clean. **Deploys: Fly v40 (B1+B3, migration 0022) + v41 (B4, migration 0023).** `scripts/deploy.sh` is now the only documented deploy path.
+
 **Date**: 2026-06-02 — Diagnosed + reverted 404 trace; root cause was iOS-side URL encoding
 
 - User reported `not_found: Route not found` on Sync now (Phase 4 v1 install). Static analysis of all sync endpoint URLs showed every path the iOS client hits responds 401 (= registered) on prod — none were 404.
