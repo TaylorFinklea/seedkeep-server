@@ -18,6 +18,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import postgres, { type Sql } from 'postgres';
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createApp } from '../../src/index';
 import type { Env } from '../../src/env';
 
@@ -265,6 +267,45 @@ describe('POST /api/catalog/:id/feedback — structured submit', () => {
     expect(secondJson.replay).toBe(true);
     expect(secondJson.data.id).toBe(firstJson.data.id);
     expect(secondJson.data.status).toBe('open');
+  });
+
+  it('CONCURRENT submissions with the same Idempotency-Key → one 201 + one 200 replay, never 409', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const app = createApp(TEST_ENV);
+    const idem = uid('idem-race');
+
+    const fire = () =>
+      app.request(
+        `/api/catalog/${catalogId}/feedback`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${fx.sessionToken}`,
+            'Idempotency-Key': idem,
+          },
+          body: JSON.stringify({
+            body: 'double-tap',
+            field_name: 'days_to_maturity_min',
+            suggested_value: '70',
+          }),
+        },
+        TEST_ENV,
+      );
+
+    const [a, b] = await Promise.all([fire(), fire()]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 201]);
+
+    const aJson = (await a.json()) as { data: { id: string; status: string }; replay?: boolean };
+    const bJson = (await b.json()) as { data: { id: string; status: string }; replay?: boolean };
+    const winner = a.status === 201 ? aJson : bJson;
+    const loser = a.status === 201 ? bJson : aJson;
+    cleanup.correctionIds.add(winner.data.id);
+    expect(loser.replay).toBe(true);
+    expect(loser.data.id).toBe(winner.data.id);
+    expect(loser.data.status).toBe('open');
   });
 
   it('duplicate (user, seed, field) open → 409 with existing DTO', async () => {
@@ -524,6 +565,15 @@ describe('PUT /api/catalog/:id/corrections/:correction_id', () => {
       TEST_ENV,
     );
     expect(edit.status).toBe(200);
+    // Single-entity convention: the DTO is wrapped as { correction: ... }.
+    const editJson = (await edit.json()) as {
+      ok: boolean;
+      data: { correction: { id: string; suggested_value: string; status: string } };
+    };
+    expect(editJson.ok).toBe(true);
+    expect(editJson.data.correction.id).toBe(createJson.data.id);
+    expect(editJson.data.correction.suggested_value).toBe('72');
+    expect(editJson.data.correction.status).toBe('open');
   });
 
   it('409 when ai_locked_at IS NOT NULL', async () => {
@@ -696,6 +746,15 @@ describe('POST /api/catalog/:id/corrections/:correction_id/escalate', () => {
       TEST_ENV,
     );
     expect(esc.status).toBe(200);
+    // Single-entity convention: the DTO is wrapped as { correction: ... }.
+    const escJson = (await esc.json()) as {
+      ok: boolean;
+      data: { correction: { id: string; status: string; dismissed_reason: string | null } };
+    };
+    expect(escJson.ok).toBe(true);
+    expect(escJson.data.correction.id).toBe(id);
+    expect(escJson.data.correction.status).toBe('reviewed');
+    expect(escJson.data.correction.dismissed_reason).toBe('user_escalated');
     const rows = await sql.unsafe<{ status: string; dismissed_reason: string | null; escalated_at: number | null }[]>(
       `SELECT status, dismissed_reason, escalated_at FROM catalog_feedback WHERE id = $1`,
       [id],
@@ -785,6 +844,126 @@ describe('GET /api/catalog/corrections/mine', () => {
     expect(json.data.items.length).toBeGreaterThanOrEqual(1);
     expect(json.data.items.some((i) => i.id === id)).toBe(true);
   });
+
+  it('free-form rows surface with NULL field_name/value_type/suggested_value on the wire', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const app = createApp(TEST_ENV);
+
+    // The iOS "Something else" option omits field_name + suggested_value.
+    const create = await app.request(
+      `/api/catalog/${catalogId}/feedback`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${fx.sessionToken}`,
+        },
+        body: JSON.stringify({ body: 'free-form note about this entry' }),
+      },
+      TEST_ENV,
+    );
+    expect(create.status).toBe(201);
+    const id = ((await create.json()) as { data: { id: string } }).data.id;
+    cleanup.correctionIds.add(id);
+
+    const res = await app.request(
+      `/api/catalog/corrections/mine?since=0&limit=50`,
+      { method: 'GET', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      data: {
+        items: {
+          id: string;
+          field_name: string | null;
+          value_type: string | null;
+          suggested_value: string | null;
+          applied_patch: unknown;
+        }[];
+      };
+    };
+    const row = json.data.items.find((i) => i.id === id);
+    expect(row).toBeDefined();
+    expect(row!.field_name).toBeNull();
+    expect(row!.value_type).toBeNull();
+    expect(row!.suggested_value).toBeNull();
+    expect(row!.applied_patch).toBeNull();
+  });
+
+  it("status='applied' rows carry applied_patch from the latest audit row", async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const app = createApp(TEST_ENV);
+
+    const create = await app.request(
+      `/api/catalog/${catalogId}/feedback`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${fx.sessionToken}`,
+        },
+        body: JSON.stringify({
+          body: 'patch me',
+          field_name: 'days_to_maturity_min',
+          suggested_value: '65',
+          client_seen_value: '60',
+        }),
+      },
+      TEST_ENV,
+    );
+    const id = ((await create.json()) as { data: { id: string } }).data.id;
+    cleanup.correctionIds.add(id);
+
+    // Simulate the worker's apply: terminal status + two audit rows.
+    // The DTO must project the LATEST audit row per correction.
+    const now = Date.now();
+    await sql.unsafe(
+      `UPDATE catalog_feedback
+          SET status = 'applied', applied_at = $1, reviewed_at = $1, updated_at = $1
+        WHERE id = $2`,
+      [now, id],
+    );
+    await sql.unsafe(
+      `INSERT INTO catalog_audit_log
+         (id, catalog_seed_id, field_name, old_value, new_value, source,
+          correction_id, actor_user_id, created_at)
+       VALUES ($1, $2, 'days_to_maturity_min', '60', '63', 'auto_apply', $3, $4, $5)`,
+      [`cal_${Math.random().toString(36).slice(2, 12)}`, catalogId, id, fx.userId, now - 2_000],
+    );
+    await sql.unsafe(
+      `INSERT INTO catalog_audit_log
+         (id, catalog_seed_id, field_name, old_value, new_value, source,
+          correction_id, actor_user_id, created_at)
+       VALUES ($1, $2, 'days_to_maturity_min', '63', '65', 'auto_apply', $3, $4, $5)`,
+      [`cal_${Math.random().toString(36).slice(2, 12)}`, catalogId, id, fx.userId, now - 1_000],
+    );
+
+    const res = await app.request(
+      `/api/catalog/corrections/mine?since=0&limit=50`,
+      { method: 'GET', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      data: {
+        items: {
+          id: string;
+          status: string;
+          applied_patch: { field_name: string; new_value: string } | null;
+        }[];
+      };
+    };
+    const row = json.data.items.find((i) => i.id === id);
+    expect(row).toBeDefined();
+    expect(row!.status).toBe('applied');
+    expect(row!.applied_patch).toEqual({
+      field_name: 'days_to_maturity_min',
+      new_value: '65',
+    });
+  });
 });
 
 describe('Notified ledger', () => {
@@ -825,6 +1004,44 @@ describe('Notified ledger', () => {
       TEST_ENV,
     );
     expect(post.status).toBe(200);
+    // First writer: the INSERT landed.
+    const postJson = (await post.json()) as { ok: boolean; data: { inserted: boolean } };
+    expect(postJson.ok).toBe(true);
+    expect(postJson.data.inserted).toBe(true);
+
+    // Replay from the same device: ON CONFLICT DO NOTHING → inserted=false.
+    const replay = await app.request(
+      `/api/catalog/corrections/${id}/notified`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${fx.sessionToken}`,
+        },
+        body: JSON.stringify({ device_id: 'device-A' }),
+      },
+      TEST_ENV,
+    );
+    expect(replay.status).toBe(200);
+    const replayJson = (await replay.json()) as { data: { inserted: boolean } };
+    expect(replayJson.data.inserted).toBe(false);
+
+    // A different device still inserts its own ledger row.
+    const second = await app.request(
+      `/api/catalog/corrections/${id}/notified`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${fx.sessionToken}`,
+        },
+        body: JSON.stringify({ device_id: 'device-B' }),
+      },
+      TEST_ENV,
+    );
+    expect(second.status).toBe(200);
+    const secondJson = (await second.json()) as { data: { inserted: boolean } };
+    expect(secondJson.data.inserted).toBe(true);
 
     const get = await app.request(
       `/api/catalog/corrections/${id}/notified`,
@@ -834,6 +1051,7 @@ describe('Notified ledger', () => {
     expect(get.status).toBe(200);
     const json = (await get.json()) as { data: { devices: string[] } };
     expect(json.data.devices).toContain('device-A');
+    expect(json.data.devices).toContain('device-B');
   });
 });
 
@@ -890,6 +1108,65 @@ describe('Admin gate', () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as { data: { items: { id: string }[] } };
     expect(json.data.items.some((i) => i.id === id)).toBe(true);
+  });
+
+  it('GET /admin/corrections surfaces open free-form rows (NULL + other), not open structured rows', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const app = createApp(TEST_ENV);
+
+    const submit = (body: Record<string, unknown>) =>
+      app.request(
+        `/api/catalog/${catalogId}/feedback`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${fx.sessionToken}`,
+          },
+          body: JSON.stringify(body),
+        },
+        TEST_ENV,
+      );
+
+    // Open free-form (field_name NULL) — the iOS "Something else" shape.
+    const nullRes = await submit({ body: 'free-form triage me' });
+    expect(nullRes.status).toBe(201);
+    const nullId = ((await nullRes.json()) as { data: { id: string } }).data.id;
+    cleanup.correctionIds.add(nullId);
+
+    // Open field_name='other' — accepted by the API, never worker-claimed.
+    const otherRes = await submit({
+      body: 'other-field note',
+      field_name: 'other',
+      suggested_value: 'something about this seed',
+    });
+    expect(otherRes.status).toBe(201);
+    const otherId = ((await otherRes.json()) as { data: { id: string } }).data.id;
+    cleanup.correctionIds.add(otherId);
+
+    // Open structured row — belongs to the worker, NOT the admin list.
+    const structuredRes = await submit({
+      body: 'structured',
+      field_name: 'days_to_maturity_min',
+      suggested_value: '70',
+    });
+    expect(structuredRes.status).toBe(201);
+    const structuredId = ((await structuredRes.json()) as { data: { id: string } }).data.id;
+    cleanup.correctionIds.add(structuredId);
+
+    const res = await app.request(
+      '/admin/corrections',
+      { method: 'GET', headers: { 'X-Admin-Secret': TEST_ENV.ADMIN_SECRET! } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      data: { items: { id: string; status: string; field_name: string | null }[] };
+    };
+    expect(json.data.items.some((i) => i.id === nullId)).toBe(true);
+    expect(json.data.items.some((i) => i.id === otherId)).toBe(true);
+    expect(json.data.items.some((i) => i.id === structuredId)).toBe(false);
   });
 
   it('POST /admin/corrections/:id/approve mutates catalog + writes audit row', async () => {
@@ -1018,5 +1295,63 @@ describe('Admin gate', () => {
       [catalogId],
     );
     expect(revertAudit.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('Migration 0022 — updated_at backfill', () => {
+  it('backfills updated_at=0 rows from created_at so the /mine cursor can see them; idempotent', async () => {
+    const fx = await seedAuthFixture();
+    const catalogId = await seedCatalog();
+    const app = createApp(TEST_ENV);
+
+    // Seed a pre-4D legacy row: free-form, updated_at=0 (the 0020 default).
+    const legacyId = `cf_legacy_${Math.random().toString(36).slice(2, 10)}`;
+    const createdAt = Date.now() - 90 * 86_400_000;
+    await sql.unsafe(
+      `INSERT INTO catalog_feedback
+         (id, catalog_seed_id, household_id, user_id, body, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'pre-4D legacy feedback', 'open', $5::BIGINT, 0)`,
+      [legacyId, catalogId, fx.householdId, fx.userId, createdAt],
+    );
+    cleanup.correctionIds.add(legacyId);
+
+    // Invisible to the strict `updated_at > since` cursor even at since=0.
+    const before = await app.request(
+      `/api/catalog/corrections/mine?since=0&limit=50`,
+      { method: 'GET', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    const beforeJson = (await before.json()) as { data: { items: { id: string }[] } };
+    expect(beforeJson.data.items.some((i) => i.id === legacyId)).toBe(false);
+
+    // Run the migration body verbatim.
+    const body = readFileSync(
+      join(process.cwd(), 'migrations', '0022_backfill_catalog_feedback_updated_at.sql'),
+      'utf8',
+    );
+    await sql.unsafe(body);
+
+    const rows = await sql.unsafe<{ updated_at: number }[]>(
+      `SELECT updated_at FROM catalog_feedback WHERE id = $1`,
+      [legacyId],
+    );
+    expect(rows[0]?.updated_at).toBe(createdAt);
+
+    // Idempotent re-run leaves the value untouched.
+    await sql.unsafe(body);
+    const rows2 = await sql.unsafe<{ updated_at: number }[]>(
+      `SELECT updated_at FROM catalog_feedback WHERE id = $1`,
+      [legacyId],
+    );
+    expect(rows2[0]?.updated_at).toBe(createdAt);
+
+    // Now visible in the delta feed.
+    const after = await app.request(
+      `/api/catalog/corrections/mine?since=0&limit=50`,
+      { method: 'GET', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    const afterJson = (await after.json()) as { data: { items: { id: string }[] } };
+    expect(afterJson.data.items.some((i) => i.id === legacyId)).toBe(true);
   });
 });

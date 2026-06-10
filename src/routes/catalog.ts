@@ -168,6 +168,8 @@ interface CorrectionRow {
   escalated_at: number | null;
   updated_at: number;
   ai_locked_at: number | null;
+  applied_patch_field_name: string | null;
+  applied_patch_new_value: string | null;
 }
 
 function correctionDTO(row: CorrectionRow): Record<string, unknown> {
@@ -191,6 +193,12 @@ function correctionDTO(row: CorrectionRow): Record<string, unknown> {
     applied_at: row.applied_at,
     escalated_at: row.escalated_at,
     updated_at: row.updated_at,
+    applied_patch:
+      row.status === 'applied' &&
+      row.applied_patch_field_name !== null &&
+      row.applied_patch_new_value !== null
+        ? { field_name: row.applied_patch_field_name, new_value: row.applied_patch_new_value }
+        : null,
     deleted_at: null,
   };
 }
@@ -368,12 +376,28 @@ catalogRoutes.post('/catalog/:id/feedback', ...feedbackAuth, async (c) => {
       ],
     );
   } catch (err: unknown) {
-    // Per-(user, seed, field) dedup raised 23505.
+    // Per-(user, seed, field) dedup OR idempotency-key collision raised 23505.
     const code = (err as { code?: string }).code;
     if (code === '23505') {
-      // If it was the idempotency-key collision, the replay branch
-      // above should have caught it — fall through to dedup of open
-      // corrections.
+      // Two requests with the same Idempotency-Key can race past the
+      // replay SELECT above; the loser lands here and must get the
+      // 200 replay, not a 409.
+      if (idempotencyKey) {
+        const replayed = await dbGet<CorrectionRow>(
+          sql,
+          `SELECT ${CORRECTION_SELECT}
+             FROM catalog_feedback
+            WHERE idempotency_key = $1 AND user_id = $2
+            LIMIT 1`,
+          [idempotencyKey, userId],
+        );
+        if (replayed) {
+          return c.json(
+            { ok: true, data: { id: replayed.id, status: replayed.status }, replay: true },
+            200,
+          );
+        }
+      }
       const existing = await dbGet<CorrectionRow>(
         sql,
         `SELECT ${CORRECTION_SELECT}
@@ -410,7 +434,13 @@ const CORRECTION_SELECT = `
   suggested_value, client_seen_value, body, status,
   ai_review_score, ai_notes, dismissed_reason, conflict_with_id,
   user_acknowledged_bounds, created_at, reviewed_at, applied_at,
-  escalated_at, updated_at, ai_locked_at
+  escalated_at, updated_at, ai_locked_at,
+  (SELECT al.field_name FROM catalog_audit_log al
+    WHERE al.correction_id = catalog_feedback.id
+    ORDER BY al.created_at DESC LIMIT 1) AS applied_patch_field_name,
+  (SELECT al.new_value FROM catalog_audit_log al
+    WHERE al.correction_id = catalog_feedback.id
+    ORDER BY al.created_at DESC LIMIT 1) AS applied_patch_new_value
 `;
 
 /**
@@ -502,7 +532,7 @@ catalogRoutes.put('/catalog/:id/corrections/:correction_id', ...feedbackAuth, as
     `SELECT ${CORRECTION_SELECT} FROM catalog_feedback WHERE id = $1`,
     [correctionId],
   );
-  return c.json({ ok: true, data: updated ? correctionDTO(updated) : null });
+  return c.json({ ok: true, data: { correction: updated ? correctionDTO(updated) : null } });
 });
 
 /** DELETE /api/catalog/:id/corrections/:correction_id — withdraw while open. */
@@ -571,7 +601,7 @@ catalogRoutes.post('/catalog/:id/corrections/:correction_id/escalate', ...feedba
     `SELECT ${CORRECTION_SELECT} FROM catalog_feedback WHERE id = $1`,
     [correctionId],
   );
-  return c.json({ ok: true, data: updated ? correctionDTO(updated) : null });
+  return c.json({ ok: true, data: { correction: updated ? correctionDTO(updated) : null } });
 });
 
 /** GET /api/catalog/corrections/mine?since=&limit= */
@@ -656,14 +686,14 @@ catalogRoutes.post('/catalog/corrections/:correction_id/notified', ...mineAuth, 
   }
 
   const now = Date.now();
-  await dbRun(
+  const result = await dbRun(
     sql,
     `INSERT INTO catalog_correction_notifications (correction_id, device_id, notified_at)
      VALUES ($1, $2, $3)
      ON CONFLICT (correction_id, device_id) DO NOTHING`,
     [correctionId, parsed.device_id, now],
   );
-  return c.json({ ok: true, data: { recorded: true } });
+  return c.json({ ok: true, data: { inserted: result.meta.changes > 0 } });
 });
 
 // Suppress unused-warning for symbols only used internally during the route's

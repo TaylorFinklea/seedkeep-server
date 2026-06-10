@@ -7,6 +7,7 @@
  *
  * Routes:
  *   GET    /admin/corrections                       — list status='reviewed'
+ *                                                     + open free-form rows
  *   POST   /admin/corrections/:id/approve           — apply suggestion
  *   POST   /admin/corrections/:id/dismiss           — final dismiss
  *   POST   /api/catalog/:id/revert/:audit_id        — undo any audit row
@@ -55,7 +56,11 @@ interface ReviewedRow {
   updated_at: number;
 }
 
-/** GET /admin/corrections — lists status='reviewed' rows. */
+/**
+ * GET /admin/corrections — lists status='reviewed' rows PLUS open
+ * free-form rows (field_name NULL or 'other'). The worker never claims
+ * free-form rows, so this list is the only triage path they have.
+ */
 adminRoutes.get('/admin/corrections', async (c) => {
   const gate = gateAdmin(c);
   if (!gate.ok) {
@@ -72,6 +77,7 @@ adminRoutes.get('/admin/corrections', async (c) => {
             dismissed_reason, created_at, updated_at
        FROM catalog_feedback
       WHERE status = 'reviewed'
+         OR (status = 'open' AND (field_name IS NULL OR field_name = 'other'))
       ORDER BY updated_at DESC
       LIMIT 200`,
   );
