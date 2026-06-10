@@ -29,6 +29,7 @@ import {
 } from '../../src/lib/catalog/moderationWorker';
 import type { AiReviewResult, ReviewCorrectionArgs } from '../../src/lib/catalog/aiReview';
 import type { ClaimedCorrection } from '../../src/lib/catalog/moderationWorker';
+import { fetchUserQuotaStats } from '../../src/lib/catalog/userQuota';
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? 'postgres://seedkeep:dev-only@localhost:5432/seedkeep';
@@ -965,5 +966,66 @@ describe('applyCorrectionOutcome — zombie guard', () => {
     );
     // Catalog must remain at original 60.
     expect(cat[0]?.days_to_maturity_min).toBe(60);
+  });
+});
+
+describe('fetchUserQuotaStats — admin manual_apply excluded from auto-apply count', () => {
+  let fx: Fixture;
+  let catalogId: string;
+
+  beforeAll(async () => {
+    fx = await seedAuthFixture();
+    catalogId = await seedCatalog({ daysToMaturityMin: 60 });
+  });
+
+  it('counts only auto_apply rows, not manual_apply rows', async () => {
+    const correctionId = uid('cw-cf');
+    const now = Date.now();
+
+    // Insert a catalog_feedback row in 'applied' status.
+    await sql.unsafe(
+      `INSERT INTO catalog_feedback
+         (id, catalog_seed_id, catalog_seed_name, user_id, household_id,
+          field_name, value_type, suggested_value, body, status,
+          created_at, updated_at, applied_at)
+       VALUES ($1, $2, 'Tomato', $3, $4,
+               'days_to_maturity_min', 'integer', '65', 'test body', 'applied',
+               $5, $5, $5)`,
+      [correctionId, catalogId, fx.userId, fx.householdId, now],
+    );
+    cleanup.correctionIds.add(correctionId);
+
+    const auditId = uid('cal');
+
+    // Insert a manual_apply audit row (admin approval — should NOT count).
+    await sql.unsafe(
+      `INSERT INTO catalog_audit_log
+         (id, catalog_seed_id, field_name, old_value, new_value,
+          source, correction_id, actor_user_id, created_at)
+       VALUES ($1, $2, 'days_to_maturity_min', '60', '65',
+               'manual_apply', $3, NULL, $4)`,
+      [auditId, catalogId, correctionId, now],
+    );
+
+    const stats = await fetchUserQuotaStats(sql, fx.userId);
+    // manual_apply should not count toward lifetime auto-applies.
+    expect(stats.lifetimeAutoApplies).toBe(0);
+    expect(stats.autoAppliesLast24h).toBe(0);
+
+    // Now add an auto_apply audit row for the same correction.
+    const autoAuditId = uid('cal');
+    await sql.unsafe(
+      `INSERT INTO catalog_audit_log
+         (id, catalog_seed_id, field_name, old_value, new_value,
+          source, correction_id, actor_user_id, created_at)
+       VALUES ($1, $2, 'days_to_maturity_min', '60', '65',
+               'auto_apply', $3, $4, $5)`,
+      [autoAuditId, catalogId, correctionId, fx.userId, now],
+    );
+
+    const statsAfter = await fetchUserQuotaStats(sql, fx.userId);
+    // auto_apply row should count.
+    expect(statsAfter.lifetimeAutoApplies).toBe(1);
+    expect(statsAfter.autoAppliesLast24h).toBe(1);
   });
 });

@@ -19,13 +19,14 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { nanoid } from 'nanoid';
+import { timingSafeEqual } from 'node:crypto';
 import type { AppEnv } from '../index';
 import { dbAll, dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
 
 export const adminRoutes = new Hono<AppEnv>();
 
-function gateAdmin(c: { env: { ADMIN_SECRET?: string }; req: { header: (k: string) => string | undefined } }):
+function gateAdmin(c: { env: { ADMIN_SECRET?: string }; req: { header: (k: string) => string | undefined; method: string; path?: string } }):
   | { ok: true }
   | { ok: false; status: 401 | 503 } {
   const expected = (c.env as { ADMIN_SECRET?: string }).ADMIN_SECRET;
@@ -33,7 +34,18 @@ function gateAdmin(c: { env: { ADMIN_SECRET?: string }; req: { header: (k: strin
     return { ok: false, status: 503 };
   }
   const provided = c.req.header('X-Admin-Secret') ?? c.req.header('x-admin-secret');
-  if (!provided || provided !== expected) {
+  if (!provided) {
+    console.warn(JSON.stringify({ event: 'admin_auth_failed', reason: 'missing_secret', method: c.req.method }));
+    return { ok: false, status: 401 };
+  }
+  // Use constant-time comparison to prevent timing-based secret discovery.
+  // Pad both sides to the same length before comparing to avoid leaking
+  // length information via short-circuit in Buffer.from.
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const providedBuf = Buffer.from(provided.padEnd(expected.length, '\0'), 'utf8').subarray(0, expectedBuf.length);
+  const match = providedBuf.length === expectedBuf.length && timingSafeEqual(expectedBuf, providedBuf);
+  if (!match) {
+    console.warn(JSON.stringify({ event: 'admin_auth_failed', reason: 'wrong_secret', method: c.req.method }));
     return { ok: false, status: 401 };
   }
   return { ok: true };

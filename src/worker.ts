@@ -19,6 +19,7 @@ import { fetchAiBaseline } from './lib/recommendation/aiFallback';
 import type { AiBaseline } from './lib/recommendation/aiFallback';
 import type { HouseholdLocation } from './lib/recommendation/engine';
 import { processOne as processOneCorrection } from './lib/catalog/moderationWorker';
+import { runBackup } from '../scripts/backup';
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_ATTEMPTS = 3;
@@ -192,6 +193,7 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
 }
 
 const WORKER_HEARTBEAT_KEY = 'worker_last_tick';
+const BACKUP_SENTINEL_KEY = 'backup_last_run_ymd';
 
 async function upsertHeartbeat(sql: Sql): Promise<void> {
   await sql.unsafe(
@@ -201,6 +203,21 @@ async function upsertHeartbeat(sql: Sql): Promise<void> {
     `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
      ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
     [WORKER_HEARTBEAT_KEY, String(Date.now())],
+  );
+}
+
+async function maybeBackup(env: ReturnType<typeof loadEnv>, sql: Sql): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const row = await sql.unsafe<{ v: string }[]>(
+    `SELECT v FROM _seedkeep_kv WHERE k = $1 LIMIT 1`,
+    [BACKUP_SENTINEL_KEY],
+  );
+  if (row[0]?.v === today) return;
+  await runBackup(env);
+  await sql.unsafe(
+    `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
+     ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+    [BACKUP_SENTINEL_KEY, today],
   );
 }
 
@@ -219,6 +236,14 @@ async function main() {
       await upsertHeartbeat(sql);
     } catch (err) {
       console.error('[worker] heartbeat error', err);
+    }
+
+    // Nightly backup: once-per-UTC-day sentinel in _seedkeep_kv.
+    try {
+      const sql = getSql(env);
+      await maybeBackup(env, sql);
+    } catch (err) {
+      console.error('[worker] backup error', err);
     }
 
     // Check SIGTERM between jobs — in-flight await finishes, no new claims.

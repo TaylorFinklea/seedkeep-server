@@ -6,6 +6,11 @@ import { requireHousehold } from '../middleware/household';
 import { dbAll, dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
 import { deletePhoto, getPhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
+import { checkRateLimit } from '../lib/rateLimit';
+
+// 20 photo uploads per household per hour.
+const PHOTO_UPLOAD_LIMIT = 20;
+const PHOTO_UPLOAD_WINDOW_MS = 3_600_000;
 
 export const photoRoutes = new Hono<AppEnv>();
 
@@ -44,6 +49,18 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const seedId = c.req.param('seedId');
   const sql = getSql(c.env);
+
+  const rl = await checkRateLimit(sql, {
+    scopeId: householdId,
+    scopeColumn: 'household_id',
+    table: 'seed_photos',
+    createdAtColumn: 'captured_at',
+    windowMs: PHOTO_UPLOAD_WINDOW_MS,
+    limit: PHOTO_UPLOAD_LIMIT,
+    retryAfterSeconds: 3600,
+    message: 'too many photo uploads in the last hour',
+  });
+  if (rl.limited) return c.json(rl.response, 429);
 
   const seed = await dbGet<{ id: string }>(
     sql,

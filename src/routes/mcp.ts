@@ -22,6 +22,11 @@ import { getSql } from '../db/client';
 import { WebStandardStreamableHTTPServerTransport } from
   '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { buildMcpServer } from '../lib/assistant/mcpServer';
+import { checkRateLimit } from '../lib/rateLimit';
+
+// 20 token mints per user per hour.
+const TOKEN_MINT_LIMIT = 20;
+const TOKEN_MINT_WINDOW_MS = 3_600_000;
 
 // Two routers from one file — token CRUD lives under /api/mcp/tokens
 // while the MCP wire-protocol endpoint lives at /mcp at the root.
@@ -72,6 +77,16 @@ mcpTokenRoutes.post('/mcp/tokens', ...tokenAuth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const userId = c.get('userId') as string;
+
+  const rl = await checkRateLimit(sql, {
+    scopeId: userId,
+    table: 'mcp_tokens',
+    windowMs: TOKEN_MINT_WINDOW_MS,
+    limit: TOKEN_MINT_LIMIT,
+    retryAfterSeconds: 3600,
+    message: 'too many token mints in the last hour',
+  });
+  if (rl.limited) return c.json(rl.response, 429);
 
   let parsed: z.infer<typeof CreateTokenBody>;
   try {

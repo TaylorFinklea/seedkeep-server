@@ -162,16 +162,12 @@
   <script>
     'use strict';
 
-    const SECRET_KEY = 'seedkeep.admin.secret';
+    // The admin secret is held in page memory only — never written to
+    // localStorage, sessionStorage, or any other persistent store.
     const secretInput = document.getElementById('secret');
     const statusEl = document.getElementById('status');
     const tableWrap = document.getElementById('table-wrap');
     const reloadBtn = document.getElementById('reload');
-
-    secretInput.value = localStorage.getItem(SECRET_KEY) || '';
-    secretInput.addEventListener('change', () => {
-      localStorage.setItem(SECRET_KEY, secretInput.value);
-    });
 
     function escapeHTML(s) {
       if (s === null || s === undefined) return '';
@@ -290,9 +286,6 @@
     }
 
     reloadBtn.addEventListener('click', reload);
-    if (secretInput.value) {
-      reload();
-    }
   </script>
 </body>
 </html>

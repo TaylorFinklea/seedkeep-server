@@ -29,6 +29,11 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
+# PostgreSQL 16 client tools (pg_dump) for nightly backups.
+# alpine:3.x ships postgresql16-client in the community repo.
+# Pin to the major version that matches the Fly Postgres cluster (v16).
+RUN apk add --no-cache postgresql16-client
+
 # Copy deps + source from builder.
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json

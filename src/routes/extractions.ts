@@ -11,6 +11,11 @@ import { isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
 import { extractFromPhotos, type ExtractionResult } from '../lib/extraction/anthropic';
 import { reviewExtraction } from '../lib/extraction/review';
 import { decideCatalogStatus, type CatalogDecision } from '../lib/extraction/confidence';
+import { checkRateLimit } from '../lib/rateLimit';
+
+// 20 pre-extracted submissions per user per hour.
+const PRE_EXTRACTED_LIMIT = 20;
+const PRE_EXTRACTED_WINDOW_MS = 3_600_000;
 
 type UserTier = 'free' | 'byok' | 'hosted';
 
@@ -381,6 +386,17 @@ extractionRoutes.post('/extractions/pre-extracted', ...auth, async (c) => {
       400,
     );
   }
+
+  const rl = await checkRateLimit(sql, {
+    scopeId: userId,
+    scopeColumn: 'submitted_by_user',
+    table: 'catalog_extractions',
+    windowMs: PRE_EXTRACTED_WINDOW_MS,
+    limit: PRE_EXTRACTED_LIMIT,
+    retryAfterSeconds: 3600,
+    message: 'too many extractions in the last hour',
+  });
+  if (rl.limited) return c.json(rl.response, 429);
 
   const body = await c.req.json().catch(() => null);
   const parsed = preExtractedSchema.safeParse(body);

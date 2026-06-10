@@ -52,7 +52,8 @@ const schema = z.object({
 
   // Phase 4D · admin surface secret. When unset, admin routes return 503
   // not_configured — explicit fail-closed rather than silent open.
-  ADMIN_SECRET: z.string().optional().transform((v) => v?.trim() || undefined),
+  // Must be at least 32 characters when set (prod uses 64-char value).
+  ADMIN_SECRET: z.string().min(32).optional().transform((v) => v?.trim() || undefined),
 });
 
 export type Env = z.infer<typeof schema>;

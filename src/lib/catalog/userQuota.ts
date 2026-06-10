@@ -39,29 +39,31 @@ export function computeUserQuota(stats: UserQuotaStats): UserQuotaResult {
 }
 
 /**
- * Lifetime + last-24h auto-apply stats for `userId`. The reverts count is
- * the number of `manual_revert` audit rows whose `correction_id`'s
- * `catalog_feedback.user_id` matches — i.e. corrections this user
- * submitted that an admin later reverted.
+ * Lifetime + last-24h auto-apply stats for `userId`. Only worker
+ * auto-applies (source='auto_apply' in catalog_audit_log) count toward
+ * power-user promotion and daily quota. Admin manual approvals
+ * (source='manual_apply') are excluded so that operators triaging the queue
+ * do not inadvertently inflate users' stats.
  */
 export async function fetchUserQuotaStats(sql: Sql, userId: string): Promise<UserQuotaStats> {
   const oneDayAgo = Date.now() - 86_400_000;
 
-  // Three counts in a single round-trip. SQL keeps the partial-index
-  // hot paths (catalog_feedback_user_auto_apply_daily for the daily
-  // count; catalog_audit_actor_revert for reverts).
+  // Three counts in a single round-trip. Only rows with a matching
+  // auto_apply audit entry count — manual_apply rows are excluded.
   const rows = await sql.unsafe<
     { lifetime_auto: number; reverts: number; daily_auto: number }[]
   >(
     `
     SELECT
-      (SELECT count(*)::int FROM catalog_feedback
-        WHERE user_id = $1 AND status = 'applied') AS lifetime_auto,
+      (SELECT count(*)::int FROM catalog_feedback cf
+        JOIN catalog_audit_log al ON al.correction_id = cf.id AND al.source = 'auto_apply'
+        WHERE cf.user_id = $1 AND cf.status = 'applied') AS lifetime_auto,
       (SELECT count(*)::int FROM catalog_audit_log al
         JOIN catalog_feedback cf ON cf.id = al.correction_id
         WHERE cf.user_id = $1 AND al.source = 'manual_revert') AS reverts,
-      (SELECT count(*)::int FROM catalog_feedback
-        WHERE user_id = $1 AND status = 'applied' AND applied_at >= $2) AS daily_auto
+      (SELECT count(*)::int FROM catalog_feedback cf
+        JOIN catalog_audit_log al ON al.correction_id = cf.id AND al.source = 'auto_apply'
+        WHERE cf.user_id = $1 AND cf.status = 'applied' AND cf.applied_at >= $2) AS daily_auto
     `,
     [userId, oneDayAgo],
   );

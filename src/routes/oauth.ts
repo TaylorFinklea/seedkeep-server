@@ -28,6 +28,13 @@ import { dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
 import { getAuth } from '../lib/auth';
 
+// 20 pairing-code mints per user per hour.
+const PAIRING_MINT_LIMIT = 20;
+const PAIRING_MINT_WINDOW_MS = 3_600_000;
+// Pairing codes expire after 10 min. expires_at ≈ minted_at + PAIRING_TTL_MS,
+// so minted_at > now - window  ⟺  expires_at > now - window + PAIRING_TTL_MS.
+const PAIRING_TTL_MS = 10 * 60_000;
+
 // Two routers from one file. The pairing-code mint endpoint is
 // iOS-facing and belongs under /api; everything else (OAuth flow
 // pages, .well-known metadata proxies, OAuth endpoint proxies) is
@@ -156,6 +163,22 @@ oauthPublicRoutes.post('/web_pairing_codes', ...PairingCodeAuth, async (c) => {
   const sql = getSql(c.env);
   const userId = c.get('userId') as string;
   const householdId = c.get('householdId') as string;
+
+  // Rate limit: count recent mints via expires_at proxy (expires_at = minted_at + TTL).
+  // minted_at > now - window  ⟺  expires_at > now - window + PAIRING_TTL_MS.
+  const pairWindowCutoff = Date.now() - PAIRING_MINT_WINDOW_MS + PAIRING_TTL_MS;
+  const pairCount = await sql.unsafe<{ n: number }[]>(
+    `SELECT count(*)::int AS n FROM web_pairing_codes WHERE user_id = $1 AND expires_at > $2`,
+    [userId, pairWindowCutoff],
+  );
+  if (Number(pairCount[0]?.n ?? 0) >= PAIRING_MINT_LIMIT) {
+    return c.json({
+      ok: false,
+      error: { code: 'rate_limited', message: 'too many pairing code requests in the last hour' },
+      retry_after_seconds: 3600,
+    }, 429);
+  }
+
   const code = generatePairingCode();
   const now = Date.now();
   const expiresAt = now + 10 * 60 * 1000;
