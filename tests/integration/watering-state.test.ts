@@ -241,6 +241,54 @@ describe('POST /api/households/:id/watering-state — round-trip', () => {
   });
 });
 
+describe('watering-state wire format', () => {
+  // Pins the exact serialization: ISO-8601 with the 'T' separator,
+  // millisecond precision, and 'Z' suffix (Date.toISOString()). The iOS
+  // ISO8601DateFormatter silently returns nil for Postgres's ::text
+  // rendering ('2026-06-04 08:00:00+00'), so a space separator here is
+  // a cross-device-dedup regression even though Date.parse accepts it.
+  const ISO_WIRE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+  it('POST and GET both return the exact T+Z ISO-8601 string', async () => {
+    const fx = await seedAuthFixture();
+    const app = createApp(TEST_ENV);
+
+    const post = await app.request(
+      `/api/households/${fx.householdId}/watering-state`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${fx.sessionToken}`,
+        },
+        body: JSON.stringify({ scheduled_for: T_MID }),
+      },
+      TEST_ENV,
+    );
+    expect(post.status).toBe(200);
+    const postJson = (await post.json()) as {
+      data: { last_watering_notification_at: string | null };
+    };
+    expect(postJson.data.last_watering_notification_at).toBe(T_MID);
+    expect(postJson.data.last_watering_notification_at).toMatch(ISO_WIRE);
+
+    const get = await app.request(
+      `/api/households/${fx.householdId}/watering-state`,
+      {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${fx.sessionToken}` },
+      },
+      TEST_ENV,
+    );
+    expect(get.status).toBe(200);
+    const getJson = (await get.json()) as {
+      data: { last_watering_notification_at: string | null };
+    };
+    expect(getJson.data.last_watering_notification_at).toBe(T_MID);
+    expect(getJson.data.last_watering_notification_at).toMatch(ISO_WIRE);
+  });
+});
+
 describe('POST /api/households/:id/watering-state — GREATEST semantics', () => {
   it('POST with an earlier timestamp returns the existing (later) value', async () => {
     const fx = await seedAuthFixture();

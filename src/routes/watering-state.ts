@@ -30,8 +30,17 @@ const PostBody = z.object({
     .refine((s) => !Number.isNaN(Date.parse(s)), { message: 'scheduled_for must be ISO8601' }),
 });
 
+// postgres.js parses timestamptz to a JS Date; serialize via
+// toISOString() so the wire format is ISO-8601 with the 'T' separator
+// and 'Z' suffix iOS's ISO8601DateFormatter requires. (Postgres's own
+// ::text rendering uses a space separator + '+00' offset, which that
+// parser silently rejects.)
 interface StateRow {
-  last_watering_notification_at: string | null;
+  last_watering_notification_at: Date | null;
+}
+
+function isoOrNull(d: Date | null): string | null {
+  return d ? d.toISOString() : null;
 }
 
 export const wateringStateRoutes = new Hono<AppEnv>();
@@ -51,7 +60,7 @@ wateringStateRoutes.get('/households/:id/watering-state', ...auth, async (c) => 
 
   const row = await dbGet<StateRow>(
     sql,
-    `SELECT last_watering_notification_at::text AS last_watering_notification_at
+    `SELECT last_watering_notification_at
        FROM households
       WHERE id = $1`,
     [sessionHouseholdId],
@@ -62,7 +71,7 @@ wateringStateRoutes.get('/households/:id/watering-state', ...auth, async (c) => 
 
   return c.json({
     ok: true,
-    data: { last_watering_notification_at: row.last_watering_notification_at },
+    data: { last_watering_notification_at: isoOrNull(row.last_watering_notification_at) },
   });
 });
 
@@ -108,7 +117,7 @@ wateringStateRoutes.post('/households/:id/watering-state', ...auth, async (c) =>
         SET last_watering_notification_at =
               GREATEST(COALESCE(last_watering_notification_at, $2::timestamptz), $2::timestamptz)
       WHERE id = $1
-      RETURNING last_watering_notification_at::text AS last_watering_notification_at`,
+      RETURNING last_watering_notification_at`,
     [sessionHouseholdId, scheduledForIso],
   );
 
@@ -118,6 +127,6 @@ wateringStateRoutes.post('/households/:id/watering-state', ...auth, async (c) =>
 
   return c.json({
     ok: true,
-    data: { last_watering_notification_at: row.last_watering_notification_at },
+    data: { last_watering_notification_at: isoOrNull(row.last_watering_notification_at) },
   });
 });
