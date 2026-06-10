@@ -86,6 +86,9 @@ const STUB_ENV: Env = {
   DEFAULT_VISION_MODEL: 'claude-sonnet-4-6',
   DEFAULT_REVIEW_MODEL: 'claude-haiku-4-5-20251001',
   ADMIN_SECRET: 'test-admin-secret-of-at-least-32-chars!',
+  ANTHROPIC_API_KEY: undefined,
+  APPLE_IAP_SHARED_SECRET: undefined,
+  ASSISTANT_KEY_MASTER: undefined,
 };
 
 describe('POST /api/planting-events kind validation', () => {
