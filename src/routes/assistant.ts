@@ -7,7 +7,7 @@ import { getSql } from '../db/client';
 import { dbGet, dbAll, dbRun } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
+import { parseDeltaQuery, buildDeltaPayload, deltaCursorWhere } from '../lib/sync';
 import { decryptApiKey } from '../lib/assistant/keyEncryption';
 import { anthropicTools } from '../lib/assistant/tools';
 import { executeTool, executeProposedChange } from '../lib/assistant/executor';
@@ -110,8 +110,9 @@ assistantRoutes.get('/threads', ...auth, async (c) => {
   const url = new URL(c.req.url);
   const query = parseDeltaQuery(url.searchParams);
 
-  const wheres: string[] = ['household_id = $1', 'updated_at > $2'];
-  const params: unknown[] = [householdId, query.since];
+  const cursor = deltaCursorWhere(query, 2);
+  const wheres: string[] = ['household_id = $1', cursor.clause];
+  const params: unknown[] = [householdId, ...cursor.params];
   if (query.since === 0) wheres.push('deleted_at IS NULL');
 
   params.push(query.limit);
@@ -120,7 +121,7 @@ assistantRoutes.get('/threads', ...auth, async (c) => {
     `SELECT id, household_id, title, thread_kind, created_at, updated_at, deleted_at
        FROM assistant_threads
       WHERE ${wheres.join(' AND ')}
-      ORDER BY updated_at ASC
+      ORDER BY updated_at ASC, id ASC
       LIMIT $${params.length}`,
     params,
   );
@@ -133,6 +134,7 @@ assistantRoutes.get('/threads', ...auth, async (c) => {
     data: {
       items: payload.items.map(threadToDto),
       cursor: payload.cursor,
+      cursor_id: payload.cursor_id,
       has_more: payload.has_more,
     },
   });

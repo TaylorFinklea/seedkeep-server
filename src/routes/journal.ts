@@ -8,7 +8,7 @@ import { requireHousehold } from '../middleware/household';
 import { validateAtMostOneAttach } from '../lib/journal/validation';
 import { retrospectiveMmDdWindow, validateMmDd } from '../lib/journal/retrospective';
 import { deletePhoto, getPhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
-import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
+import { parseDeltaQuery, buildDeltaPayload, deltaCursorWhere } from '../lib/sync';
 
 const auth = [requireAuth(), requireHousehold()] as const;
 
@@ -62,9 +62,10 @@ journalRoutes.get('/', ...auth, async (c) => {
   const fromDate = url.searchParams.get('from_date');
   const toDate = url.searchParams.get('to_date');
 
-  const wheres: string[] = ['household_id = $1', 'updated_at > $2'];
-  const params: unknown[] = [householdId, query.since];
-  let p = 3;
+  const cursor = deltaCursorWhere(query, 2);
+  const wheres: string[] = ['household_id = $1', cursor.clause];
+  const params: unknown[] = [householdId, ...cursor.params];
+  let p = params.length + 1;
   if (query.since === 0) wheres.push('deleted_at IS NULL');
   if (seedId) { wheres.push(`seed_id = $${p++}`); params.push(seedId); }
   if (bedId) { wheres.push(`bed_id = $${p++}`); params.push(bedId); }
@@ -79,7 +80,7 @@ journalRoutes.get('/', ...auth, async (c) => {
             planting_event_id, created_at, updated_at, deleted_at
        FROM journal_entries
       WHERE ${wheres.join(' AND ')}
-      ORDER BY updated_at ASC
+      ORDER BY updated_at ASC, id ASC
       LIMIT $${p}`,
     params,
   );
@@ -92,6 +93,7 @@ journalRoutes.get('/', ...auth, async (c) => {
     data: {
       items: payload.items.map(rowToDto),
       cursor: payload.cursor,
+      cursor_id: payload.cursor_id,
       has_more: payload.has_more,
     },
   });

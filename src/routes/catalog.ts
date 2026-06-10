@@ -604,33 +604,46 @@ catalogRoutes.post('/catalog/:id/corrections/:correction_id/escalate', ...feedba
   return c.json({ ok: true, data: { correction: updated ? correctionDTO(updated) : null } });
 });
 
-/** GET /api/catalog/corrections/mine?since=&limit= */
+/** GET /api/catalog/corrections/mine?since=&since_id=&limit= */
 catalogRoutes.get('/catalog/corrections/mine', ...mineAuth, async (c) => {
   const sql = getSql(c.env);
   const userId = c.get('userId') as string;
   const sinceParam = c.req.query('since');
+  const sinceIdParam = c.req.query('since_id');
   const limitParam = c.req.query('limit');
   const since = sinceParam ? Number(sinceParam) : 0;
+  const sinceId = sinceIdParam ? sinceIdParam : null;
   const limit = Math.max(1, Math.min(50, limitParam ? Number(limitParam) : 50));
+
+  // Composite cursor (contract decision 9): with `since_id`, rows tied at
+  // the cursor millisecond resume from the id tiebreaker instead of being
+  // skipped by the strict filter. Without it, legacy behavior holds.
+  const cursorClause = sinceId !== null
+    ? '(updated_at > $2 OR (updated_at = $2 AND id > $3))'
+    : 'updated_at > $2';
+  const params: unknown[] = sinceId !== null ? [userId, since, sinceId] : [userId, since];
+  params.push(limit + 1);
 
   const rows = await dbAll<CorrectionRow>(
     sql,
     `SELECT ${CORRECTION_SELECT}
        FROM catalog_feedback
-      WHERE user_id = $1 AND updated_at > $2
+      WHERE user_id = $1 AND ${cursorClause}
       ORDER BY updated_at ASC, id ASC
-      LIMIT $3`,
-    [userId, since, limit + 1],
+      LIMIT $${params.length}`,
+    params,
   );
   const hasMore = rows.length > limit;
   const items = rows.slice(0, limit);
   const cursor = items.length > 0 ? items[items.length - 1].updated_at : since;
+  const cursorId = items.length > 0 ? items[items.length - 1].id : sinceId;
 
   return c.json({
     ok: true,
     data: {
       items: items.map(correctionDTO),
       cursor,
+      cursor_id: cursorId,
       has_more: hasMore,
     },
   });

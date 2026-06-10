@@ -31,7 +31,7 @@ import { decryptApiKey } from '../lib/assistant/keyEncryption';
 import { buildDepartureNotePrompt, parseDepartureNoteResponse } from '../lib/pets/sprout';
 import { anthropicOneShot } from '../lib/pets/anthropicOneShot';
 import { BESTIARY, type PetRarity } from '../lib/pets/bestiary';
-import { parseDeltaQuery, buildDeltaPayload } from '../lib/sync';
+import { parseDeltaQuery, buildDeltaPayload, deltaCursorWhere } from '../lib/sync';
 
 export const petRoutes = new Hono<AppEnv>();
 
@@ -154,8 +154,11 @@ petRoutes.get('/pets/departures', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const query = parseDeltaQuery(new URL(c.req.url).searchParams);
 
-  const wheres: string[] = ['household_id = $1', 'updated_at > $2'];
-  const params: unknown[] = [householdId, query.since];
+  // This feed's primary key is planting_event_id, so it doubles as the
+  // cursor tiebreaker id.
+  const cursor = deltaCursorWhere(query, 2, { id: 'planting_event_id' });
+  const wheres: string[] = ['household_id = $1', cursor.clause];
+  const params: unknown[] = [householdId, ...cursor.params];
   if (query.since === 0) wheres.push('deleted_at IS NULL');
   params.push(query.limit);
 
@@ -165,12 +168,12 @@ petRoutes.get('/pets/departures', ...auth, async (c) => {
             departed_at, created_at, updated_at, deleted_at
        FROM pet_departures
       WHERE ${wheres.join(' AND ')}
-      ORDER BY updated_at ASC
+      ORDER BY updated_at ASC, planting_event_id ASC
       LIMIT $${params.length}`,
     params,
   );
 
-  return c.json({ ok: true, data: buildDeltaPayload(rows, query) });
+  return c.json({ ok: true, data: buildDeltaPayload(rows, query, (r) => r.planting_event_id) });
 });
 
 // ── POST /api/pets/:planting_event_id/depart ──────────────────────────────

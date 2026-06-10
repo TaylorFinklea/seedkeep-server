@@ -6,7 +6,7 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
-import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
+import { buildDeltaPayload, deltaCursorWhere, parseDeltaQuery } from '../lib/sync';
 import { decryptApiKey } from '../lib/assistant/keyEncryption';
 import { run as spawnPet } from '../lib/pets/spawn';
 
@@ -78,14 +78,16 @@ plantingEventRoutes.get('/planting-events', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
   const query = parseDeltaQuery(new URL(c.req.url).searchParams);
+  const cursor = deltaCursorWhere(query, 2);
+  const params = [householdId, ...cursor.params, query.limit];
   const items = await dbAll<PlantingEventRow>(
     sql,
     `SELECT ${SELECT_COLS}
        FROM planting_events
-      WHERE household_id = $1 AND updated_at > $2
-      ORDER BY updated_at ASC
-      LIMIT $3`,
-    [householdId, query.since, query.limit],
+      WHERE household_id = $1 AND ${cursor.clause}
+      ORDER BY updated_at ASC, id ASC
+      LIMIT $${params.length}`,
+    params,
   );
   return c.json({ ok: true, data: buildDeltaPayload(items, query) });
 });

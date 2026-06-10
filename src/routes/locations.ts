@@ -6,7 +6,7 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { dbAll, dbGet, dbRun, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
-import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
+import { buildDeltaPayload, deltaCursorWhere, parseDeltaQuery } from '../lib/sync';
 
 export const locationRoutes = new Hono<AppEnv>();
 
@@ -46,14 +46,16 @@ locationRoutes.get('/locations', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
   const query = parseDeltaQuery(new URL(c.req.url).searchParams);
+  const cursor = deltaCursorWhere(query, 2);
+  const params = [householdId, ...cursor.params, query.limit];
   const items = await dbAll<LocationRow>(
     sql,
     `SELECT id, household_id, name, sort_order, created_at, updated_at, deleted_at
        FROM locations
-      WHERE household_id = $1 AND updated_at > $2
-      ORDER BY updated_at ASC
-      LIMIT $3`,
-    [householdId, query.since, query.limit],
+      WHERE household_id = $1 AND ${cursor.clause}
+      ORDER BY updated_at ASC, id ASC
+      LIMIT $${params.length}`,
+    params,
   );
   return c.json({ ok: true, data: buildDeltaPayload(items, query) });
 });

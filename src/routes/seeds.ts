@@ -153,7 +153,17 @@ seedRoutes.get('/seeds', ...auth, async (c) => {
   };
 
   addWhere('s.household_id = ?', householdId);
-  addWhere('s.updated_at > ?', query.since);
+  if (query.sinceId !== null) {
+    // Composite cursor (contract decision 9): resume mid-millisecond via
+    // the id tiebreaker so tied rows straddling a page boundary aren't
+    // skipped forever.
+    addWhere(
+      '(s.updated_at > ? OR (s.updated_at = ? AND s.id > ?))',
+      query.since, query.since, query.sinceId,
+    );
+  } else {
+    addWhere('s.updated_at > ?', query.since);
+  }
 
   if (query.since === 0) {
     wheres.push(`s.deleted_at IS NULL`);
@@ -183,7 +193,7 @@ seedRoutes.get('/seeds', ...auth, async (c) => {
             ${TAG_IDS_AGG}
        FROM seeds s
       WHERE ${wheres.join(' AND ')}
-      ORDER BY s.updated_at ASC
+      ORDER BY s.updated_at ASC, s.id ASC
       LIMIT ${limitPlaceholder}`,
     params,
   );
