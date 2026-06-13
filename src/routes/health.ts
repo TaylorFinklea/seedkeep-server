@@ -5,6 +5,9 @@ import { getSql } from '../db/client';
 export const healthRoutes = new Hono<AppEnv>();
 
 const WORKER_STALE_MS = 2 * 60 * 1000; // 2 minutes
+// A backup not recorded within 36 hours is considered stale (covers daily
+// cadence + a full day of slack for the first backup after a fresh deploy).
+const BACKUP_STALE_HOURS = 36;
 
 healthRoutes.get('/health', async (c) => {
   const sql = getSql(c.env);
@@ -19,14 +22,26 @@ healthRoutes.get('/health', async (c) => {
   // process down; ops monitors the stale flag separately.
   let workerLastTick: number | null = null;
   let workerStale = false;
+  let backupLastSuccessYmd: string | null = null;
+  let backupStale = false;
   try {
-    const row = await sql.unsafe<{ v: string }[]>(
-      `SELECT v FROM _seedkeep_kv WHERE k = 'worker_last_tick' LIMIT 1`,
+    const rows = await sql.unsafe<{ k: string; v: string }[]>(
+      `SELECT k, v FROM _seedkeep_kv
+        WHERE k IN ('worker_last_tick', 'backup_last_success_ymd')`,
     );
-    if (row[0]) {
-      workerLastTick = Number(row[0].v);
-      workerStale = Date.now() - workerLastTick > WORKER_STALE_MS;
+    for (const row of rows) {
+      if (row.k === 'worker_last_tick') {
+        workerLastTick = Number(row.v);
+        workerStale = Date.now() - workerLastTick > WORKER_STALE_MS;
+      } else if (row.k === 'backup_last_success_ymd') {
+        backupLastSuccessYmd = row.v;
+        // Parse YYYY-MM-DD as UTC midnight, compare to now.
+        const successTs = Date.parse(`${row.v}T00:00:00Z`);
+        backupStale = Date.now() - successTs > BACKUP_STALE_HOURS * 60 * 60 * 1000;
+      }
     }
+    // No row for backup_last_success_ymd → never succeeded → stale.
+    if (backupLastSuccessYmd === null) backupStale = true;
   } catch {
     // _seedkeep_kv may not exist in fresh deploys — treat as missing, not error.
   }
@@ -38,6 +53,8 @@ healthRoutes.get('/health', async (c) => {
       env: c.env.APP_ENV,
       worker_last_tick: workerLastTick,
       worker_stale: workerStale,
+      backup_last_success_ymd: backupLastSuccessYmd,
+      backup_stale: backupStale,
     },
   });
 });

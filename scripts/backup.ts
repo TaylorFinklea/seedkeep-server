@@ -2,8 +2,9 @@
  * Nightly pg_dump → S3 backup.
  *
  * Called from the worker's daily sentinel. Dumps the database in custom
- * format, compresses with gzip, uploads to the existing S3 bucket under
- * backups/seedkeep-YYYY-MM-DD.dump.gz. Sweeps objects older than 30 days.
+ * format, compresses with gzip, streams the result directly into S3 via
+ * multipart upload (@aws-sdk/lib-storage Upload). No intermediate heap
+ * buffer — safe on the 256MB always-on worker VM.
  *
  * Requires pg_dump in PATH (added to the Dockerfile via postgresql client
  * package matching the Postgres major version).
@@ -13,16 +14,49 @@
  *
  * Usage (called by worker, or manually):
  *   bun run scripts/backup.ts
+ *
+ * Manual end-to-end rehearse against local MinIO (docker-compose includes
+ * a MinIO service on port 9000):
+ *
+ *   # 1. Start local stack
+ *   docker compose up -d --wait db minio minio-bootstrap
+ *
+ *   # 2. Create the backups bucket in MinIO (one-time, if not already done)
+ *   AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=dev-only-secret \
+ *     aws --endpoint-url http://localhost:9000 s3 mb s3://seedkeep-backups 2>/dev/null || true
+ *
+ *   # 3. Run migrations
+ *   DATABASE_URL=postgres://seedkeep:dev-only@localhost:5432/seedkeep bun run migrate
+ *
+ *   # 4. Run backup against local MinIO
+ *   DATABASE_URL=postgres://seedkeep:dev-only@localhost:5432/seedkeep \
+ *   S3_ENDPOINT=http://localhost:9000 \
+ *   S3_REGION=us-east-1 \
+ *   S3_ACCESS_KEY_ID=minio \
+ *   S3_SECRET_ACCESS_KEY=dev-only-secret \
+ *   S3_BUCKET=seedkeep-backups \
+ *   S3_FORCE_PATH_STYLE=true \
+ *   bun run scripts/backup.ts
+ *
+ *   # 5. (Optional) Full rehearse with restore + migration + integration tests
+ *   S3_ENDPOINT=http://localhost:9000 \
+ *   S3_ACCESS_KEY_ID=minio \
+ *   S3_SECRET_ACCESS_KEY=dev-only-secret \
+ *   S3_BUCKET=seedkeep-backups \
+ *   S3_REGION=us-east-1 \
+ *   S3_FORCE_PATH_STYLE=true \
+ *   DATABASE_URL=postgres://seedkeep:dev-only@localhost:5432/seedkeep \
+ *   bash scripts/rehearse-migrations.sh
  */
 
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import {
   S3Client,
-  PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { loadEnv } from '../src/env';
 import { createGzip } from 'node:zlib';
 
@@ -39,14 +73,6 @@ function getS3Client(env: ReturnType<typeof loadEnv>): S3Client {
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,
     },
   });
-}
-
-async function streamToBuffer(stream: Readable): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
 }
 
 export async function runBackup(env: ReturnType<typeof loadEnv>): Promise<void> {
@@ -67,28 +93,43 @@ export async function runBackup(env: ReturnType<typeof loadEnv>): Promise<void> 
   const stderrChunks: Buffer[] = [];
   dumpProcess.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
 
-  // Wait for the dump process to complete and compress the output.
-  const [compressedBuffer, exitCode] = await Promise.all([
-    streamToBuffer(gzip as unknown as Readable),
-    new Promise<number>((resolve) => {
-      dumpProcess.on('close', resolve);
+  // Reject the backup promise if pg_dump fails to spawn (ENOENT) or errors.
+  let rejectBackup: ((err: Error) => void) | null = null;
+  const spawnErrorPromise = new Promise<never>((_resolve, reject) => {
+    rejectBackup = reject;
+    dumpProcess.on('error', (err) => reject(new Error(`pg_dump spawn error: ${err.message}`)));
+    gzip.on('error', (err) => reject(new Error(`gzip stream error: ${err.message}`)));
+  });
+
+  // Stream the gzip output directly to S3 via multipart upload — no heap buffer.
+  const s3 = getS3Client(env);
+  const upload = new Upload({
+    client: s3,
+    params: {
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      Body: gzip as unknown as Readable,
+      ContentType: 'application/gzip',
+    },
+  });
+
+  // Race the upload against spawn/stream errors so an ENOENT rejects quickly.
+  const exitCodePromise = new Promise<number>((resolve) => {
+    dumpProcess.on('close', resolve);
+  });
+
+  await Promise.race([
+    Promise.all([upload.done(), exitCodePromise]).then(([, exitCode]) => {
+      if (exitCode !== 0) {
+        const stderr = Buffer.concat(stderrChunks).toString();
+        throw new Error(`pg_dump exited with code ${exitCode}: ${stderr}`);
+      }
     }),
+    spawnErrorPromise,
   ]);
 
-  if (exitCode !== 0) {
-    const stderr = Buffer.concat(stderrChunks).toString();
-    throw new Error(`pg_dump exited with code ${exitCode}: ${stderr}`);
-  }
-
-  console.log(`[backup] dump complete (${compressedBuffer.byteLength} bytes compressed), uploading`);
-
-  const s3 = getS3Client(env);
-  await s3.send(new PutObjectCommand({
-    Bucket: env.S3_BUCKET,
-    Key: key,
-    Body: compressedBuffer,
-    ContentType: 'application/gzip',
-  }));
+  // Silence the unused rejectBackup reference (only used in the error handlers).
+  void rejectBackup;
 
   console.log(`[backup] uploaded ${key}`);
 

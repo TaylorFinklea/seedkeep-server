@@ -193,7 +193,11 @@ async function processOne(env: ReturnType<typeof loadEnv>): Promise<boolean> {
 }
 
 const WORKER_HEARTBEAT_KEY = 'worker_last_tick';
-const BACKUP_SENTINEL_KEY = 'backup_last_run_ymd';
+// Written BEFORE backup runs (on every attempt, success or failure) so a
+// failing backup backs off to 1/day instead of retrying every ~5s tick.
+const BACKUP_ATTEMPT_KEY = 'backup_last_attempt_ymd';
+// Written only on success — read by /api/health to compute backup_stale.
+const BACKUP_SUCCESS_KEY = 'backup_last_success_ymd';
 
 async function upsertHeartbeat(sql: Sql): Promise<void> {
   await sql.unsafe(
@@ -208,16 +212,28 @@ async function upsertHeartbeat(sql: Sql): Promise<void> {
 
 async function maybeBackup(env: ReturnType<typeof loadEnv>, sql: Sql): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
-  const row = await sql.unsafe<{ v: string }[]>(
+  // Check the ATTEMPT sentinel — backs off even if the backup failed, so a
+  // broken backup doesn't burn through retries every 5s.
+  const attemptRow = await sql.unsafe<{ v: string }[]>(
     `SELECT v FROM _seedkeep_kv WHERE k = $1 LIMIT 1`,
-    [BACKUP_SENTINEL_KEY],
+    [BACKUP_ATTEMPT_KEY],
   );
-  if (row[0]?.v === today) return;
-  await runBackup(env);
+  if (attemptRow[0]?.v === today) return;
+
+  // Write the attempt sentinel BEFORE running so a crash/hang still backs off.
   await sql.unsafe(
     `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
      ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
-    [BACKUP_SENTINEL_KEY, today],
+    [BACKUP_ATTEMPT_KEY, today],
+  );
+
+  await runBackup(env);
+
+  // Only update the success sentinel on a clean run.
+  await sql.unsafe(
+    `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
+     ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+    [BACKUP_SUCCESS_KEY, today],
   );
 }
 
