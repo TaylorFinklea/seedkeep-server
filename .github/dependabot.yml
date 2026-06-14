@@ -1,0 +1,16 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      auth-critical:
+        patterns:
+          - better-auth
+          - better-call
+          - hono
+          - "@modelcontextprotocol/sdk"
+          - jose
+          - zod
