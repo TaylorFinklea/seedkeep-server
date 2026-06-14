@@ -39,7 +39,7 @@ jobs:
       # ANTHROPIC_API_KEY, APPLE_IAP_SHARED_SECRET, ASSISTANT_KEY_MASTER, ADMIN_SECRET
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: oven-sh/setup-bun@v2
 
