@@ -26,7 +26,7 @@
     "jose": "^6.2.2",
     "kysely": "^0.28.16",
     "kysely-postgres-js": "^2.0.0",
-    "nanoid": "5.0.7",
+    "nanoid": "5.1.11",
     "postgres": "^3.4.5",
     "zod": "^4.3.6"
   },
