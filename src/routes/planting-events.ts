@@ -82,11 +82,14 @@ plantingEventRoutes.get('/planting-events', ...auth, async (c) => {
   const query = parseDeltaQuery(new URL(c.req.url).searchParams);
   const cursor = deltaCursorWhere(query, 2);
   const params = [householdId, ...cursor.params, query.limit];
+  // Baseline pulls (since=0) hide soft-deletes; non-zero since includes
+  // tombstones so clients can purge. Adds no param, so the LIMIT index holds.
+  const softDeleteFilter = query.since === 0 ? ' AND deleted_at IS NULL' : '';
   const items = await dbAll<PlantingEventRow>(
     sql,
     `SELECT ${SELECT_COLS}
        FROM planting_events
-      WHERE household_id = $1 AND ${cursor.clause}
+      WHERE household_id = $1 AND ${cursor.clause}${softDeleteFilter}
       ORDER BY updated_at ASC, id ASC
       LIMIT $${params.length}`,
     params,

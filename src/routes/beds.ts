@@ -68,8 +68,9 @@ const SELECT_COLS = `id, household_id, name, description,
 /**
  * GET /api/beds?since=<ms>&limit=<n>
  *
- * Delta-sync friendly listing. Returns beds updated after `since`,
- * including soft-deletes so clients can purge.
+ * Delta-sync friendly listing. When `since=0`, soft-deletes are hidden;
+ * any non-zero `since` includes deletes so clients can purge. Mirrors the
+ * seeds + journal feeds.
  */
 bedRoutes.get('/beds', ...auth, async (c) => {
   const householdId = c.get('householdId');
@@ -77,11 +78,14 @@ bedRoutes.get('/beds', ...auth, async (c) => {
   const query = parseDeltaQuery(new URL(c.req.url).searchParams);
   const cursor = deltaCursorWhere(query, 2);
   const params = [householdId, ...cursor.params, query.limit];
+  // Baseline pulls (since=0) hide soft-deletes; non-zero since includes
+  // tombstones so clients can purge. Adds no param, so the LIMIT index holds.
+  const softDeleteFilter = query.since === 0 ? ' AND deleted_at IS NULL' : '';
   const items = await dbAll<BedRow>(
     sql,
     `SELECT ${SELECT_COLS}
        FROM beds
-      WHERE household_id = $1 AND ${cursor.clause}
+      WHERE household_id = $1 AND ${cursor.clause}${softDeleteFilter}
       ORDER BY updated_at ASC, id ASC
       LIMIT $${params.length}`,
     params,

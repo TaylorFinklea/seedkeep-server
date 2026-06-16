@@ -317,12 +317,11 @@ describe('DELETE /api/me — sole-member household', () => {
       `SELECT id, user_id FROM catalog_feedback WHERE id = $1`,
       [feedbackId],
     );
-    // household_id is also SET NULL on deletion, so the row may or may not
-    // survive depending on the constraint update in migration 0020.
-    // The key invariant: user_id is NULL on the surviving row (if it exists).
-    if (feedbackRows.length > 0) {
-      expect(feedbackRows[0]!.user_id).toBeNull();
-    }
+    // catalog_feedback.user_id + household_id are both ON DELETE SET NULL
+    // (migration 0020), so the row MUST survive with user_id NULL. Asserted
+    // unconditionally so a regression re-introducing CASCADE is caught.
+    expect(feedbackRows.length).toBe(1);
+    expect(feedbackRows[0]!.user_id).toBeNull();
 
     // deletePhoto was called for all 3 key sources.
     expect(deletedKeys).toContain(seedPhotoKey);
@@ -334,6 +333,146 @@ describe('DELETE /api/me — sole-member household', () => {
     await sql.unsafe(`DELETE FROM catalog_feedback WHERE id = $1`, [feedbackId]).catch(() => {});
     await sql.unsafe(`DELETE FROM catalog_audit_log WHERE catalog_seed_id = $1`, [catalogSeedId]).catch(() => {});
     await sql.unsafe(`DELETE FROM catalog_seeds WHERE id = $1`, [catalogSeedId]).catch(() => {});
+  });
+});
+
+// ── (a-ii) Gap-closer: catalog_feedback SURVIVES with user_id = NULL ─────────
+
+describe('DELETE /api/me — sole-member: catalog_feedback survival', () => {
+  it('catalog_feedback row survives with user_id=NULL after sole-member deletion (positive survival case)', async () => {
+    deletedKeys.length = 0;
+
+    const fx = await seedFixture('owner');
+    const app = createApp(TEST_ENV);
+
+    const catalogSeedId = await seedCatalogSeed();
+    const feedbackId = uid('cf-surv');
+    await sql.unsafe(
+      `INSERT INTO catalog_feedback
+         (id, catalog_seed_id, household_id, user_id, body, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'test feedback survival', 'open', $5::BIGINT, $5::BIGINT)`,
+      [feedbackId, catalogSeedId, fx.householdId, fx.userId, Date.now()],
+    );
+
+    const res = await app.request(
+      '/api/me',
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
+    expect(json.ok).toBe(true);
+    expect(json.data.deleted).toBe(true);
+
+    // POSITIVE SURVIVAL ASSERTION: the row MUST survive with user_id=NULL.
+    // (catalog_feedback.user_id FK is ON DELETE SET NULL;
+    //  catalog_feedback.household_id FK is also ON DELETE SET NULL.)
+    // Guards against a silent cascade-delete regression.
+    const feedbackRows = await sql.unsafe<{ id: string; user_id: string | null; household_id: string | null }[]>(
+      `SELECT id, user_id, household_id FROM catalog_feedback WHERE id = $1`,
+      [feedbackId],
+    );
+    expect(feedbackRows.length).toBe(1);
+    expect(feedbackRows[0]!.user_id).toBeNull();
+    // household_id is also SET NULL when household is deleted.
+    expect(feedbackRows[0]!.household_id).toBeNull();
+
+    // Clean up.
+    await sql.unsafe(`DELETE FROM catalog_feedback WHERE id = $1`, [feedbackId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM catalog_audit_log WHERE catalog_seed_id = $1`, [catalogSeedId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM catalog_seeds WHERE id = $1`, [catalogSeedId]).catch(() => {});
+  });
+});
+
+// ── (a-iii) Gap-closer: source_photo_keys edge cases on catalog_extractions ──
+
+describe('DELETE /api/me — sole-member: source_photo_keys edge cases', () => {
+  it('empty array [] contributes 0 keys; deletion still returns 200', async () => {
+    deletedKeys.length = 0;
+
+    const fx = await seedFixture('owner');
+    const app = createApp(TEST_ENV);
+
+    const extractionId = uid('ad-ext-empty');
+    await sql.unsafe(
+      `INSERT INTO catalog_extractions
+         (id, submitted_by_household, submitted_by_user, source_photo_keys,
+          vision_model_id, raw_extraction, status, created_at)
+       VALUES ($1, $2, $3, $4, 'claude-sonnet-4-6', '{}', 'pending', $5)`,
+      [extractionId, fx.householdId, fx.userId, JSON.stringify([]), Date.now()],
+    );
+
+    const res = await app.request(
+      '/api/me',
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
+    expect(json.ok).toBe(true);
+    // Empty array contributes 0 keys — no deletePhoto calls beyond any other sources.
+    // (No seed_photos or journal_entry_photos were seeded here.)
+    expect(deletedKeys.length).toBe(0);
+  });
+
+  it('malformed JSON in source_photo_keys is silently skipped; deletion still 200', async () => {
+    deletedKeys.length = 0;
+
+    const fx = await seedFixture('owner');
+    const app = createApp(TEST_ENV);
+
+    const extractionId = uid('ad-ext-bad');
+    await sql.unsafe(
+      `INSERT INTO catalog_extractions
+         (id, submitted_by_household, submitted_by_user, source_photo_keys,
+          vision_model_id, raw_extraction, status, created_at)
+       VALUES ($1, $2, $3, $4, 'claude-sonnet-4-6', '{}', 'pending', $5)`,
+      [extractionId, fx.householdId, fx.userId, 'not-json', Date.now()],
+    );
+
+    const res = await app.request(
+      '/api/me',
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
+    expect(json.ok).toBe(true);
+    // Malformed JSON silently skipped — no crash, no keys.
+    expect(deletedKeys.length).toBe(0);
+  });
+
+  it('non-string element in source_photo_keys array does not crash; valid string keys still collected', async () => {
+    deletedKeys.length = 0;
+
+    const fx = await seedFixture('owner');
+    const app = createApp(TEST_ENV);
+
+    const validKey = `households/${fx.householdId}/extractions/valid-key.jpg`;
+    const extractionId = uid('ad-ext-mixed');
+    // Array with one non-string element (number) and one string key.
+    await sql.unsafe(
+      `INSERT INTO catalog_extractions
+         (id, submitted_by_household, submitted_by_user, source_photo_keys,
+          vision_model_id, raw_extraction, status, created_at)
+       VALUES ($1, $2, $3, $4, 'claude-sonnet-4-6', '{}', 'pending', $5)`,
+      [extractionId, fx.householdId, fx.userId, JSON.stringify([123, validKey]), Date.now()],
+    );
+
+    const res = await app.request(
+      '/api/me',
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
+    expect(json.ok).toBe(true);
+    // The numeric element is included as-is since array.isArray filter doesn't
+    // strip non-strings — the route does (parsed as string[]). Whether the
+    // string '123' or validKey ends up in deletedKeys depends on the cast
+    // behavior. The key guarantee is: no crash, deletion returns 200.
+    // The valid string key SHOULD be in deletedKeys.
+    expect(deletedKeys).toContain(validKey);
   });
 });
 
