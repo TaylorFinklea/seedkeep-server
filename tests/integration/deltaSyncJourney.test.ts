@@ -566,3 +566,94 @@ describe('GET /api/planting-events — delta-sync envelope shape', () => {
     expect(tombstone!.deleted_at).not.toBeNull();
   });
 });
+
+// ── Journal entry tombstone delta test ───────────────────────────────────────
+//
+// Mirrors the seeds tombstone test:
+//   1. Create a journal entry.
+//   2. Soft-DELETE it via the API.
+//   3. GET /api/journal?since=<priorCursor>&since_id=<id> INCLUDES the tombstone
+//      (deleted_at populated).
+//   4. GET /api/journal?since=0 EXCLUDES the tombstone.
+
+describe('GET /api/journal — tombstone delta contract', () => {
+  it('since=0 EXCLUDES soft-deleted journal entries', async () => {
+    const fx = await seedAuthFixture();
+    const app = createApp(TEST_ENV);
+
+    const createRes = await app.request(
+      '/api/journal',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fx.sessionToken}` },
+        body: JSON.stringify({ occurred_on: '2026-06-01', body: 'Tombstone exclusion test' }),
+      },
+      TEST_ENV,
+    );
+    expect(createRes.status).toBe(200);
+    const createJson = (await createRes.json()) as { ok: boolean; data: { entry: { id: string } } };
+    const jeId = createJson.data.entry.id;
+
+    // Soft-delete it.
+    const delRes = await app.request(
+      `/api/journal/${jeId}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(delRes.status).toBe(200);
+
+    // since=0 must NOT include the deleted entry.
+    const feed = await getJson<{ id: string; deletedAt: number | null }>(
+      app, fx, '/api/journal?since=0',
+    );
+    const found = feed.data.items.find((r) => r.id === jeId);
+    expect(found).toBeUndefined();
+  });
+
+  it('since>0 INCLUDES journal entry tombstone (deleted_at populated)', async () => {
+    const fx = await seedAuthFixture();
+    const app = createApp(TEST_ENV);
+
+    const createRes = await app.request(
+      '/api/journal',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fx.sessionToken}` },
+        body: JSON.stringify({ occurred_on: '2026-06-01', body: 'Tombstone inclusion test' }),
+      },
+      TEST_ENV,
+    );
+    expect(createRes.status).toBe(200);
+    const createJson = (await createRes.json()) as { ok: boolean; data: { entry: { id: string; updatedAt: number } } };
+    const jeId = createJson.data.entry.id;
+
+    // Capture the baseline cursor.
+    const baseline = await getJson<{ id: string; updatedAt: number }>(
+      app, fx, '/api/journal?since=0',
+    );
+    const item = baseline.data.items.find((r) => r.id === jeId);
+    expect(item).toBeTruthy();
+    const cursorBefore = item!.updatedAt;
+    const idBefore = jeId;
+
+    // Small sleep so updated_at advances at least 1ms after the delete.
+    await new Promise((r) => setTimeout(r, 2));
+
+    // Soft-delete via the API.
+    const delRes = await app.request(
+      `/api/journal/${jeId}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      TEST_ENV,
+    );
+    expect(delRes.status).toBe(200);
+
+    // since>0 with composite cursor MUST include the tombstone.
+    const tombstoneFeed = await getJson<{ id: string; deletedAt: number | null }>(
+      app, fx, `/api/journal?since=${cursorBefore}&since_id=${idBefore}`,
+    );
+    const tombstone = tombstoneFeed.data.items.find((r) => r.id === jeId);
+    expect(tombstone).toBeTruthy();
+    // The DTO field is camelCased to `deletedAt`.
+    expect(tombstone!.deletedAt).not.toBeNull();
+  });
+});

@@ -603,9 +603,11 @@ async function previewDestructive(
                   : name === 'delete_journal_entry' ? 'journal_entries'
                   : name === 'delete_seed' ? 'seeds'
                   : 'beds';
-      const was = await dbGet(sql,
-        `SELECT * FROM ${table} WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-        [args.id, householdId]);
+      // Use the same column subset readCurrentWas re-reads at confirm time so
+      // wasMatches compares identical keys (a prior SELECT * captured extra
+      // columns absent from readCurrentWas, making every delete confirm
+      // wrongly return stale_proposal).
+      const was = await readCurrentWas(name, args, ctx);
       if (!was) throw new Error(`${table} row not found: ${args.id}`);
       return { tool: name, description: `Delete ${table} ${args.id}`, was, becomes: null };
     }
