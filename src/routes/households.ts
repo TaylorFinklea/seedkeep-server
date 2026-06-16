@@ -225,17 +225,29 @@ householdRoutes.post('/invites/:code/accept', authOnly, async (c) => {
   }
 
   const now = Date.now();
-  await dbBatch(sql, [
-    {
-      sql: `INSERT INTO memberships (household_id, user_id, role, joined_at)
-            VALUES ($1, $2, 'member', $3)`,
-      params: [invite.household_id, userId, now],
-    },
-    {
-      sql: `UPDATE invites SET claimed_by = $1, claimed_at = $2 WHERE id = $3`,
-      params: [userId, now, invite.id],
-    },
-  ]);
+  const claimed = await sql.begin(async (tx) => {
+    const updateResult = await tx.unsafe(
+      `UPDATE invites
+          SET claimed_by = $1, claimed_at = $2
+        WHERE id = $3
+          AND claimed_by IS NULL
+          AND expires_at > $4`,
+      [userId, now, invite.id, now],
+    );
+    if (Number((updateResult as { count?: number }).count ?? 0) === 0) {
+      return false;
+    }
+    await tx.unsafe(
+      `INSERT INTO memberships (household_id, user_id, role, joined_at)
+       VALUES ($1, $2, 'member', $3)
+       ON CONFLICT DO NOTHING`,
+      [invite.household_id, userId, now],
+    );
+    return true;
+  });
+  if (!claimed) {
+    return c.json({ ok: false, error: { code: 'already_claimed', message: 'Invite has already been used or expired.' } }, 409);
+  }
 
   const household = await dbGet<HouseholdRow>(
     sql,

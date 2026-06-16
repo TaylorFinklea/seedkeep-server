@@ -1050,7 +1050,7 @@ async function loadHouseholdSnapshot(
   };
 }
 
-async function loadConversationHistory(
+export async function loadConversationHistory(
   sql: ReturnType<typeof getSql>,
   threadId: string,
 ): Promise<AnthropicMessage[]> {
@@ -1060,15 +1060,34 @@ async function loadConversationHistory(
   // the placeholder stays `[]` and Anthropic rejects malformed
   // history. We delete them inline now, but old rows from before this
   // landed are still in the table.
+  // Return the NEWEST 40 messages, then re-sort oldest→newest so
+  // the most-recent turn is always present in history (prevents
+  // the just-sent message from being dropped on >40-turn threads).
   const rows = await dbAll<{ role: string; content_json: string }>(sql,
-    `SELECT role, content_json FROM assistant_messages
-      WHERE thread_id = $1
-        AND content_json <> '[]'
-      ORDER BY created_at ASC, id ASC`,
+    `SELECT role, content_json FROM (
+       SELECT role, content_json, created_at, id
+         FROM assistant_messages
+        WHERE thread_id = $1
+          AND content_json <> '[]'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 40
+     ) t
+     ORDER BY created_at ASC, id ASC`,
     [threadId]);
-  return rows.map((r) => ({
+  const mapped = rows.map((r) => ({
     role: (r.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
     content: JSON.parse(r.content_json) as AnthropicContentBlock[],
   }));
+  // Strip image content blocks from all messages except the last one to
+  // avoid re-sending large image data in conversation history.
+  for (let i = 0; i < mapped.length - 1; i++) {
+    mapped[i].content = mapped[i].content.map((block) => {
+      if ((block as { type?: string }).type === 'image') {
+        return { type: 'text', text: '[image omitted]' } as unknown as AnthropicContentBlock;
+      }
+      return block;
+    });
+  }
+  return mapped;
 }
 

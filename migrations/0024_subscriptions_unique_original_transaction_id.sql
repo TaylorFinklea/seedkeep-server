@@ -1,0 +1,5 @@
+-- NO-OP: migrations/0002_tier_and_subscriptions.sql already declares
+-- `original_transaction_id TEXT NOT NULL UNIQUE` on the subscriptions table,
+-- which creates an implicit unique index. A redundant explicit index here
+-- would cause CREATE UNIQUE INDEX to fail on conflict with the column
+-- constraint. This file is kept as a migration record placeholder only.

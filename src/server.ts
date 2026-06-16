@@ -25,7 +25,13 @@ console.log(`seedkeep-server listening on http://localhost:${server.port} (env=$
 
 const shutdown = async (signal: string) => {
   console.log(`\n→ ${signal} received, draining…`);
-  server.stop();
+  // Await server stop with a bounded timeout (25s, under fly.toml
+  // kill_timeout=120s) so in-flight stream handlers can flush their
+  // finally blocks before we close the DB connection.
+  await Promise.race([
+    server.stop(),
+    new Promise<void>((resolve) => setTimeout(resolve, 25_000)),
+  ]);
   await closeDb();
   process.exit(0);
 };

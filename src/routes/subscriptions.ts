@@ -101,6 +101,13 @@ subscriptionRoutes.post('/subscriptions/verify', authOnly, async (c) => {
     [entry.original_transaction_id],
   );
 
+  if (existing && existing.user_id !== userId) {
+    return c.json(
+      { ok: false, error: { code: 'receipt_bound_to_other_account', message: 'This receipt belongs to another account.' } },
+      409,
+    );
+  }
+
   if (existing) {
     await dbRun(
       sql,
@@ -127,21 +134,44 @@ subscriptionRoutes.post('/subscriptions/verify', authOnly, async (c) => {
       ],
     );
   } else {
-    await dbRun(
-      sql,
-      `INSERT INTO subscriptions (
-        id, user_id, product_id, original_transaction_id, latest_transaction_id,
-        receipt_data, status, expires_at, last_verified_at, environment,
-        created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [
-        nanoid(), userId, entry.product_id,
-        entry.original_transaction_id, entry.transaction_id,
-        parsed.data.receipt_data,
-        status, expiresAt, now, verify.environment,
-        now, now,
-      ],
-    );
+    try {
+      await dbRun(
+        sql,
+        `INSERT INTO subscriptions (
+          id, user_id, product_id, original_transaction_id, latest_transaction_id,
+          receipt_data, status, expires_at, last_verified_at, environment,
+          created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          nanoid(), userId, entry.product_id,
+          entry.original_transaction_id, entry.transaction_id,
+          parsed.data.receipt_data,
+          status, expiresAt, now, verify.environment,
+          now, now,
+        ],
+      );
+    } catch (insertErr) {
+      // Concurrent same-receipt race: two callers both saw existing=null and
+      // one wins the INSERT; the loser hits Postgres 23505 (unique violation).
+      // Re-fetch to find the winner's row and apply the same 409 guard.
+      if ((insertErr as { code?: string }).code === '23505') {
+        const raced = await dbGet<SubscriptionRow>(
+          sql,
+          `SELECT id, user_id FROM subscriptions
+            WHERE original_transaction_id = $1 LIMIT 1`,
+          [entry.original_transaction_id],
+        );
+        if (raced && raced.user_id !== userId) {
+          return c.json(
+            { ok: false, error: { code: 'receipt_bound_to_other_account', message: 'This receipt belongs to another account.' } },
+            409,
+          );
+        }
+        // Same user won the race — treat as a successful idempotent insert.
+      } else {
+        throw insertErr;
+      }
+    }
   }
 
   // Flip the user's tier based on the subscription state. We only

@@ -510,14 +510,19 @@ catalogRoutes.put('/catalog/:id/corrections/:correction_id', ...feedbackAuth, as
   }
 
   const now = Date.now();
-  await dbRun(
+  const clearAiCache = parsed.suggested_value !== undefined;
+  const result = await dbRun(
     sql,
     `UPDATE catalog_feedback
         SET suggested_value = COALESCE($2, suggested_value),
             body = COALESCE($3, body),
             idempotency_key = COALESCE($4, idempotency_key),
-            updated_at = $5
-      WHERE id = $1`,
+            updated_at = $5${clearAiCache ? `,
+            ai_review_score = NULL, ai_self_confidence = NULL,
+            ai_notes = NULL, ai_raw_response = NULL, ai_next_attempt_at = NULL` : ''}
+      WHERE id = $1
+        AND status = 'open'
+        AND ai_locked_at IS NULL`,
     [
       correctionId,
       parsed.suggested_value ?? null,
@@ -526,6 +531,12 @@ catalogRoutes.put('/catalog/:id/corrections/:correction_id', ...feedbackAuth, as
       now,
     ],
   );
+  if (result.meta.changes === 0) {
+    return c.json(
+      { ok: false, error: { code: 'no_longer_editable', message: 'correction is locked or no longer editable' } },
+      409,
+    );
+  }
 
   const updated = await dbGet<CorrectionRow>(
     sql,
