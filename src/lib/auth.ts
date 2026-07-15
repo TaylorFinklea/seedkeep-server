@@ -2,6 +2,7 @@ import { betterAuth } from 'better-auth';
 import { mcp } from 'better-auth/plugins';
 import { getKysely } from '../db/client';
 import type { Env } from '../env';
+import { MCP_READ_SCOPE, MCP_WRITE_SCOPE } from './assistant/mcpScopes';
 
 /// Public-facing host that OAuth issuers/metadata + redirect URIs use.
 /// This must match the hostname clients (Claude.ai) actually hit.
@@ -25,6 +26,10 @@ function publicBaseURL(env: Env): string {
 type AuthInstance = ReturnType<typeof buildAuth>;
 
 let _auth: AuthInstance | null = null;
+
+const OIDC_SCOPES = [
+  'openid', 'profile', 'email', 'offline_access', MCP_READ_SCOPE, MCP_WRITE_SCOPE,
+];
 
 function buildAuth(env: Env) {
   const base = publicBaseURL(env);
@@ -65,9 +70,10 @@ function buildAuth(env: Env) {
       // WWW-Authenticate header to 401s on the protected /mcp resource.
       // It requires `oidcConfig` since it composes the oidc-provider
       // plugin inline.
-      mcp({
+      mcp(({
         loginPage: '/oauth/pair',
         resource: `${base}/mcp`,
+        metadata: { scopes_supported: OIDC_SCOPES },
         oidcConfig: {
           loginPage: '/oauth/pair',
           consentPage: '/oauth/consent',
@@ -77,10 +83,11 @@ function buildAuth(env: Env) {
           accessTokenExpiresIn: 60 * 60 * 24,        // 24 h
           refreshTokenExpiresIn: 60 * 60 * 24 * 30,  // 30 d
           codeExpiresIn: 600,                         // 10 min
-          scopes: ['openid', 'profile', 'email', 'offline_access', 'seedkeep:read', 'seedkeep:write'],
-          defaultScope: 'openid seedkeep:read seedkeep:write',
+          scopes: OIDC_SCOPES,
+          defaultScope: `openid ${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}`,
+          metadata: { scopes_supported: OIDC_SCOPES },
         },
-      }),
+      } as Parameters<typeof mcp>[0] & { metadata: { scopes_supported: string[] } })),
     ],
   });
 }

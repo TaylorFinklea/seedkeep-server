@@ -17,6 +17,7 @@ import { z } from 'zod';
 import type { Sql } from 'postgres';
 import { TOOL_REGISTRY } from './tools';
 import { executeTool, executeProposedChange } from './executor';
+import { isMcpToolAllowed } from './mcpScopes';
 
 /**
  * Build a fully-configured MCP server scoped to a single household.
@@ -27,8 +28,9 @@ import { executeTool, executeProposedChange } from './executor';
 export function buildMcpServer(args: {
   sql: Sql;
   householdId: string;
+  scopes?: ReadonlySet<string>;
 }): McpServer {
-  const { sql, householdId } = args;
+  const { sql, householdId, scopes } = args;
 
   const server = new McpServer(
     { name: 'seedkeep', version: '1.0.0' },
@@ -40,6 +42,8 @@ export function buildMcpServer(args: {
   );
 
   for (const def of Object.values(TOOL_REGISTRY)) {
+    if (!isMcpToolAllowed(def.scope, scopes)) continue;
+
     server.registerTool(
       def.name,
       {

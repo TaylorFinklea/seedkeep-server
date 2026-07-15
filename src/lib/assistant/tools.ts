@@ -11,6 +11,7 @@
 // Write tools (confirm-required): update_*, delete_*, set_household_location.
 
 import { z } from 'zod';
+import type { McpScope } from './mcpScopes';
 
 const YYYY_MM_DD = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD');
 
@@ -187,78 +188,91 @@ export interface ToolDef {
   description: string;
   schema: z.ZodTypeAny;
   requires_confirmation: boolean;
+  scope: McpScope;
 }
 
 export const TOOL_REGISTRY: Record<ToolName, ToolDef> = {
   // ── Read ─────────────────────────────────────────────────────────────────
   list_seeds: {
     name: 'list_seeds',
+    scope: 'seedkeep:read',
     description: 'List seeds in the user\'s inventory, optionally filtered by state, location, or text search across name/variety.',
     schema: ListSeedsArgs,
     requires_confirmation: false,
   },
   get_seed: {
     name: 'get_seed',
+    scope: 'seedkeep:read',
     description: 'Get full detail for a single seed by id, including catalog growing info if linked.',
     schema: GetSeedArgs,
     requires_confirmation: false,
   },
   list_beds: {
     name: 'list_beds',
+    scope: 'seedkeep:read',
     description: 'List garden beds in the household.',
     schema: ListBedsArgs,
     requires_confirmation: false,
   },
   get_bed: {
     name: 'get_bed',
+    scope: 'seedkeep:read',
     description: 'Get full detail for a single bed by id, including dimensions and any layout positions.',
     schema: GetBedArgs,
     requires_confirmation: false,
   },
   list_planting_events: {
     name: 'list_planting_events',
+    scope: 'seedkeep:read',
     description: 'List planting events (sowing, transplant, harvest), optionally filtered by bed, seed, kind, or date range.',
     schema: ListPlantingEventsArgs,
     requires_confirmation: false,
   },
   get_planting_event: {
     name: 'get_planting_event',
+    scope: 'seedkeep:read',
     description: 'Get full detail for a single planting event by id.',
     schema: GetPlantingEventArgs,
     requires_confirmation: false,
   },
   list_journal_entries: {
     name: 'list_journal_entries',
+    scope: 'seedkeep:read',
     description: 'List the user\'s journal entries, optionally filtered by entity (seed/bed/event), date range, or text search across the body.',
     schema: ListJournalEntriesArgs,
     requires_confirmation: false,
   },
   get_journal_entry: {
     name: 'get_journal_entry',
+    scope: 'seedkeep:read',
     description: 'Get full detail for a single journal entry by id, including photos and checklist items.',
     schema: GetJournalEntryArgs,
     requires_confirmation: false,
   },
   get_recommendation: {
     name: 'get_recommendation',
+    scope: 'seedkeep:read',
     description: 'Get the current planting-window recommendation for a catalog seed (when to plant, indoor-start window, verdict).',
     schema: GetRecommendationArgs,
     requires_confirmation: false,
   },
   search_catalog: {
     name: 'search_catalog',
+    scope: 'seedkeep:read',
     description: 'Search the shared seed catalog by common name or variety.',
     schema: SearchCatalogArgs,
     requires_confirmation: false,
   },
   get_household_location: {
     name: 'get_household_location',
+    scope: 'seedkeep:read',
     description: 'Get the user\'s home ZIP, USDA hardiness zone, average frost dates, and region (state code).',
     schema: GetHouseholdLocationArgs,
     requires_confirmation: false,
   },
   query_pet: {
     name: 'query_pet',
+    scope: 'seedkeep:read',
     description: 'Look up plant pets (Tomagachi-style companion creatures attached to planting events). Identity (name, rarity, creature_kind, vignette) is server-of-record and returned here. Detailed mood (thriving/content/quiet/wilted/departingImminent) is iOS-derived and present only when the iOS client preloaded it via client_pet_state; otherwise mood is null. Status (alive/departed/graduated) is always populated from server columns. Use for queries like "how\'s my basil\'s pet?" or "tell me about my menagerie".',
     schema: QueryPetArgs,
     requires_confirmation: false,
@@ -267,24 +281,28 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDef> = {
   // ── Write (auto-execute) ─────────────────────────────────────────────────
   create_planting_event: {
     name: 'create_planting_event',
+    scope: 'seedkeep:write',
     description: 'Create a new planting event (sowing, transplant, or harvest) in a bed. Supply either seed_id (household seed) or catalog_seed_id (generic crop), or neither for a free-form bed event.',
     schema: CreatePlantingEventArgs,
     requires_confirmation: false,
   },
   create_journal_entry: {
     name: 'create_journal_entry',
+    scope: 'seedkeep:write',
     description: 'Create a journal entry. Attach to AT MOST ONE of seed_id, bed_id, or planting_event_id. Leave all three null for a garden-level entry.',
     schema: CreateJournalEntryArgs,
     requires_confirmation: false,
   },
   add_checklist_item: {
     name: 'add_checklist_item',
+    scope: 'seedkeep:write',
     description: 'Add a checklist item to a journal entry.',
     schema: AddChecklistItemArgs,
     requires_confirmation: false,
   },
   toggle_checklist_item: {
     name: 'toggle_checklist_item',
+    scope: 'seedkeep:write',
     description: 'Toggle the completed state of a checklist item.',
     schema: ToggleChecklistItemArgs,
     requires_confirmation: false,
@@ -293,54 +311,63 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDef> = {
   // ── Write (require confirmation) ─────────────────────────────────────────
   update_planting_event: {
     name: 'update_planting_event',
+    scope: 'seedkeep:write',
     description: 'Update fields of a planting event. Only fields you provide will change. Will surface a Was→Becomes diff for the user to confirm before applying.',
     schema: UpdatePlantingEventArgs,
     requires_confirmation: true,
   },
   update_journal_entry: {
     name: 'update_journal_entry',
+    scope: 'seedkeep:write',
     description: 'Update fields of a journal entry. Only fields you provide will change. Will surface a Was→Becomes diff for the user to confirm before applying.',
     schema: UpdateJournalEntryArgs,
     requires_confirmation: true,
   },
   update_seed: {
     name: 'update_seed',
+    scope: 'seedkeep:write',
     description: 'Update fields of a seed (name, state, packet count, location, etc.). Surfaces a Was→Becomes diff for user confirmation.',
     schema: UpdateSeedArgs,
     requires_confirmation: true,
   },
   update_bed: {
     name: 'update_bed',
+    scope: 'seedkeep:write',
     description: 'Update a bed\'s name or dimensions. Surfaces a Was→Becomes diff for user confirmation.',
     schema: UpdateBedArgs,
     requires_confirmation: true,
   },
   delete_planting_event: {
     name: 'delete_planting_event',
+    scope: 'seedkeep:write',
     description: 'Soft-delete a planting event. Requires user confirmation.',
     schema: DeletePlantingEventArgs,
     requires_confirmation: true,
   },
   delete_journal_entry: {
     name: 'delete_journal_entry',
+    scope: 'seedkeep:write',
     description: 'Soft-delete a journal entry. Requires user confirmation.',
     schema: DeleteJournalEntryArgs,
     requires_confirmation: true,
   },
   delete_seed: {
     name: 'delete_seed',
+    scope: 'seedkeep:write',
     description: 'Soft-delete a seed from inventory. Requires user confirmation.',
     schema: DeleteSeedArgs,
     requires_confirmation: true,
   },
   delete_bed: {
     name: 'delete_bed',
+    scope: 'seedkeep:write',
     description: 'Soft-delete a bed. Requires user confirmation.',
     schema: DeleteBedArgs,
     requires_confirmation: true,
   },
   set_household_location: {
     name: 'set_household_location',
+    scope: 'seedkeep:write',
     description: 'Change the user\'s home ZIP (which drives planting-window recommendations household-wide). Requires user confirmation.',
     schema: SetHouseholdLocationArgs,
     requires_confirmation: true,

@@ -50,6 +50,28 @@ describe('TOOL_REGISTRY', () => {
     }
     expect(counts).toEqual({ read: 12, writeAuto: 4, confirm: 9 });
   });
+
+  it('classifies every tool for MCP OAuth scope enforcement', () => {
+    const readTools: ToolName[] = [
+      'list_seeds', 'get_seed', 'list_beds', 'get_bed',
+      'list_planting_events', 'get_planting_event',
+      'list_journal_entries', 'get_journal_entry',
+      'get_recommendation', 'search_catalog', 'get_household_location', 'query_pet',
+    ];
+    const writeTools: ToolName[] = [
+      'create_planting_event', 'create_journal_entry', 'add_checklist_item', 'toggle_checklist_item',
+      'update_planting_event', 'update_journal_entry', 'update_seed', 'update_bed',
+      'delete_planting_event', 'delete_journal_entry', 'delete_seed', 'delete_bed',
+      'set_household_location',
+    ];
+
+    for (const name of readTools) {
+      expect(TOOL_REGISTRY[name].scope, name).toBe('seedkeep:read');
+    }
+    for (const name of writeTools) {
+      expect(TOOL_REGISTRY[name].scope, name).toBe('seedkeep:write');
+    }
+  });
 });
 
 describe('validateToolArgs', () => {

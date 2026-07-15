@@ -23,6 +23,7 @@ import { WebStandardStreamableHTTPServerTransport } from
   '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { buildMcpServer } from '../lib/assistant/mcpServer';
 import { checkRateLimit } from '../lib/rateLimit';
+import { parseOAuthScopes } from '../lib/assistant/mcpScopes';
 
 // 20 token mints per user per hour.
 const TOKEN_MINT_LIMIT = 20;
@@ -186,6 +187,8 @@ mcpTransportRoutes.all('/mcp', async (c) => {
   }
   const token = authHeader.slice(7).trim();
 
+  let oauthScopes: ReadonlySet<string> | undefined;
+
   // Resolve to a household_id either via our personal MCP-token format
   // (mcp_<id>.<secret> against `mcp_tokens`) OR via a better-auth
   // OAuth access token (looked up in `oauthAccessToken` and joined to
@@ -212,15 +215,16 @@ mcpTransportRoutes.all('/mcp', async (c) => {
     }
   } else {
     // OAuth access token from better-auth's OIDC provider.
-    const oauth = await dbGet<{ userId: string; expiresAt: Date }>(
+    const oauth = await dbGet<{ userId: string; expiresAt: Date; scopes: string }>(
       sql,
-      `SELECT "userId", "accessTokenExpiresAt" AS "expiresAt"
+      `SELECT "userId", "accessTokenExpiresAt" AS "expiresAt", scopes
          FROM "oauthAccessToken"
         WHERE "accessToken" = $1 AND "accessTokenExpiresAt" > NOW()
         LIMIT 1`,
       [token],
     );
     if (oauth?.userId) {
+      oauthScopes = parseOAuthScopes(oauth.scopes);
       // Prefer the household the user pinned at pairing time — that's
       // what they intended when they typed the code from iOS. Falls
       // back to memberships with the SAME ordering as `requireHousehold`
@@ -262,7 +266,7 @@ mcpTransportRoutes.all('/mcp', async (c) => {
   }
 
   // Build a fresh MCP server scoped to this household.
-  const server = buildMcpServer({ sql, householdId });
+  const server = buildMcpServer({ sql, householdId, scopes: oauthScopes });
 
   // Stateless streamable HTTP transport. New session per request, no
   // server-held connection state — fine for Claude Desktop's MCP
