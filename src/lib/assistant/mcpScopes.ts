@@ -7,6 +7,12 @@ export function parseOAuthScopes(value: string): ReadonlySet<string> {
   return new Set(value.split(/\s+/).filter(Boolean));
 }
 
+export function hasRequiredMcpScopes(grantedScopes?: ReadonlySet<string>): boolean {
+  return !grantedScopes || (
+    grantedScopes.has(MCP_READ_SCOPE) && grantedScopes.has(MCP_WRITE_SCOPE)
+  );
+}
+
 /** Personal MCP tokens omit scopes and retain unrestricted read/write access. */
 export function isMcpToolAllowed(
   requiredScope: McpScope,

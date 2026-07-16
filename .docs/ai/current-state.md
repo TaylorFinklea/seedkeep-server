@@ -6,7 +6,7 @@
 
 ## Plan
 
-- [x] `seedkeep-5rj` — enforce OAuth `seedkeep:read` / `seedkeep:write` scopes at MCP discovery and execution while preserving explicitly tested personal-token behavior. `tier_floor: senior`; `complexity: M`. Verify: `bun run typecheck && bun run test:all`
+- [x] `seedkeep-5rj` review corrections: transport and callback scope guards, route/callback regression tests. Verified with `bun run typecheck && bun run test:all`.
 
 ## Blockers
 

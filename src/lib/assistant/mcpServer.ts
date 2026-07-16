@@ -16,7 +16,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Sql } from 'postgres';
 import { TOOL_REGISTRY } from './tools';
-import { executeTool, executeProposedChange } from './executor';
+import {
+  executeTool,
+  executeProposedChange,
+  type ToolExecutionContext,
+  type ToolExecutionResult,
+} from './executor';
+import type { ToolDef } from './tools';
 import { isMcpToolAllowed } from './mcpScopes';
 
 /**
@@ -25,6 +31,30 @@ import { isMcpToolAllowed } from './mcpScopes';
  * A new instance is constructed per HTTP request so the database
  * handle + household are baked in and can't bleed across users.
  */
+export async function executeMcpTool(args: {
+  def: ToolDef;
+  rawArgs: unknown;
+  ctx: ToolExecutionContext;
+  scopes?: ReadonlySet<string>;
+}): Promise<ToolExecutionResult> {
+  const { def, rawArgs, ctx, scopes } = args;
+  if (!isMcpToolAllowed(def.scope, scopes)) {
+    return {
+      status: 'failed',
+      error: {
+        code: 'insufficient_scope',
+        message: `OAuth token does not grant ${def.scope}`,
+      },
+    };
+  }
+
+  const result = await executeTool(def.name, rawArgs, ctx);
+  if (result.status === 'proposed') {
+    return executeProposedChange(def.name, rawArgs, ctx);
+  }
+  return result;
+}
+
 export function buildMcpServer(args: {
   sql: Sql;
   householdId: string;
@@ -52,15 +82,7 @@ export function buildMcpServer(args: {
       },
       async (rawArgs: unknown) => {
         const ctx = { sql, householdId };
-        const result = await executeTool(def.name, rawArgs, ctx);
-
-        // Destructive op? In-app the user gets a Confirm/Cancel card.
-        // In MCP we apply immediately — the user already authorized
-        // the tool_use by letting Claude run it in their chat.
-        if (result.status === 'proposed') {
-          const applied = await executeProposedChange(def.name, rawArgs, ctx);
-          return mcpResponse(applied);
-        }
+        const result = await executeMcpTool({ def, rawArgs, ctx, scopes });
         return mcpResponse(result);
       },
     );

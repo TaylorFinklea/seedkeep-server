@@ -23,7 +23,12 @@ import { WebStandardStreamableHTTPServerTransport } from
   '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { buildMcpServer } from '../lib/assistant/mcpServer';
 import { checkRateLimit } from '../lib/rateLimit';
-import { parseOAuthScopes } from '../lib/assistant/mcpScopes';
+import {
+  hasRequiredMcpScopes,
+  MCP_READ_SCOPE,
+  MCP_WRITE_SCOPE,
+  parseOAuthScopes,
+} from '../lib/assistant/mcpScopes';
 
 // 20 token mints per user per hour.
 const TOKEN_MINT_LIMIT = 20;
@@ -225,6 +230,14 @@ mcpTransportRoutes.all('/mcp', async (c) => {
     );
     if (oauth?.userId) {
       oauthScopes = parseOAuthScopes(oauth.scopes);
+      if (!hasRequiredMcpScopes(oauthScopes)) {
+        const wwwAuth = `Bearer realm="seedkeep", error="insufficient_scope", scope="${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}", resource_metadata="${publicOrigin(c.req.raw)}/.well-known/oauth-protected-resource"`;
+        c.header('WWW-Authenticate', wwwAuth);
+        return c.json({ ok: false, error: {
+          code: 'insufficient_scope',
+          message: `OAuth token must grant ${MCP_READ_SCOPE} and ${MCP_WRITE_SCOPE}`,
+        } }, 403);
+      }
       // Prefer the household the user pinned at pairing time — that's
       // what they intended when they typed the code from iOS. Falls
       // back to memberships with the SAME ordering as `requireHousehold`

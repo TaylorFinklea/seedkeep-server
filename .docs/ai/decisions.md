@@ -2,6 +2,16 @@
 
 > Architecture decision records. Append-only — one entry per decision.
 
+## [2026-07-15] MCP OAuth transport requires both Seedkeep scopes
+
+**Context**: Discovery filtering removed tools outside an OAuth token's scopes, but a direct or future callback invocation could bypass that filter. MCP transport access also needs a single predictable capability contract.
+
+**Decision**: OAuth access tokens reaching `/mcp` must grant both `seedkeep:read` and `seedkeep:write`, otherwise return HTTP 403 with `insufficient_scope`. Enforce the same per-tool scope check inside the application callback. Personal MCP tokens remain unrestricted because they have no OAuth scope set.
+
+**Alternatives considered**: Permit read-only OAuth MCP sessions (rejected for the current all-capabilities MCP contract); rely only on SDK tool registration filtering (rejected because it is not an execution boundary).
+
+**Rationale**: A transport-level check gives clients a standards-compatible scope challenge, while the callback guard remains defense-in-depth if registration behavior changes or a tool is invoked outside discovery.
+
 ## [2026-05-04] Bun + Hono + Postgres + S3-compatible storage
 
 **Context**: After completing Phase 1 step E on Cloudflare Workers + D1 + R2, we identified self-hostability as a first-class requirement (users should be able to run their own backend on Fly.io / Railway / Docker). Workers + D1 are Cloudflare-locked and cannot satisfy that.

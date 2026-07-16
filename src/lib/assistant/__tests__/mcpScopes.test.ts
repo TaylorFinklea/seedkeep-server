@@ -2,16 +2,25 @@ import { describe, expect, it } from 'vitest';
 import {
   MCP_READ_SCOPE,
   MCP_WRITE_SCOPE,
+  hasRequiredMcpScopes,
   isMcpToolAllowed,
   parseOAuthScopes,
 } from '../mcpScopes';
-import { buildMcpServer } from '../mcpServer';
+import { buildMcpServer, executeMcpTool } from '../mcpServer';
+import { TOOL_REGISTRY } from '../tools';
 
 describe('MCP OAuth scopes', () => {
   it('parses a space-separated OAuth scope claim', () => {
     expect(parseOAuthScopes(`openid  ${MCP_READ_SCOPE} ${MCP_READ_SCOPE}`)).toEqual(
       new Set(['openid', MCP_READ_SCOPE]),
     );
+  });
+
+  it('requires both Seedkeep scopes at the MCP transport boundary', () => {
+    expect(hasRequiredMcpScopes(parseOAuthScopes(`${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}`))).toBe(true);
+    expect(hasRequiredMcpScopes(parseOAuthScopes(MCP_READ_SCOPE))).toBe(false);
+    expect(hasRequiredMcpScopes(parseOAuthScopes(MCP_WRITE_SCOPE))).toBe(false);
+    expect(hasRequiredMcpScopes(parseOAuthScopes('openid'))).toBe(false);
   });
 
   it('allows only tools covered by a scoped OAuth token', () => {
@@ -23,6 +32,20 @@ describe('MCP OAuth scopes', () => {
   it('leaves personal MCP tokens unrestricted', () => {
     expect(isMcpToolAllowed(MCP_READ_SCOPE)).toBe(true);
     expect(isMcpToolAllowed(MCP_WRITE_SCOPE)).toBe(true);
+  });
+
+  it('blocks a write callback even when invoked outside tool discovery', async () => {
+    const result = await executeMcpTool({
+      def: TOOL_REGISTRY.create_journal_entry,
+      rawArgs: { occurred_on: '2026-07-15', body: 'not authorized' },
+      ctx: { sql: null as never, householdId: 'hh-1' },
+      scopes: parseOAuthScopes(MCP_READ_SCOPE),
+    });
+
+    expect(result).toEqual({
+      status: 'failed',
+      error: { code: 'insufficient_scope', message: 'OAuth token does not grant seedkeep:write' },
+    });
   });
 
   it('registers only read tools for a read-only OAuth token', () => {
