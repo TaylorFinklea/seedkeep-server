@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MCP_READ_SCOPE,
   MCP_WRITE_SCOPE,
-  hasRequiredMcpScopes,
+  hasMcpAccessScope,
   isMcpToolAllowed,
   parseOAuthScopes,
 } from '../mcpScopes';
@@ -16,11 +16,11 @@ describe('MCP OAuth scopes', () => {
     );
   });
 
-  it('requires both Seedkeep scopes at the MCP transport boundary', () => {
-    expect(hasRequiredMcpScopes(parseOAuthScopes(`${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}`))).toBe(true);
-    expect(hasRequiredMcpScopes(parseOAuthScopes(MCP_READ_SCOPE))).toBe(false);
-    expect(hasRequiredMcpScopes(parseOAuthScopes(MCP_WRITE_SCOPE))).toBe(false);
-    expect(hasRequiredMcpScopes(parseOAuthScopes('openid'))).toBe(false);
+  it('admits either Seedkeep capability scope at the MCP transport boundary', () => {
+    expect(hasMcpAccessScope(parseOAuthScopes(`${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}`))).toBe(true);
+    expect(hasMcpAccessScope(parseOAuthScopes(MCP_READ_SCOPE))).toBe(true);
+    expect(hasMcpAccessScope(parseOAuthScopes(MCP_WRITE_SCOPE))).toBe(true);
+    expect(hasMcpAccessScope(parseOAuthScopes('openid'))).toBe(false);
   });
 
   it('allows only tools covered by a scoped OAuth token', () => {

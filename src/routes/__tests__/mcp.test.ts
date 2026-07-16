@@ -23,11 +23,11 @@ describe('MCP OAuth transport authorization', () => {
     dbGet.mockReset();
   });
 
-  it('rejects an OAuth token without both Seedkeep scopes before household resolution', async () => {
+  it('rejects an OAuth token without any Seedkeep scope before household resolution', async () => {
     dbGet.mockResolvedValue({
       userId: 'user-1',
       expiresAt: new Date(Date.now() + 60_000),
-      scopes: 'openid seedkeep:read',
+      scopes: 'openid profile',
     });
 
     const response = await mcpTransportRoutes.request(
@@ -44,9 +44,46 @@ describe('MCP OAuth transport authorization', () => {
       ok: false,
       error: {
         code: 'insufficient_scope',
-        message: 'OAuth token must grant seedkeep:read and seedkeep:write',
+        message: 'OAuth token must grant seedkeep:read or seedkeep:write',
       },
     });
     expect(dbGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('admits a read-only OAuth token and reaches MCP initialization', async () => {
+    dbGet
+      .mockResolvedValueOnce({
+        userId: 'user-1',
+        expiresAt: new Date(Date.now() + 60_000),
+        scopes: 'openid seedkeep:read',
+      })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ household_id: 'hh-1' });
+
+    const response = await mcpTransportRoutes.request(
+      new Request('https://seedkeep.test/mcp', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer oauth-read-only',
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'scope-test', version: '1.0.0' },
+          },
+        }),
+      }),
+      {},
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(dbGet).toHaveBeenCalledTimes(3);
   });
 });

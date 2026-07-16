@@ -24,7 +24,7 @@ import { WebStandardStreamableHTTPServerTransport } from
 import { buildMcpServer } from '../lib/assistant/mcpServer';
 import { checkRateLimit } from '../lib/rateLimit';
 import {
-  hasRequiredMcpScopes,
+  hasMcpAccessScope,
   MCP_READ_SCOPE,
   MCP_WRITE_SCOPE,
   parseOAuthScopes,
@@ -230,12 +230,12 @@ mcpTransportRoutes.all('/mcp', async (c) => {
     );
     if (oauth?.userId) {
       oauthScopes = parseOAuthScopes(oauth.scopes);
-      if (!hasRequiredMcpScopes(oauthScopes)) {
+      if (!hasMcpAccessScope(oauthScopes)) {
         const wwwAuth = `Bearer realm="seedkeep", error="insufficient_scope", scope="${MCP_READ_SCOPE} ${MCP_WRITE_SCOPE}", resource_metadata="${publicOrigin(c.req.raw)}/.well-known/oauth-protected-resource"`;
         c.header('WWW-Authenticate', wwwAuth);
         return c.json({ ok: false, error: {
           code: 'insufficient_scope',
-          message: `OAuth token must grant ${MCP_READ_SCOPE} and ${MCP_WRITE_SCOPE}`,
+          message: `OAuth token must grant ${MCP_READ_SCOPE} or ${MCP_WRITE_SCOPE}`,
         } }, 403);
       }
       // Prefer the household the user pinned at pairing time — that's

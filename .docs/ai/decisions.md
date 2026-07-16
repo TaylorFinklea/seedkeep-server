@@ -2,6 +2,16 @@
 
 > Architecture decision records. Append-only — one entry per decision.
 
+## [2026-07-15] MCP OAuth transport accepts any Seedkeep capability scope
+
+**Context**: The immediately following entry over-constrained transport access to tokens carrying both Seedkeep scopes. That contradicts the product contract for useful read-only OAuth grants and weakens least-privilege authorization.
+
+**Decision**: This entry supersedes “MCP OAuth transport requires both Seedkeep scopes.” OAuth tokens may enter `/mcp` when they carry `seedkeep:read` or `seedkeep:write`; tokens with neither are rejected with `insufficient_scope`. Tool discovery and the application callback independently enforce each tool's required scope. Personal MCP tokens remain unrestricted.
+
+**Alternatives considered**: Require both scopes (rejected because it makes read-only grants unusable); accept any valid OAuth token and expose zero tools (rejected because `openid`-only is not MCP authorization).
+
+**Rationale**: Admission should require a Seedkeep capability, while authorization stays per operation. This preserves read-only clients, permits write-only grants to mutate only, and retains defense in depth.
+
 ## [2026-07-15] MCP OAuth transport requires both Seedkeep scopes
 
 **Context**: Discovery filtering removed tools outside an OAuth token's scopes, but a direct or future callback invocation could bypass that filter. MCP transport access also needs a single predictable capability contract.
