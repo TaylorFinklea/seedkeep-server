@@ -279,7 +279,12 @@ mcpTransportRoutes.all('/mcp', async (c) => {
   }
 
   // Build a fresh MCP server scoped to this household.
-  const server = buildMcpServer({ sql, householdId, scopes: oauthScopes });
+  const server = buildMcpServer({
+    sql,
+    householdId,
+    scopes: oauthScopes,
+    gardenToolsEnabled: c.env.GARDEN_TOOLS_ENABLED,
+  });
 
   // Stateless streamable HTTP transport. New session per request, no
   // server-held connection state — fine for Claude Desktop's MCP

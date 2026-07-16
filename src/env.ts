@@ -54,6 +54,16 @@ const schema = z.object({
   // not_configured — explicit fail-closed rather than silent open.
   // Must be at least 32 characters when set (prod uses 64-char value).
   ADMIN_SECRET: z.string().min(32).optional().transform((v) => v?.trim() || undefined),
+
+  // R1 CloudKit-cutover kill switch (umbrella ADR 2026-07-16); unset ⇒
+  // garden tools disabled; rollback = set to 'true'. Disables the entire
+  // server garden-tool surface (Sprout assistant + MCP) at the boundary,
+  // including already-issued personal MCP tokens and OAuth grants. String
+  // env vars come in as "true"/"false" — coerce like S3_FORCE_PATH_STYLE.
+  GARDEN_TOOLS_ENABLED: z
+    .union([z.boolean(), z.literal('true'), z.literal('false')])
+    .default(false)
+    .transform((v) => v === true || v === 'true'),
 });
 
 export type Env = z.infer<typeof schema>;

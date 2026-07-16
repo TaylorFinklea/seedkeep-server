@@ -2,6 +2,20 @@
 
 > Architecture decision records. Append-only — one entry per decision.
 
+## [2026-07-16] R1 garden-tool kill switch: fail closed at the Sprout + MCP boundaries
+
+**Context**: Implements the umbrella ADR "R1 fails closed at the server boundary for all garden tools, including already-issued Sprout/MCP credentials" (`~/git/seedkeep/.docs/ai/decisions.md`, 2026-07-16) and bead `seedkeep-27d.9`. The iOS gate hides in-app Sprout/MCP routes, but credentials already pasted into Claude Desktop or claude.ai never pass through iOS again — `/mcp` would still resolve those tokens against the user's (possibly parked) Postgres household and register the full read/write tool set.
+
+**Decision**: A new `GARDEN_TOOLS_ENABLED` env var (`src/env.ts`, Zod `.default(false)` — same union/transform shape as `S3_FORCE_PATH_STYLE` rather than `z.coerce.boolean()`, which would coerce the literal string `"false"` to `true`) gates the entire 25-tool garden surface at two boundaries:
+- **Sprout** (`src/routes/assistant.ts`): `POST /stream` and `POST /tool_calls/:id/confirm` return 503 `capability_unavailable` before touching the DB when disabled, mirroring the existing `ASSISTANT_KEY_MASTER` 503 `not_configured` idiom. `POST /tool_calls/:id/cancel` is left untouched — it stays available unconditionally so an old client can still clean up a stale proposal.
+- **MCP** (`src/lib/assistant/mcpServer.ts`, `src/routes/mcp.ts`): `buildMcpServer` takes a required `gardenToolsEnabled` flag; when false it registers zero tools via `registerTool` but still explicitly wires the SDK's `ListToolsRequestSchema` handler (through the low-level `server.server` — the class's own documented extension point for custom request handlers) to answer `tools/list` with `{ tools: [] }`. Without that explicit wiring, `tools/list` would 404 with "Method not found", because the SDK only registers its own list/call handlers lazily inside `registerTool`, which we never call. `executeMcpTool` double-gates the same flag so a direct callback invocation (bypassing tool discovery) also refuses with `capability_unavailable`. The `/mcp` transport, `initialize`, and both personal-token and OAuth auth flows are unchanged — only tool registration is affected. Token CRUD (`/api/mcp/tokens`) and OAuth routes are untouched.
+
+`fly.toml` has no `[env]` block, so the fail-closed default ships without any deploy-config change; enabling requires an explicit `GARDEN_TOOLS_ENABLED=true` set on the Fly app (user-gated, not done here).
+
+**Alternatives considered**: A persistent per-account data-plane marker checked before registering/running tools, and revoking all issued MCP tokens/OAuth grants/the assistant key at cutover — both rejected for the same reasons as the umbrella ADR (cross-plane state and races; destructive and hard to reverse, respectively). For the MCP empty-list mechanics specifically: calling the SDK's private `setToolRequestHandlers()` (rejected — reaches around a method the `.d.ts` marks `private`, an unstable target for a library upgrade) vs. setting the handler through the public `server.server` seam (chosen).
+
+**Rationale**: One boolean is the simplest fail-closed switch and matches this file's existing `ADMIN_SECRET`/`ASSISTANT_KEY_MASTER` optional-gating pattern. Registering zero tools (rather than filtering per-tool) disables the entire surface with one branch instead of 25 conditionals. Explicitly answering `tools/list` with an empty array — instead of letting the method 404 — keeps the transport spec-compliant: a server that advertises `capabilities: { tools: {} }` at `initialize` is expected to answer `tools/list`, not error on it.
+
 ## [2026-07-15] MCP OAuth transport accepts any Seedkeep capability scope
 
 **Context**: The immediately following entry over-constrained transport access to tokens carrying both Seedkeep scopes. That contradicts the product contract for useful read-only OAuth grants and weakens least-privilege authorization.

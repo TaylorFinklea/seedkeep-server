@@ -40,6 +40,7 @@ describe('MCP OAuth scopes', () => {
       rawArgs: { occurred_on: '2026-07-15', body: 'not authorized' },
       ctx: { sql: null as never, householdId: 'hh-1' },
       scopes: parseOAuthScopes(MCP_READ_SCOPE),
+      gardenToolsEnabled: true,
     });
 
     expect(result).toEqual({
@@ -53,6 +54,7 @@ describe('MCP OAuth scopes', () => {
       sql: null as never,
       householdId: 'hh-1',
       scopes: parseOAuthScopes(MCP_READ_SCOPE),
+      gardenToolsEnabled: true,
     });
     const registered = (server as unknown as {
       _registeredTools: Record<string, unknown>;
@@ -63,11 +65,39 @@ describe('MCP OAuth scopes', () => {
   });
 
   it('registers all tools for a personal MCP token', () => {
-    const server = buildMcpServer({ sql: null as never, householdId: 'hh-1' });
+    const server = buildMcpServer({ sql: null as never, householdId: 'hh-1', gardenToolsEnabled: true });
     const registered = (server as unknown as {
       _registeredTools: Record<string, unknown>;
     })._registeredTools;
 
     expect(Object.keys(registered)).toHaveLength(25);
+  });
+});
+
+describe('R1 garden-tool kill switch (umbrella ADR 2026-07-16)', () => {
+  it('registers zero tools when garden tools are disabled, even for a personal MCP token', () => {
+    const server = buildMcpServer({ sql: null as never, householdId: 'hh-1', gardenToolsEnabled: false });
+    const registered = (server as unknown as {
+      _registeredTools: Record<string, unknown>;
+    })._registeredTools;
+
+    expect(Object.keys(registered)).toHaveLength(0);
+  });
+
+  it('double-gates executeMcpTool: returns capability_unavailable when invoked while disabled', async () => {
+    const result = await executeMcpTool({
+      def: TOOL_REGISTRY.list_seeds,
+      rawArgs: {},
+      ctx: { sql: null as never, householdId: 'hh-1' },
+      gardenToolsEnabled: false,
+    });
+
+    expect(result).toEqual({
+      status: 'failed',
+      error: {
+        code: 'capability_unavailable',
+        message: 'Garden tools are unavailable during the CloudKit transition.',
+      },
+    });
   });
 });

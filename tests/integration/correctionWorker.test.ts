@@ -73,6 +73,7 @@ const TEST_ENV: Env = {
   DEFAULT_VISION_MODEL: 'claude-sonnet-4-6',
   DEFAULT_REVIEW_MODEL: 'claude-haiku-4-5-20251001',
   ADMIN_SECRET: 'test-admin-secret',
+  GARDEN_TOOLS_ENABLED: true,
 };
 
 const cleanup = {

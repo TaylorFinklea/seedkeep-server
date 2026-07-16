@@ -89,6 +89,7 @@ const STUB_ENV: Env = {
   ANTHROPIC_API_KEY: undefined,
   APPLE_IAP_SHARED_SECRET: undefined,
   ASSISTANT_KEY_MASTER: undefined,
+  GARDEN_TOOLS_ENABLED: true,
 };
 
 describe('POST /api/planting-events kind validation', () => {

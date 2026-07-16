@@ -80,6 +80,7 @@ const TEST_ENV: Env = {
   DEFAULT_VISION_MODEL: 'claude-sonnet-4-6',
   DEFAULT_REVIEW_MODEL: 'claude-haiku-4-5-20251001',
   ADMIN_SECRET: undefined,
+  GARDEN_TOOLS_ENABLED: true,
 };
 
 // ── Mock the Anthropic stream module ─────────────────────────────────────────
@@ -791,5 +792,99 @@ describe('assistantStateMachine: stream_busy when thread lock is held', () => {
       `UPDATE assistant_threads SET stream_lock_at = NULL WHERE id = $1`,
       [threadId],
     );
+  });
+});
+
+// ── Case 6: R1 garden-tool kill switch (umbrella ADR 2026-07-16) ─────────────
+//
+// GARDEN_TOOLS_ENABLED gates the Sprout assistant boundary. Disabled (the
+// R1 default): stream + confirm fail closed with 503 capability_unavailable
+// even for an already-issued session/thread; cancel stays available so old
+// clients can still clean up a stale proposal.
+
+describe('assistantStateMachine: R1 garden-tool kill switch', () => {
+  const DISABLED_ENV: Env = { ...TEST_ENV, GARDEN_TOOLS_ENABLED: false };
+
+  it('stream returns 503 capability_unavailable when garden tools are disabled', async () => {
+    const fx = await seedAuthFixture();
+    cleanup.householdIds.add(fx.householdId);
+    cleanup.userIds.add(fx.userId);
+
+    await seedAssistantKey(fx.householdId);
+
+    const app = createApp(TEST_ENV);
+    const threadId = await createThread(app, fx);
+
+    const disabledApp = createApp(DISABLED_ENV);
+    const streamRes = await disabledApp.request(
+      `/api/assistant/threads/${threadId}/stream`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fx.sessionToken}` },
+        body: JSON.stringify({ text: 'should be blocked' }),
+      },
+      DISABLED_ENV,
+    );
+    expect(streamRes.status).toBe(503);
+    const body = (await streamRes.json()) as { ok: boolean; error: { code: string } };
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('capability_unavailable');
+  });
+
+  it('confirm returns 503 capability_unavailable and leaves the proposal untouched; cancel still works', async () => {
+    const fx = await seedAuthFixture();
+    cleanup.householdIds.add(fx.householdId);
+    cleanup.userIds.add(fx.userId);
+
+    const seedId = await seedSeed(fx.householdId, 'KillSwitch Seed');
+    currentSeedId = seedId;
+    await seedAssistantKey(fx.householdId);
+
+    const app = createApp(TEST_ENV);
+    const threadId = await createThread(app, fx);
+
+    // Propose a delete while garden tools are enabled (mirrors how an
+    // already-issued client would have a pending proposal at cutover time).
+    mockScenario = 'delete_seed_propose';
+    mockToolCallId = uid('mock-tc');
+    const { events } = await driveStream(app, fx, threadId);
+    const proposed = events.find((e) => e.type === 'proposed_change') as
+      | { tool_call_id: string } | undefined;
+    expect(proposed, `expected proposed_change; got: ${JSON.stringify(events)}`).toBeTruthy();
+    const toolCallId = proposed!.tool_call_id;
+
+    const disabledApp = createApp(DISABLED_ENV);
+
+    // Confirm fails closed — the pending proposal is left exactly as-is.
+    const confirmRes = await disabledApp.request(
+      `/api/assistant/tool_calls/${toolCallId}/confirm`,
+      { method: 'POST', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      DISABLED_ENV,
+    );
+    expect(confirmRes.status).toBe(503);
+    const confirmBody = (await confirmRes.json()) as { ok: boolean; error: { code: string } };
+    expect(confirmBody.ok).toBe(false);
+    expect(confirmBody.error.code).toBe('capability_unavailable');
+
+    const tcAfterConfirm = await sql.unsafe<Array<{ status: string }>>(
+      `SELECT status FROM assistant_tool_calls WHERE id = $1`,
+      [toolCallId],
+    );
+    expect(tcAfterConfirm[0]?.status).toBe('proposed');
+
+    // Cancel stays available regardless of the kill switch so old clients
+    // can clean up a stale proposal.
+    const cancelRes = await disabledApp.request(
+      `/api/assistant/tool_calls/${toolCallId}/cancel`,
+      { method: 'POST', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
+      DISABLED_ENV,
+    );
+    expect(cancelRes.status).toBe(200);
+    const cancelJson = (await cancelRes.json()) as {
+      ok: boolean;
+      data: { toolCall: { status: string } };
+    };
+    expect(cancelJson.ok).toBe(true);
+    expect(cancelJson.data.toolCall.status).toBe('cancelled');
   });
 });

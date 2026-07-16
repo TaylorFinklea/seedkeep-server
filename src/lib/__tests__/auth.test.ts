@@ -20,6 +20,7 @@ const env: Env = {
   ADMIN_SECRET: undefined,
   DEFAULT_VISION_MODEL: 'test-vision',
   DEFAULT_REVIEW_MODEL: 'test-review',
+  GARDEN_TOOLS_ENABLED: true,
 };
 
 describe('MCP OAuth discovery metadata', () => {

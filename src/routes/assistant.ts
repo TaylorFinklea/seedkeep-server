@@ -394,6 +394,13 @@ assistantRoutes.post('/threads/:id/stream', ...auth, async (c) => {
   const householdId = c.get('householdId') as string;
   const threadId = c.req.param('id');
 
+  // R1 CloudKit-cutover kill switch (umbrella ADR 2026-07-16) — fails
+  // closed for old clients holding already-issued credentials too.
+  if (!c.env.GARDEN_TOOLS_ENABLED) {
+    return c.json({ ok: false, error: { code: 'capability_unavailable',
+      message: 'Garden assistant is unavailable during the CloudKit transition.' } }, 503);
+  }
+
   if (!c.env.ASSISTANT_KEY_MASTER) {
     return c.json({ ok: false, error: { code: 'not_configured',
       message: 'Server is missing ASSISTANT_KEY_MASTER' } }, 503);
@@ -570,6 +577,13 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const id = c.req.param('id');
+
+  // R1 CloudKit-cutover kill switch (umbrella ADR 2026-07-16) — fails
+  // closed for old clients holding already-issued credentials too.
+  if (!c.env.GARDEN_TOOLS_ENABLED) {
+    return c.json({ ok: false, error: { code: 'capability_unavailable',
+      message: 'Garden assistant is unavailable during the CloudKit transition.' } }, 503);
+  }
 
   if (!c.env.ASSISTANT_KEY_MASTER) {
     return c.json({ ok: false, error: { code: 'not_configured',

@@ -13,6 +13,7 @@
 // run before Claude commits.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { Sql } from 'postgres';
 import { TOOL_REGISTRY } from './tools';
@@ -36,8 +37,21 @@ export async function executeMcpTool(args: {
   rawArgs: unknown;
   ctx: ToolExecutionContext;
   scopes?: ReadonlySet<string>;
+  gardenToolsEnabled: boolean;
 }): Promise<ToolExecutionResult> {
-  const { def, rawArgs, ctx, scopes } = args;
+  const { def, rawArgs, ctx, scopes, gardenToolsEnabled } = args;
+  // R1 CloudKit-cutover kill switch (umbrella ADR 2026-07-16) — double-gate
+  // here even though buildMcpServer already omits tools when disabled, so a
+  // direct call (bypassing tool discovery) still fails closed.
+  if (!gardenToolsEnabled) {
+    return {
+      status: 'failed',
+      error: {
+        code: 'capability_unavailable',
+        message: 'Garden tools are unavailable during the CloudKit transition.',
+      },
+    };
+  }
   if (!isMcpToolAllowed(def.scope, scopes)) {
     return {
       status: 'failed',
@@ -59,8 +73,9 @@ export function buildMcpServer(args: {
   sql: Sql;
   householdId: string;
   scopes?: ReadonlySet<string>;
+  gardenToolsEnabled: boolean;
 }): McpServer {
-  const { sql, householdId, scopes } = args;
+  const { sql, householdId, scopes, gardenToolsEnabled } = args;
 
   const server = new McpServer(
     { name: 'seedkeep', version: '1.0.0' },
@@ -70,6 +85,19 @@ export function buildMcpServer(args: {
         'Seedkeep is a personal gardening companion. Tools read and write the household\'s seed library, garden beds, planting events, journal entries, catalog, and recommendations. Destructive operations (delete, update, change home ZIP) apply immediately when invoked — review the tool_use block before authorizing.',
     },
   );
+
+  // R1 CloudKit-cutover kill switch (umbrella ADR 2026-07-16) — when
+  // disabled, register ZERO tools. The transport, initialize, and auth flow
+  // stay fully functional; a connected MCP client just sees an empty list.
+  // `registerTool` is what normally wires up the SDK's `tools/list` handler
+  // (lazily, on first call) — since we never call it, we set the handler
+  // directly on the underlying `server.server` (the documented extension
+  // point for custom request handlers) so `tools/list` still answers with
+  // an empty array instead of "Method not found".
+  if (!gardenToolsEnabled) {
+    server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+    return server;
+  }
 
   for (const def of Object.values(TOOL_REGISTRY)) {
     if (!isMcpToolAllowed(def.scope, scopes)) continue;
@@ -82,7 +110,7 @@ export function buildMcpServer(args: {
       },
       async (rawArgs: unknown) => {
         const ctx = { sql, householdId };
-        const result = await executeMcpTool({ def, rawArgs, ctx, scopes });
+        const result = await executeMcpTool({ def, rawArgs, ctx, scopes, gardenToolsEnabled });
         return mcpResponse(result);
       },
     );
