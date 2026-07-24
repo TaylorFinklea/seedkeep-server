@@ -557,62 +557,41 @@ describe('DELETE /api/me — multi-member, caller is non-owner', () => {
 // ── (c) Multi-member, caller is the only owner ────────────────────────────────
 
 describe('DELETE /api/me — multi-member, caller is the only owner', () => {
-  it('promotes oldest-joined other member to owner, household intact, caller gone', async () => {
+  it('refuses final deletion until a verified CloudKit transfer records source deletion', async () => {
     deletedKeys.length = 0;
-
-    // Caller is the sole owner.
     const { userId: ownerUserId, sessionToken: ownerToken } = await seedUser();
-    // Other member (not owner).
     const { userId: memberUserId } = await seedUser();
-
     const householdId = await seedHousehold();
-    // Owner joined first.
     await addMembership(householdId, ownerUserId, 'owner', 0);
-    // Member joined later.
     await addMembership(householdId, memberUserId, 'member', 5000);
 
     const app = createApp(TEST_ENV);
-
     const res = await app.request(
       '/api/me',
       { method: 'DELETE', headers: { Authorization: `Bearer ${ownerToken}` } },
       TEST_ENV,
     );
 
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
-    expect(json.ok).toBe(true);
-    expect(json.data.deleted).toBe(true);
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { ok: boolean; error: { code: string } };
+    expect(json.ok).toBe(false);
+    expect(json.error.code).toBe('cloudkit_transfer_required');
 
-    // Owner (caller) user is gone.
     const ownerRows = await sql.unsafe<{ id: string }[]>(
       `SELECT id FROM "user" WHERE id = $1`,
       [ownerUserId],
     );
-    expect(ownerRows.length).toBe(0);
-
-    // Household is intact.
-    const hhRows = await sql.unsafe<{ id: string }[]>(
-      `SELECT id FROM households WHERE id = $1`,
-      [householdId],
-    );
-    expect(hhRows.length).toBe(1);
-
-    // Other member has been promoted to owner.
-    const memberMembRows = await sql.unsafe<{ role: string }[]>(
+    expect(ownerRows.length).toBe(1);
+    const memberships = await sql.unsafe<{ role: string }[]>(
       `SELECT role FROM memberships WHERE household_id = $1 AND user_id = $2`,
-      [householdId, memberUserId],
+      [householdId, ownerUserId],
     );
-    expect(memberMembRows.length).toBe(1);
-    expect(memberMembRows[0]!.role).toBe('owner');
+    expect(memberships).toEqual([{ role: 'owner' }]);
+    expect(deletedKeys).toEqual([]);
 
-    // No S3 deletions occurred.
-    expect(deletedKeys.length).toBe(0);
-
-    // Clean up.
     await sql.unsafe(`DELETE FROM memberships WHERE household_id = $1`, [householdId]).catch(() => {});
     await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]).catch(() => {});
-    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [memberUserId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [ownerUserId, memberUserId]).catch(() => {});
   });
 });
 

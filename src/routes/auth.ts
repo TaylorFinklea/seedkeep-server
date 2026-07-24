@@ -134,19 +134,16 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
         await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
       });
     } else if (isOnlyOwner) {
-      // Promote oldest-joined other member to owner, then delete caller.
-      const oldestOther = otherMembers[0]!;
-      await sql.begin(async (tx) => {
-        await tx.unsafe(
-          `UPDATE memberships SET role = 'owner' WHERE household_id = $1 AND user_id = $2`,
-          [householdId, oldestOther.user_id],
-        );
-        await tx.unsafe(
-          `DELETE FROM memberships WHERE household_id = $1 AND user_id = $2`,
-          [householdId, userId],
-        );
-        await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
-      });
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'cloudkit_transfer_required',
+            message: 'Transfer the shared iCloud garden before deleting this account.',
+          },
+        },
+        409,
+      );
     } else {
       // Other owners exist or caller is not the only owner — remove membership only.
       await sql.begin(async (tx) => {
