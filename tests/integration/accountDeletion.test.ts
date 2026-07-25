@@ -21,13 +21,14 @@
  *
  * Prerequisites:
  *   - Local Postgres reachable at DATABASE_URL
- *   - Migrations 0001–0025 applied (`bun run migrate`)
+ *   - Migrations 0001–0028 applied (`bun run migrate`)
  */
 
 import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
 import postgres, { type Sql } from 'postgres';
 import type { Hono } from 'hono';
 import { createApp } from '../../src/index';
+import { createHash } from 'node:crypto';
 import type { AppEnv } from '../../src/index';
 import type { Env } from '../../src/env';
 
@@ -86,6 +87,10 @@ const TEST_ENV: Env = {
 
 function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function receiptHash(raw: string = uid('receipt')): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex');
 }
 
 interface Fixture {
@@ -150,24 +155,31 @@ async function seedFixture(role: 'owner' | 'member' = 'owner'): Promise<Fixture>
 }
 
 /**
- * DELETE /api/me with an explicit CloudKit disposition. Pass `null` to
- * exercise the fail-closed path taken by a client that never did (or
- * never reported) its CloudKit work.
+ * DELETE /api/me with an explicit CloudKit disposition and a unique
+ * deletion receipt by default. Pass `addReceipt = false` to exercise the
+ * fail-closed receipt validation path.
  */
 async function deleteMe(
   app: Hono<AppEnv>,
   sessionToken: string,
   body: Record<string, unknown> | null,
+  addReceipt = true,
 ): Promise<Response> {
+  const requestBody =
+    body === null
+      ? null
+      : addReceipt
+        ? { deletion_receipt_hash: receiptHash(), ...body }
+        : body;
   return app.request(
     '/api/me',
     {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${sessionToken}`,
-        ...(body === null ? {} : { 'Content-Type': 'application/json' }),
+        ...(requestBody === null ? {} : { 'Content-Type': 'application/json' }),
       },
-      body: body === null ? undefined : JSON.stringify(body),
+      body: requestBody === null ? undefined : JSON.stringify(requestBody),
     },
     TEST_ENV,
   );
@@ -228,6 +240,9 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await sql
+    .unsafe(`DELETE FROM account_deletion_receipts WHERE deleted_user_id LIKE 'ad-user-%'`)
+    .catch(() => {});
   await sql.end({ timeout: 5 });
 });
 
@@ -585,7 +600,7 @@ describe('DELETE /api/me — multi-member, caller is the only owner', () => {
     await addMembership(householdId, memberUserId, 'member', 5000);
 
     const app = createApp(TEST_ENV);
-    const res = await deleteMe(app, ownerToken, null);
+    const res = await deleteMe(app, ownerToken, {});
 
     expect(res.status).toBe(400);
     const json = (await res.json()) as { ok: boolean; error: { code: string } };
@@ -704,5 +719,188 @@ describe('DELETE /api/me — user with no household', () => {
 
     // No S3 deletions.
     expect(deletedKeys.length).toBe(0);
+  });
+});
+
+// ── Durable account-deletion receipts ─────────────────────────────────────
+
+describe('account-deletion receipts', () => {
+  it('writes the receipt in the deletion transaction and looks it up without authentication', async () => {
+    const { userId, sessionToken } = await seedUser();
+    const app = createApp(TEST_ENV);
+    const rawReceipt = uid('raw-receipt');
+    const hash = receiptHash(rawReceipt);
+    const before = Date.now();
+
+    const deleted = await deleteMe(
+      app,
+      sessionToken,
+      {
+        cloudkit_disposition: 'no_cloudkit_garden',
+        deletion_receipt_hash: hash,
+      },
+      false,
+    );
+    expect(deleted.status).toBe(200);
+
+    const rows = await sql.unsafe<
+      { receipt_hash: string; deleted_user_id: string; deleted_at: number; expires_at: number }[]
+    >(
+      `SELECT receipt_hash, deleted_user_id, deleted_at, expires_at
+         FROM account_deletion_receipts
+        WHERE receipt_hash = $1`,
+      [hash],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.deleted_user_id).toBe(userId);
+    expect(rows[0]!.deleted_at).toBeGreaterThanOrEqual(before);
+    expect(rows[0]!.expires_at - rows[0]!.deleted_at).toBe(30 * 24 * 60 * 60 * 1000);
+
+    const userRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [userId],
+    );
+    expect(userRows).toHaveLength(0);
+
+    const lookup = await app.request(
+      '/api/account-deletion/receipts/lookup',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receipt_token: rawReceipt }),
+      },
+      TEST_ENV,
+    );
+    expect(lookup.status).toBe(200);
+    const lookupBody = await lookup.json();
+    expect(lookupBody).toEqual({
+      ok: true,
+      data: { deleted: true, deleted_at: rows[0]!.deleted_at },
+    });
+
+    await sql.unsafe(`DELETE FROM account_deletion_receipts WHERE receipt_hash = $1`, [hash]);
+  });
+
+  it('returns receipt_not_found for an unknown unauthenticated capability', async () => {
+    const app = createApp(TEST_ENV);
+    const lookup = await app.request(
+      '/api/account-deletion/receipts/lookup',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receipt_token: uid('unknown-receipt') }),
+      },
+      TEST_ENV,
+    );
+
+    expect(lookup.status).toBe(404);
+    const body = await lookup.json();
+    expect(body).toEqual({
+      ok: false,
+      error: { code: 'receipt_not_found', message: expect.any(String) },
+    });
+  });
+
+  it('rolls back account deletion when the receipt hash already exists', async () => {
+    const { userId, sessionToken } = await seedUser();
+    const app = createApp(TEST_ENV);
+    const hash = receiptHash(uid('duplicate-receipt'));
+    const now = Date.now();
+    await sql.unsafe(
+      `INSERT INTO account_deletion_receipts
+          (receipt_hash, deleted_user_id, deleted_at, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [hash, 'already-deleted-user', now, now + 30 * 24 * 60 * 60 * 1000],
+    );
+
+    const res = await deleteMe(
+      app,
+      sessionToken,
+      {
+        cloudkit_disposition: 'no_cloudkit_garden',
+        deletion_receipt_hash: hash,
+      },
+      false,
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toEqual({
+      ok: false,
+      error: { code: 'deletion_receipt_conflict', message: expect.any(String) },
+    });
+
+    const userRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [userId],
+    );
+    expect(userRows).toEqual([{ id: userId }]);
+
+    await sql.unsafe(`DELETE FROM account_deletion_receipts WHERE receipt_hash = $1`, [hash]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
+  });
+
+  it('requires a lowercase SHA-256 deletion receipt hash', async () => {
+    const { userId, sessionToken } = await seedUser();
+    const app = createApp(TEST_ENV);
+
+    for (const body of [
+      { cloudkit_disposition: 'no_cloudkit_garden' },
+      {
+        cloudkit_disposition: 'no_cloudkit_garden',
+        deletion_receipt_hash: 'not-a-sha256-hash',
+      },
+    ]) {
+      const res = await deleteMe(app, sessionToken, body, false);
+      expect(res.status).toBe(400);
+      const responseBody = await res.json();
+      expect(responseBody).toEqual({
+        ok: false,
+        error: { code: 'deletion_receipt_required', message: expect.any(String) },
+      });
+    }
+
+    const userRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [userId],
+    );
+    expect(userRows).toEqual([{ id: userId }]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
+  });
+
+  it('does not write a receipt when the CloudKit transfer gate blocks deletion', async () => {
+    const { userId: ownerId, sessionToken } = await seedUser();
+    const { userId: memberId } = await seedUser();
+    const householdId = await seedHousehold();
+    await addMembership(householdId, ownerId, 'owner');
+    await addMembership(householdId, memberId, 'member', 1000);
+    const app = createApp(TEST_ENV);
+    const hash = receiptHash(uid('blocked-receipt'));
+
+    const res = await deleteMe(
+      app,
+      sessionToken,
+      {
+        cloudkit_disposition: 'transfer_source_deleted',
+        transfer_id: 'missing-transfer',
+        deletion_receipt_hash: hash,
+      },
+      false,
+    );
+    expect(res.status).toBe(409);
+
+    const receipts = await sql.unsafe<{ receipt_hash: string }[]>(
+      `SELECT receipt_hash FROM account_deletion_receipts WHERE receipt_hash = $1`,
+      [hash],
+    );
+    expect(receipts).toHaveLength(0);
+    const ownerRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [ownerId],
+    );
+    expect(ownerRows).toEqual([{ id: ownerId }]);
+
+    await sql.unsafe(`DELETE FROM memberships WHERE household_id = $1`, [householdId]);
+    await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [ownerId, memberId]);
   });
 });

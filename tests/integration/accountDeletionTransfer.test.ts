@@ -9,8 +9,8 @@
  * authorization rule and every legal/illegal phase transition:
  *
  *   pending_successor → successor_bound → destination_ready
- *     → owner_verified → verified → source_deleted
- *   (any non-terminal phase) → cancelled
+ *     → owner_verified → verified → source_deleting → source_deleted
+ *   (any phase before source_deleting) → cancelled
  *
  * Also covers: 256-bit handoff token stored only as a SHA-256 hash, 72h
  * expiry, single use, create/accept/advance idempotency, digest and
@@ -27,7 +27,7 @@
  *
  * Prerequisites:
  *   - Local Postgres reachable at DATABASE_URL
- *   - Migrations 0001–0025 applied (`bun run migrate`)
+ *   - Migrations 0001–0028 applied (`bun run migrate`)
  */
 
 import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
@@ -109,6 +109,7 @@ interface TransferWire {
   phase: string;
   handoff_expires_at: number;
   handoff_consumed_at: number | null;
+  source_deleting_at: number | null;
   destination_zone_name: string | null;
   destination_zone_owner_name: string | null;
   destination_share_record_name: string | null;
@@ -161,6 +162,14 @@ function okBody(body: AnyBody): OkBody {
 function errBody(body: AnyBody): ErrBody {
   if (body.ok) throw new Error(`expected error envelope, got ${JSON.stringify(body)}`);
   return body;
+}
+
+function deletionReceiptHash(raw: string = uid('receipt')): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
+function deletionBody(body: Record<string, unknown>): Record<string, unknown> {
+  return { ...body, deletion_receipt_hash: deletionReceiptHash() };
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -288,6 +297,7 @@ type Phase =
   | 'destination_ready'
   | 'owner_verified'
   | 'verified'
+  | 'source_deleting'
   | 'source_deleted';
 
 /** Drive the machine to a phase, returning the transfer id + raw token. */
@@ -336,6 +346,12 @@ async function driveTo(
   expect(successorVerify.status).toBe(200);
   if (target === 'verified') return { id, token };
 
+  const sourceDeleting = await api('POST', `${BASE}/${id}/source-deleting`, {
+    token: scene.owner.sessionToken,
+  });
+  expect(sourceDeleting.status).toBe(200);
+  if (target === 'source_deleting') return { id, token };
+
   const sourceDeleted = await api('POST', `${BASE}/${id}/source-deleted`, {
     token: scene.owner.sessionToken,
   });
@@ -349,6 +365,9 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await sql
+    .unsafe(`DELETE FROM account_deletion_receipts WHERE deleted_user_id LIKE 'adt-user-%'`)
+    .catch(() => {});
   // User deletion cascades memberships and transfers.
   await sql.unsafe(`DELETE FROM "user" WHERE id LIKE 'adt-user-%'`).catch(() => {});
   await sql.unsafe(`DELETE FROM households WHERE id LIKE 'adt-hh-%'`).catch(() => {});
@@ -643,6 +662,155 @@ describe('POST /api/account-deletion/transfers/:id/accept', () => {
     expect(res.status).toBe(409);
     expect(errBody(res.body).error.code).toBe('phase_conflict');
     expect(await phaseOf(id)).toBe('cancelled');
+  });
+});
+
+// ── Inspect handoff token without consuming it ────────────────────────────
+
+describe('POST /api/account-deletion/transfers/:id/inspect', () => {
+  it('reveals only garden identity and leaves the same token usable for accept', async () => {
+    const scene = await seedScene();
+    const { id, token } = await driveTo(scene, 'pending_successor');
+
+    const inspected = await api('POST', `${BASE}/${id}/inspect`, {
+      token: scene.successor.sessionToken,
+      body: { token },
+    });
+    expect(inspected.status).toBe(200);
+    const inspectedBody: unknown = inspected.body;
+    if (
+      !inspectedBody ||
+      typeof inspectedBody !== 'object' ||
+      !('ok' in inspectedBody) ||
+      inspectedBody.ok !== true ||
+      !('data' in inspectedBody) ||
+      !inspectedBody.data ||
+      typeof inspectedBody.data !== 'object'
+    ) {
+      throw new Error(`unexpected inspect response: ${JSON.stringify(inspectedBody)}`);
+    }
+    const data = inspectedBody.data;
+    expect(Object.keys(data).sort()).toEqual(
+      ['transfer_id', 'source_household_id', 'phase', 'handoff_expires_at'].sort(),
+    );
+    expect(data.transfer_id).toBe(id);
+    expect(data.source_household_id).toBe(scene.householdId);
+    expect(data.phase).toBe('pending_successor');
+
+    const rowAfterInspect = (await transferRow(id))!;
+    expect(rowAfterInspect.phase).toBe('pending_successor');
+    expect(rowAfterInspect.successor_user_id).toBeNull();
+    expect(rowAfterInspect.handoff_consumed_at).toBeNull();
+
+    const accepted = await api('POST', `${BASE}/${id}/accept`, {
+      token: scene.successor.sessionToken,
+      body: { token },
+    });
+    expect(accepted.status).toBe(200);
+    expect(okBody(accepted.body).data.transfer.successor_user_id).toBe(scene.successor.userId);
+  });
+
+  it('rejects a wrong token before revealing transfer state', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'pending_successor');
+
+    const res = await api('POST', `${BASE}/${id}/inspect`, {
+      token: scene.successor.sessionToken,
+      body: { token: 'wrong-token' },
+    });
+    expect(res.status).toBe(403);
+    expect(errBody(res.body).error.code).toBe('invalid_token');
+  });
+
+  it('rejects an expired token', async () => {
+    const scene = await seedScene();
+    const { id, token } = await driveTo(scene, 'pending_successor');
+    await sql.unsafe(
+      `UPDATE account_deletion_transfers SET handoff_expires_at = $1 WHERE id = $2`,
+      [Date.now() - 1, id],
+    );
+
+    const res = await api('POST', `${BASE}/${id}/inspect`, {
+      token: scene.successor.sessionToken,
+      body: { token },
+    });
+    expect(res.status).toBe(403);
+    expect(errBody(res.body).error.code).toBe('handoff_expired');
+  });
+
+  it('returns not_found for an unknown transfer id', async () => {
+    const scene = await seedScene();
+    const res = await api('POST', `${BASE}/unknown/inspect`, {
+      token: scene.successor.sessionToken,
+      body: { token: 'opaque-capability' },
+    });
+    expect(res.status).toBe(404);
+    expect(errBody(res.body).error.code).toBe('not_found');
+  });
+});
+
+// ── Explicit handoff-token rotation ───────────────────────────────────────
+
+describe('POST /api/account-deletion/transfers/:id/handoff-token', () => {
+  it('lets the owner rotate the pending token and invalidates the previous token', async () => {
+    const scene = await seedScene();
+    const { id, token: previousToken } = await driveTo(scene, 'pending_successor');
+
+    const rotated = await api('POST', `${BASE}/${id}/handoff-token`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(rotated.status).toBe(200);
+    const nextToken = okBody(rotated.body).data.handoff_token;
+    expect(typeof nextToken).toBe('string');
+    expect(nextToken).not.toBe(previousToken);
+
+    const stale = await api('POST', `${BASE}/${id}/accept`, {
+      token: scene.successor.sessionToken,
+      body: { token: previousToken },
+    });
+    expect(stale.status).toBe(403);
+    expect(errBody(stale.body).error.code).toBe('invalid_token');
+
+    const accepted = await api('POST', `${BASE}/${id}/accept`, {
+      token: scene.successor.sessionToken,
+      body: { token: nextToken },
+    });
+    expect(accepted.status).toBe(200);
+  });
+
+  it('is owner-only', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'pending_successor');
+
+    for (const caller of [scene.successor, scene.outsider]) {
+      const res = await api('POST', `${BASE}/${id}/handoff-token`, {
+        token: caller.sessionToken,
+      });
+      expect(res.status).toBe(403);
+      expect(errBody(res.body).error.code).toBe('forbidden');
+    }
+  });
+
+  it('returns phase_conflict from every later durable phase', async () => {
+    for (const phase of [
+      'successor_bound',
+      'destination_ready',
+      'owner_verified',
+      'verified',
+      'source_deleting',
+      'source_deleted',
+    ] as const) {
+      const scene = await seedScene();
+      const { id } = await driveTo(scene, phase);
+
+      const res = await api('POST', `${BASE}/${id}/handoff-token`, {
+        token: scene.owner.sessionToken,
+      });
+      expect(res.status).toBe(409);
+      const error = errBody(res.body).error;
+      expect(error.code).toBe('phase_conflict');
+      expect(error.phase).toBe(phase);
+    }
   });
 });
 
@@ -962,12 +1130,159 @@ describe('PUT /api/account-deletion/transfers/:id/successor-verification', () =>
   });
 });
 
+// ── Source-deletion lease ─────────────────────────────────────────────────
+
+describe('POST /api/account-deletion/transfers/:id/source-deleting', () => {
+  it('acquires the owner lease from verified and records its timestamp', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+    const before = Date.now();
+
+    const res = await api('POST', `${BASE}/${id}/source-deleting`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(res.status).toBe(200);
+    const transfer = okBody(res.body).data.transfer;
+    expect(transfer.phase).toBe('source_deleting');
+    expect(transfer.source_deleting_at).toBeGreaterThanOrEqual(before);
+    expect(transfer.source_deleting_at).toBeLessThanOrEqual(Date.now());
+    expect((await transferRow(id))!.source_deleting_at).toBe(transfer.source_deleting_at);
+  });
+
+  it('is idempotent after the lease is acquired and after source deletion is recorded', async () => {
+    for (const phase of ['source_deleting', 'source_deleted'] as const) {
+      const scene = await seedScene();
+      const { id } = await driveTo(scene, phase);
+      const before = (await transferRow(id))!.source_deleting_at;
+
+      const retry = await api('POST', `${BASE}/${id}/source-deleting`, {
+        token: scene.owner.sessionToken,
+      });
+      expect(retry.status).toBe(200);
+      expect(okBody(retry.body).data.transfer.phase).toBe(phase);
+      expect((await transferRow(id))!.source_deleting_at).toBe(before);
+    }
+  });
+
+  it('returns phase_conflict with the durable phase from every other phase', async () => {
+    for (const phase of [
+      'pending_successor',
+      'successor_bound',
+      'destination_ready',
+      'owner_verified',
+    ] as const) {
+      const scene = await seedScene();
+      const { id } = await driveTo(scene, phase);
+
+      const res = await api('POST', `${BASE}/${id}/source-deleting`, {
+        token: scene.owner.sessionToken,
+      });
+      expect(res.status).toBe(409);
+      const error = errBody(res.body).error;
+      expect(error.code).toBe('phase_conflict');
+      expect(error.phase).toBe(phase);
+    }
+
+    const cancelledScene = await seedScene();
+    const { id: cancelledId } = await driveTo(cancelledScene, 'verified');
+    await api('DELETE', `${BASE}/${cancelledId}`, {
+      token: cancelledScene.owner.sessionToken,
+    });
+    const cancelled = await api('POST', `${BASE}/${cancelledId}/source-deleting`, {
+      token: cancelledScene.owner.sessionToken,
+    });
+    expect(cancelled.status).toBe(409);
+    expect(errBody(cancelled.body).error.code).toBe('phase_conflict');
+    expect(errBody(cancelled.body).error.phase).toBe('cancelled');
+  });
+
+  it('refuses the successor and an unrelated authenticated account', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+
+    for (const caller of [scene.successor, scene.outsider]) {
+      const res = await api('POST', `${BASE}/${id}/source-deleting`, {
+        token: caller.sessionToken,
+      });
+      expect(res.status).toBe(403);
+      expect(errBody(res.body).error.code).toBe('forbidden');
+    }
+    expect(await phaseOf(id)).toBe('verified');
+  });
+
+  it('refuses the lease when the successor user row is gone', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [scene.successor.userId]);
+
+    const res = await api('POST', `${BASE}/${id}/source-deleting`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(res.status).toBe(409);
+    const error = errBody(res.body).error;
+    expect(error.code).toBe('successor_unavailable');
+    expect(error.phase).toBe('verified');
+    expect(await phaseOf(id)).toBe('verified');
+  });
+
+  it('refuses the lease when the successor no longer owns the source household', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+    await sql.unsafe(
+      `UPDATE memberships SET role = 'member' WHERE household_id = $1 AND user_id = $2`,
+      [scene.householdId, scene.successor.userId],
+    );
+
+    const res = await api('POST', `${BASE}/${id}/source-deleting`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(res.status).toBe(409);
+    const error = errBody(res.body).error;
+    expect(error.code).toBe('successor_unavailable');
+    expect(error.phase).toBe('verified');
+    expect(await phaseOf(id)).toBe('verified');
+  });
+
+  it('serializes two concurrent lease acquisitions onto one durable timestamp', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+
+    const [a, b] = await Promise.all([
+      api('POST', `${BASE}/${id}/source-deleting`, { token: scene.owner.sessionToken }),
+      api('POST', `${BASE}/${id}/source-deleting`, { token: scene.owner.sessionToken }),
+    ]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const first = okBody(a.body).data.transfer;
+    const second = okBody(b.body).data.transfer;
+    expect(first.phase).toBe('source_deleting');
+    expect(second.phase).toBe('source_deleting');
+    expect(first.source_deleting_at).toBe(second.source_deleting_at);
+    expect((await transferRow(id))!.source_deleting_at).toBe(first.source_deleting_at);
+  });
+
+  it('serializes cancellation against acquisition so both cannot succeed', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'verified');
+
+    const [lease, cancel] = await Promise.all([
+      api('POST', `${BASE}/${id}/source-deleting`, { token: scene.owner.sessionToken }),
+      api('DELETE', `${BASE}/${id}`, { token: scene.owner.sessionToken }),
+    ]);
+    expect([lease.status, cancel.status].sort()).toEqual([200, 409]);
+    const durablePhase = await phaseOf(id);
+    expect(['source_deleting', 'cancelled']).toContain(durablePhase);
+    const loser = lease.status === 409 ? lease : cancel;
+    expect(errBody(loser.body).error.code).toBe('phase_conflict');
+    expect(errBody(loser.body).error.phase).toBe(durablePhase);
+  });
+});
+
 // ── Source deleted ────────────────────────────────────────────────────────
 
 describe('POST /api/account-deletion/transfers/:id/source-deleted', () => {
-  it('records verified source-zone absence', async () => {
+  it('records source-zone absence only after the deletion lease is held', async () => {
     const scene = await seedScene();
-    const { id } = await driveTo(scene, 'verified');
+    const { id } = await driveTo(scene, 'source_deleting');
 
     const res = await api('POST', `${BASE}/${id}/source-deleted`, {
       token: scene.owner.sessionToken,
@@ -976,16 +1291,30 @@ describe('POST /api/account-deletion/transfers/:id/source-deleted', () => {
     expect(okBody(res.body).data.transfer.phase).toBe('source_deleted');
   });
 
-  it('refuses the successor', async () => {
+
+  it('rejects verified until the owner acquires the deletion lease', async () => {
     const scene = await seedScene();
     const { id } = await driveTo(scene, 'verified');
+
+    const res = await api('POST', `${BASE}/${id}/source-deleted`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(res.status).toBe(409);
+    const error = errBody(res.body).error;
+    expect(error.code).toBe('phase_conflict');
+    expect(error.phase).toBe('verified');
+    expect(await phaseOf(id)).toBe('verified');
+  });
+  it('refuses the successor', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'source_deleting');
 
     const res = await api('POST', `${BASE}/${id}/source-deleted`, {
       token: scene.successor.sessionToken,
     });
     expect(res.status).toBe(403);
     expect(errBody(res.body).error.code).toBe('forbidden');
-    expect(await phaseOf(id)).toBe('verified');
+    expect(await phaseOf(id)).toBe('source_deleting');
   });
 
   it('refuses source deletion before both parties verified', async () => {
@@ -1090,6 +1419,18 @@ describe('DELETE /api/account-deletion/transfers/:id', () => {
     expect(okBody(retry.body).data.transfer.phase).toBe('cancelled');
   });
 
+  it('refuses cancellation while the source-deletion lease is held', async () => {
+    const scene = await seedScene();
+    const { id } = await driveTo(scene, 'source_deleting');
+
+    const res = await api('DELETE', `${BASE}/${id}`, { token: scene.owner.sessionToken });
+    expect(res.status).toBe(409);
+    const error = errBody(res.body).error;
+    expect(error.code).toBe('phase_conflict');
+    expect(error.phase).toBe('source_deleting');
+    expect(await phaseOf(id)).toBe('source_deleting');
+  });
+
   it('refuses cancellation once the source zone is gone', async () => {
     const scene = await seedScene();
     const { id } = await driveTo(scene, 'source_deleted');
@@ -1123,7 +1464,10 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
     const scene = await seedScene();
     const { id } = await driveTo(scene, 'verified');
 
-    const res = await api('DELETE', '/api/me', { token: scene.owner.sessionToken });
+    const res = await api('DELETE', '/api/me', {
+      token: scene.owner.sessionToken,
+      body: deletionBody({}),
+    });
     expect(res.status).toBe(400);
     expect(errBody(res.body).error.code).toBe('cloudkit_disposition_required');
 
@@ -1145,7 +1489,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const res = await api('DELETE', '/api/me', {
       token: scene.owner.sessionToken,
-      body: { cloudkit_disposition: 'trust_me' },
+      body: deletionBody({ cloudkit_disposition: 'trust_me' }),
     });
     expect(res.status).toBe(400);
     expect(errBody(res.body).error.code).toBe('cloudkit_disposition_required');
@@ -1163,7 +1507,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const res = await api('DELETE', '/api/me', {
       token: scene.owner.sessionToken,
-      body: { cloudkit_disposition: 'transfer_source_deleted', transfer_id: id },
+      body: deletionBody({ cloudkit_disposition: 'transfer_source_deleted', transfer_id: id }),
     });
     expect(res.status).toBe(409);
     expect(errBody(res.body).error.code).toBe('cloudkit_transfer_required');
@@ -1179,7 +1523,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const res = await api('DELETE', '/api/me', {
       token: scene.successor.sessionToken,
-      body: { cloudkit_disposition: 'transfer_source_deleted', transfer_id: id },
+      body: deletionBody({ cloudkit_disposition: 'transfer_source_deleted', transfer_id: id }),
     });
     expect(res.status).toBe(409);
     expect(errBody(res.body).error.code).toBe('cloudkit_transfer_required');
@@ -1202,7 +1546,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
     ]) {
       const res = await api('DELETE', '/api/me', {
         token: scene.owner.sessionToken,
-        body: { cloudkit_disposition: disposition },
+        body: deletionBody({ cloudkit_disposition: disposition }),
       });
       expect(res.status).toBe(409);
       expect(errBody(res.body).error.code).toBe('cloudkit_transfer_required');
@@ -1221,7 +1565,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const res = await api('DELETE', '/api/me', {
       token: scene.owner.sessionToken,
-      body: { cloudkit_disposition: 'transfer_source_deleted', transfer_id: id },
+      body: deletionBody({ cloudkit_disposition: 'transfer_source_deleted', transfer_id: id }),
     });
     expect(res.status).toBe(200);
 
@@ -1256,7 +1600,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const blocked = await api('DELETE', '/api/me', {
       token: scene.owner.sessionToken,
-      body: { cloudkit_disposition: 'owner_zone_deleted' },
+      body: deletionBody({ cloudkit_disposition: 'owner_zone_deleted' }),
     });
     expect(blocked.status).toBe(409);
     expect(errBody(blocked.body).error.code).toBe('cloudkit_transfer_required');
@@ -1266,7 +1610,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
 
     const deleted = await api('DELETE', '/api/me', {
       token: scene.owner.sessionToken,
-      body: { cloudkit_disposition: 'owner_zone_deleted' },
+      body: deletionBody({ cloudkit_disposition: 'owner_zone_deleted' }),
     });
     expect(deleted.status).toBe(200);
 
@@ -1285,7 +1629,7 @@ describe('DELETE /api/me — CloudKit disposition gate', () => {
     // does not block them.
     const res = await api('DELETE', '/api/me', {
       token: scene.bystander.sessionToken,
-      body: { cloudkit_disposition: 'participant_left_share' },
+      body: deletionBody({ cloudkit_disposition: 'participant_left_share' }),
     });
     expect(res.status).toBe(200);
 
@@ -1336,19 +1680,19 @@ describe('concurrent transfer operations', () => {
 
   it('serializes a successor account deletion against the owner’s source-deleted step', async () => {
     const scene = await seedScene();
-    const { id } = await driveTo(scene, 'verified');
+    const { id } = await driveTo(scene, 'source_deleting');
 
     const [successorDelete, sourceDeleted] = await Promise.all([
       api('DELETE', '/api/me', {
         token: scene.successor.sessionToken,
-        body: { cloudkit_disposition: 'owner_zone_deleted' },
+        body: deletionBody({ cloudkit_disposition: 'owner_zone_deleted' }),
       }),
       api('POST', `${BASE}/${id}/source-deleted`, { token: scene.owner.sessionToken }),
     ]);
 
-    // The owner always gets through: either the successor's deletion was
-    // refused (transfer still verified) or it ran after the source was
-    // already recorded gone. The successor can never vanish mid-handoff.
+    // The owner always gets through: either the successor's deletion is
+    // refused while the lease is held or it runs after source_deleted.
+    // The successor can never vanish mid-handoff.
     expect(sourceDeleted.status).toBe(200);
     expect(await phaseOf(id)).toBe('source_deleted');
     expect([200, 409]).toContain(successorDelete.status);
@@ -1366,7 +1710,7 @@ describe('concurrent transfer operations', () => {
 describe('successor liveness', () => {
   it('refuses source-deleted when the bound successor is gone', async () => {
     const scene = await seedScene();
-    const { id } = await driveTo(scene, 'verified');
+    const { id } = await driveTo(scene, 'source_deleting');
     await sql.unsafe(
       `UPDATE account_deletion_transfers SET successor_user_id = NULL WHERE id = $1`,
       [id],
@@ -1377,12 +1721,12 @@ describe('successor liveness', () => {
     });
     expect(res.status).toBe(409);
     expect(errBody(res.body).error.code).toBe('successor_unavailable');
-    expect(await phaseOf(id)).toBe('verified');
+    expect(await phaseOf(id)).toBe('source_deleting');
   });
 
   it('refuses source-deleted when the successor no longer owns the household', async () => {
     const scene = await seedScene();
-    const { id } = await driveTo(scene, 'verified');
+    const { id } = await driveTo(scene, 'source_deleting');
     await sql.unsafe(
       `DELETE FROM memberships WHERE household_id = $1 AND user_id = $2`,
       [scene.householdId, scene.successor.userId],
@@ -1393,19 +1737,19 @@ describe('successor liveness', () => {
     });
     expect(res.status).toBe(409);
     expect(errBody(res.body).error.code).toBe('successor_unavailable');
-    expect(await phaseOf(id)).toBe('verified');
+    expect(await phaseOf(id)).toBe('source_deleting');
   });
 
   it('refuses the bound successor’s own account deletion while the handoff is unfinished', async () => {
     const scene = await seedScene();
 
-    for (const phase of ['successor_bound', 'verified'] as const) {
+    for (const phase of ['successor_bound', 'verified', 'source_deleting'] as const) {
       const fresh = await seedScene();
       await driveTo(fresh, phase);
 
       const res = await api('DELETE', '/api/me', {
         token: fresh.successor.sessionToken,
-        body: { cloudkit_disposition: 'owner_zone_deleted' },
+        body: deletionBody({ cloudkit_disposition: 'owner_zone_deleted' }),
       });
       expect(res.status).toBe(409);
       expect(errBody(res.body).error.code).toBe('cloudkit_transfer_required');
@@ -1429,7 +1773,7 @@ describe('successor liveness', () => {
 
     const blocked = await api('DELETE', '/api/me', {
       token: scene.successor.sessionToken,
-      body: { cloudkit_disposition: 'participant_left_share' },
+      body: deletionBody({ cloudkit_disposition: 'participant_left_share' }),
     });
     expect(blocked.status).toBe(409);
 
@@ -1438,7 +1782,7 @@ describe('successor liveness', () => {
 
     const deleted = await api('DELETE', '/api/me', {
       token: scene.successor.sessionToken,
-      body: { cloudkit_disposition: 'participant_left_share' },
+      body: deletionBody({ cloudkit_disposition: 'participant_left_share' }),
     });
     expect(deleted.status).toBe(200);
 
@@ -1455,7 +1799,7 @@ describe('successor liveness', () => {
 
     const res = await api('DELETE', '/api/me', {
       token: scene.successor.sessionToken,
-      body: { cloudkit_disposition: 'owner_zone_deleted' },
+      body: deletionBody({ cloudkit_disposition: 'owner_zone_deleted' }),
     });
     expect(res.status).toBe(200);
   });

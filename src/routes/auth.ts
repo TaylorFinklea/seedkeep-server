@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { AppEnv } from '../index';
 import { getAuth } from '../lib/auth';
 import { requireAuth } from '../middleware/auth';
-import { dbGet, dbAll } from '../db/helpers';
+import { dbGet, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { deletePhoto } from '../lib/storage';
 import { TRANSFER_PHASE_SOURCE_DELETED } from './account-deletion-transfers';
@@ -39,10 +39,17 @@ const CLOUDKIT_DISPOSITIONS = [
   'transfer_source_deleted',
 ] as const;
 
+const deletionReceiptHash = z.string().regex(/^[0-9a-f]{64}$/);
+
+const deletionReceiptField = z
+  .object({ deletion_receipt_hash: deletionReceiptHash })
+  .passthrough();
+
 const deleteAccountBody = z
   .object({
     cloudkit_disposition: z.enum(CLOUDKIT_DISPOSITIONS),
     transfer_id: z.string().min(1).max(64).optional(),
+    deletion_receipt_hash: deletionReceiptHash,
   })
   .strict();
 
@@ -87,7 +94,7 @@ authRoutes.get('/me', requireAuth(), async (c) => {
  * 1. CloudKit gate. The caller states an explicit `cloudkit_disposition`
  *    (see above); there is no default. Every uncancelled transfer the
  *    caller is a party to is locked `FOR UPDATE` first, which serializes
- *    this request against `POST /transfers/:id/source-deleted`.
+ *    this request against the deletion-lease and source-deleted routes.
  *      - Bound successor of an unfinished handoff → refused. Their
  *        destination zone is the only verified copy of the garden until
  *        the owner records the source gone; letting them erase it would
@@ -109,6 +116,10 @@ authRoutes.get('/me', requireAuth(), async (c) => {
  *    These counts describe who owns rows in *this* database. They say
  *    nothing about CloudKit — that is entirely gate 1's job.
  *
+ * After gate 1 passes, the capability receipt is inserted in this same
+ * transaction before any user deletion. A duplicate hash aborts the whole
+ * transaction, while a committed row deliberately outlives the user.
+ *
  * S3 objects are collected inside the transaction and deleted best-effort
  * after it commits, so a rolled-back deletion never orphans a live
  * household's photos.
@@ -124,8 +135,25 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const sql = getSql(c.env);
 
+  // The receipt has its own error code so a client knows whether to repair
+  // deletion recovery or resume an unfinished CloudKit operation.
+  const rawBody = await c.req.json().catch(() => null);
+  const receiptParsed = deletionReceiptField.safeParse(rawBody);
+  if (!receiptParsed.success) {
+    return c.json(
+      {
+        ok: false,
+        error: {
+          code: 'deletion_receipt_required',
+          message: 'Send a lowercase SHA-256 deletion_receipt_hash with the deletion request.',
+        },
+      },
+      400,
+    );
+  }
+
   // ── Gate 1 · CloudKit disposition ──────────────────────────────────────
-  const parsed = deleteAccountBody.safeParse(await c.req.json().catch(() => null));
+  const parsed = deleteAccountBody.safeParse(rawBody);
   if (!parsed.success) {
     return c.json(
       {
@@ -139,7 +167,11 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
       400,
     );
   }
-  const { cloudkit_disposition: disposition, transfer_id: transferId } = parsed.data;
+  const {
+    cloudkit_disposition: disposition,
+    transfer_id: transferId,
+    deletion_receipt_hash: receiptHash,
+  } = parsed.data;
 
   interface TransferPartyRow {
     id: string;
@@ -152,7 +184,7 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
     | { kind: 'blocked'; message: string }
     | { kind: 'deleted'; photoKeys: readonly string[] };
 
-  const outcome: DeleteOutcome = await sql.begin(async (tx) => {
+  const outcome: DeleteOutcome | { kind: 'receipt_conflict' } = await sql.begin(async (tx) => {
     // ── Gate 1 · CloudKit disposition ────────────────────────────────────
     // Lock every uncancelled transfer this account is a party to. The lock
     // is what makes the gate race-safe: the transfer routes take the same
@@ -200,6 +232,14 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
           'A shared-garden transfer is in progress. Finish or cancel it before deleting this account.',
       } as const;
     }
+
+    const deletedAt = Date.now();
+    await tx.unsafe(
+      `INSERT INTO account_deletion_receipts
+          (receipt_hash, deleted_user_id, deleted_at, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [receiptHash, userId, deletedAt, deletedAt + 30 * 24 * 60 * 60 * 1000],
+    );
 
     // ── Gate 2 · server-data disposal ────────────────────────────────────
     const membershipRows = await tx.unsafe<{ household_id: string }[]>(
@@ -284,7 +324,23 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
     await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
 
     return { kind: 'deleted', photoKeys: [] } as const;
+  }).catch((err: unknown) => {
+    if (!isUniqueViolation(err)) throw err;
+    return { kind: 'receipt_conflict' } as const;
   });
+
+  if (outcome.kind === 'receipt_conflict') {
+    return c.json(
+      {
+        ok: false,
+        error: {
+          code: 'deletion_receipt_conflict',
+          message: 'That deletion receipt has already been used.',
+        },
+      },
+      409,
+    );
+  }
 
   if (outcome.kind === 'blocked') {
     return c.json(

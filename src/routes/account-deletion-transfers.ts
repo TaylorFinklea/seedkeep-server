@@ -18,10 +18,12 @@
 // handoff token, the phase, and timestamps.
 //
 //   pending_successor → successor_bound → destination_ready
-//     → owner_verified → verified → source_deleted
+//     → owner_verified → verified → source_deleting → source_deleted
 //
-// Every non-terminal phase may move to `cancelled`. Transitions run as
-// `SELECT ... FOR UPDATE` + conditional `UPDATE ... WHERE phase = ANY(...)`
+// Cancellation closes once `source_deleting` grants the owner an exclusive
+// lease to destroy the source. Earlier phases may move to `cancelled`.
+// Transitions run as `SELECT ... FOR UPDATE` plus a conditional
+// `UPDATE ... WHERE phase = ANY(...)`
 // inside one transaction (the convention `pets.ts` introduced), so two
 // devices racing the same step cannot both win. Repeating a step that
 // already landed returns the durable state instead of failing — the iOS
@@ -62,6 +64,7 @@ export const TRANSFER_PHASES = [
   'destination_ready',
   'owner_verified',
   'verified',
+  'source_deleting',
   'source_deleted',
   'cancelled',
 ] as const;
@@ -76,10 +79,10 @@ export const TRANSFER_PHASE_SOURCE_DELETED = 'source_deleted' satisfies Transfer
 
 const COLUMNS = `id, source_household_id, owner_user_id, successor_user_id,
                  handoff_token_hash, handoff_expires_at, handoff_consumed_at,
-                 phase, destination_zone_name, destination_zone_owner_name,
-                 destination_share_record_name, destination_share_url,
-                 owner_digest, successor_digest, successor_prior_membership,
-                 created_at, updated_at, cancelled_at`;
+                 source_deleting_at, phase, destination_zone_name,
+                 destination_zone_owner_name, destination_share_record_name,
+                 destination_share_url, owner_digest, successor_digest,
+                 successor_prior_membership, created_at, updated_at, cancelled_at`;
 
 /**
  * What the successor's membership looked like before re-home promoted
@@ -103,6 +106,7 @@ interface TransferRow {
   handoff_token_hash: string;
   handoff_expires_at: number;
   handoff_consumed_at: number | null;
+  source_deleting_at: number | null;
   phase: TransferPhase;
   destination_zone_name: string | null;
   destination_zone_owner_name: string | null;
@@ -146,6 +150,7 @@ function ok(c: Context<AppEnv>, row: TransferRow, handoffToken: string | null = 
         phase: row.phase,
         handoff_expires_at: row.handoff_expires_at,
         handoff_consumed_at: row.handoff_consumed_at,
+        source_deleting_at: row.source_deleting_at,
         destination_zone_name: row.destination_zone_name,
         destination_zone_owner_name: row.destination_zone_owner_name,
         destination_share_record_name: row.destination_share_record_name,
@@ -182,6 +187,10 @@ function tokenMatches(raw: string, storedHash: string): boolean {
 // ── Bodies ────────────────────────────────────────────────────────────────
 
 const acceptBody = z.object({ token: z.string().min(1).max(512) }).strict();
+
+const receiptLookupBody = z
+  .object({ receipt_token: z.string().min(1).max(512) })
+  .strict();
 
 const destinationBody = z
   .object({
@@ -329,12 +338,54 @@ async function withParty(
   });
 }
 
+/**
+ * The source may be destroyed only while the bound successor still owns
+ * the source household in server state. Both lease acquisition and final
+ * source-deleted recording enforce this same invariant under the row lock.
+ */
+async function successorOwnsSource(tx: TransactionSql, row: TransferRow): Promise<boolean> {
+  if (row.successor_user_id === null) return false;
+  const memberships = await tx.unsafe<{ exists: boolean }[]>(
+    `SELECT TRUE AS "exists"
+       FROM memberships
+      WHERE household_id = $1 AND user_id = $2 AND role = 'owner'
+      LIMIT 1`,
+    [row.source_household_id, row.successor_user_id],
+  );
+  return memberships.length === 1;
+}
+
 function respond(c: Context<AppEnv>, outcome: Outcome) {
   if (outcome.kind === 'error') {
     return fail(c, outcome.status, outcome.code, outcome.message, outcome.phase);
   }
   return ok(c, outcome.row);
 }
+
+// ── POST /receipts/lookup — recover a lost deletion response ──────────────
+
+/**
+ * This capability lookup is intentionally unauthenticated. Successful
+ * account deletion cascades the caller's session, so the 256-bit raw
+ * receipt token is the only credential available after response loss.
+ */
+accountDeletionTransferRoutes.post('/receipts/lookup', async (c) => {
+  const body = await parseBody(c, receiptLookupBody);
+  if (!body.ok) return fail(c, 400, 'bad_request', body.message);
+
+  const receipt = await dbGet<{ deleted_at: number }>(
+    getSql(c.env),
+    `SELECT deleted_at
+       FROM account_deletion_receipts
+      WHERE receipt_hash = $1
+      LIMIT 1`,
+    [hashToken(body.data.receipt_token)],
+  );
+  if (!receipt) {
+    return fail(c, 404, 'receipt_not_found', 'Account deletion receipt not found.');
+  }
+  return c.json({ ok: true, data: { deleted: true, deleted_at: receipt.deleted_at } });
+});
 
 // ── POST /transfers — create or resume ────────────────────────────────────
 
@@ -350,11 +401,9 @@ function respond(c: Context<AppEnv>, outcome: Outcome) {
  *
  * Resume is idempotent: the same id, phase, and creation time come back.
  * The raw token cannot come back with it — only its hash is stored — so
- * `handoff_token` is null on resume. The one exception is a transfer still
- * waiting for a successor whose token has expired: re-issuing there is the
- * documented recovery path (the spec caps the token's life, not the
- * request's), and it invalidates the stale link. An owner who merely lost
- * an unexpired link cancels and creates a new transfer.
+ * `handoff_token` is null on resume. A pending expired token is reissued
+ * automatically; an owner who lost an unexpired token uses the explicit
+ * `/handoff-token` rotation route. Both paths invalidate the previous link.
  */
 accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -462,6 +511,66 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
     return fail(c, 409, 'conflict', 'Could not create a transfer. Reload and try again.');
   }
   return ok(c, raced, null);
+});
+
+// ── POST /transfers/:id/inspect — non-consuming handoff inspection ────────
+
+accountDeletionTransferRoutes.post('/transfers/:id/inspect', requireAuth(), async (c) => {
+  const body = await parseBody(c, acceptBody);
+  if (!body.ok) return fail(c, 400, 'bad_request', body.message);
+
+  const row = await dbGet<TransferRow>(
+    getSql(c.env),
+    `SELECT ${COLUMNS} FROM account_deletion_transfers WHERE id = $1`,
+    [c.req.param('id')],
+  );
+  if (!row) return fail(c, 404, 'not_found', 'Transfer not found');
+
+  // Token first: never reveal phase or expiry to a caller without the
+  // capability. Inspection deliberately performs no write and no binding.
+  if (!tokenMatches(body.data.token, row.handoff_token_hash)) {
+    return fail(c, 403, 'invalid_token', 'Handoff token is not valid for this transfer.');
+  }
+  if (row.handoff_expires_at <= Date.now()) {
+    return fail(c, 403, 'handoff_expired', 'This handoff link has expired.');
+  }
+
+  return c.json({
+    ok: true,
+    data: {
+      transfer_id: row.id,
+      source_household_id: row.source_household_id,
+      phase: row.phase,
+      handoff_expires_at: row.handoff_expires_at,
+    },
+  });
+});
+
+// ── POST /transfers/:id/handoff-token — explicit owner rotation ───────────
+
+accountDeletionTransferRoutes.post('/transfers/:id/handoff-token', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const id = c.req.param('id');
+  const raw = randomBytes(HANDOFF_TOKEN_BYTES).toString('base64url');
+  const now = Date.now();
+
+  const outcome = await withParty(getSql(c.env), id, userId, 'owner', async (tx, row) => {
+    if (row.phase !== 'pending_successor') return PHASE_CONFLICT(row);
+    const updated = await transition(
+      tx,
+      id,
+      ['pending_successor'],
+      `handoff_token_hash = $3, handoff_expires_at = $4, updated_at = $5`,
+      [hashToken(raw), now + HANDOFF_TOKEN_TTL_MS, now],
+    );
+    if (!updated) return PHASE_CONFLICT(row);
+    return { kind: 'ok', row: updated } as const;
+  });
+
+  if (outcome.kind === 'error') {
+    return fail(c, outcome.status, outcome.code, outcome.message, outcome.phase);
+  }
+  return ok(c, outcome.row, raw);
 });
 
 // ── POST /transfers/:id/accept — bind the successor ───────────────────────
@@ -733,8 +842,8 @@ accountDeletionTransferRoutes.put(
       }
 
       // Remember what the successor's membership was before we touch it:
-      // cancellation is legal right up to source deletion, and it has to
-      // put this back exactly as it found it.
+      // cancellation remains legal until the source-deletion lease, and
+      // it has to put this back exactly as it found it.
       const priorRows = await tx.unsafe<{ role: string }[]>(
         `SELECT role FROM memberships WHERE household_id = $1 AND user_id = $2 FOR UPDATE`,
         [row.source_household_id, userId],
@@ -768,37 +877,26 @@ accountDeletionTransferRoutes.put(
   },
 );
 
-// ── POST /transfers/:id/source-deleted ────────────────────────────────────
+// ── POST /transfers/:id/source-deleting — acquire deletion lease ──────────
 
 /**
- * The owner reports the source zone verifiably absent. Unlocks
- * `DELETE /api/me`.
- *
- * The bound successor must still exist and still own the household. If
- * they deleted their account (or left) between verification and this
- * call, the destination copy is gone or unowned and the source is the
- * last copy — advancing here would authorize destroying it. The owner
- * cancels and starts a new handoff instead.
+ * The owner atomically closes cancellation before starting irreversible
+ * CloudKit deletion. Successor ownership is revalidated under the same
+ * transfer lock so no account-deletion request can remove the destination
+ * owner between this check and the durable lease.
  */
-accountDeletionTransferRoutes.post('/transfers/:id/source-deleted', requireAuth(), async (c) => {
+accountDeletionTransferRoutes.post('/transfers/:id/source-deleting', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const sql = getSql(c.env);
   const id = c.req.param('id');
 
   const outcome = await withParty(sql, id, userId, 'owner', async (tx, row) => {
-    if (row.phase === 'source_deleted') return { kind: 'ok', row } as const;
+    if (row.phase === 'source_deleting' || row.phase === 'source_deleted') {
+      return { kind: 'ok', row } as const;
+    }
     if (row.phase !== 'verified') return PHASE_CONFLICT(row);
 
-    const successorId = row.successor_user_id;
-    const successorRole = successorId
-      ? (
-          await tx.unsafe<{ role: string }[]>(
-            `SELECT role FROM memberships WHERE household_id = $1 AND user_id = $2`,
-            [row.source_household_id, successorId],
-          )
-        )[0]?.role
-      : undefined;
-    if (successorRole !== 'owner') {
+    if (!(await successorOwnsSource(tx, row))) {
       return {
         kind: 'error',
         status: 409,
@@ -809,10 +907,54 @@ accountDeletionTransferRoutes.post('/transfers/:id/source-deleted', requireAuth(
       } as const;
     }
 
+    const now = Date.now();
     const updated = await transition(
       tx,
       id,
       ['verified'],
+      `phase = 'source_deleting', source_deleting_at = $3, updated_at = $3`,
+      [now],
+    );
+    if (!updated) return PHASE_CONFLICT(row);
+    return { kind: 'ok', row: updated } as const;
+  });
+
+  return respond(c, outcome);
+});
+
+// ── POST /transfers/:id/source-deleted ────────────────────────────────────
+
+/**
+ * The owner reports the source zone verifiably absent. Unlocks
+ * `DELETE /api/me`.
+ *
+ * The bound successor must still exist and still own the household. The
+ * same invariant was checked when the lease was acquired, and is checked
+ * again here before the durable transfer authorizes final account deletion.
+ */
+accountDeletionTransferRoutes.post('/transfers/:id/source-deleted', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const sql = getSql(c.env);
+  const id = c.req.param('id');
+
+  const outcome = await withParty(sql, id, userId, 'owner', async (tx, row) => {
+    if (row.phase === 'source_deleted') return { kind: 'ok', row } as const;
+    if (row.phase !== 'source_deleting') return PHASE_CONFLICT(row);
+
+    if (!(await successorOwnsSource(tx, row))) {
+      return {
+        kind: 'error',
+        status: 409,
+        code: 'successor_unavailable',
+        message: 'The successor no longer owns the transferred garden.',
+        phase: row.phase,
+      } as const;
+    }
+
+    const updated = await transition(
+      tx,
+      id,
+      ['source_deleting'],
       `phase = 'source_deleted', updated_at = $3`,
       [Date.now()],
     );
@@ -844,9 +986,9 @@ accountDeletionTransferRoutes.get('/transfers/:id', requireAuth(), async (c) => 
 // ── DELETE /transfers/:id — cancel ────────────────────────────────────────
 
 /**
- * The owner abandons the handoff. Legal until the source zone is gone;
- * after that the transfer is the only thing standing between the owner and
- * a truthful account deletion, so it cannot be withdrawn.
+ * The owner abandons the handoff. Legal only before the source-deletion
+ * lease; once irreversible deletion may have started, the durable transfer
+ * cannot be withdrawn.
  *
  * Cancelling never touches garden data, and it must not leave server
  * authority behind either: if verification already re-homed membership
@@ -862,13 +1004,17 @@ accountDeletionTransferRoutes.delete('/transfers/:id', requireAuth(), async (c) 
 
   const outcome = await withParty(sql, id, userId, 'owner', async (tx, row) => {
     if (row.phase === 'cancelled') return { kind: 'ok', row } as const;
-    if (row.phase === 'source_deleted') return PHASE_CONFLICT(row);
+    if (row.phase === 'source_deleting' || row.phase === 'source_deleted') {
+      return PHASE_CONFLICT(row);
+    }
 
     const now = Date.now();
     const updated = await transition(
       tx,
       id,
-      TRANSFER_PHASES.filter((p) => p !== 'cancelled' && p !== 'source_deleted'),
+      TRANSFER_PHASES.filter(
+        (p) => p !== 'cancelled' && p !== 'source_deleting' && p !== 'source_deleted',
+      ),
       `phase = 'cancelled', cancelled_at = $3, updated_at = $3`,
       [now],
     );
