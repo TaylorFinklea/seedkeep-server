@@ -78,8 +78,14 @@ const COLUMNS = `id, source_household_id, owner_user_id, successor_user_id,
                  handoff_token_hash, handoff_expires_at, handoff_consumed_at,
                  phase, destination_zone_name, destination_zone_owner_name,
                  destination_share_record_name, destination_share_url,
-                 owner_digest, successor_digest,
+                 owner_digest, successor_digest, successor_prior_membership,
                  created_at, updated_at, cancelled_at`;
+
+/**
+ * What the successor's membership looked like before re-home promoted
+ * them. Cancelling a verified transfer restores exactly this.
+ */
+type PriorMembership = 'absent' | 'member' | 'owner';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -104,6 +110,7 @@ interface TransferRow {
   destination_share_url: string | null;
   owner_digest: DigestDoc | null;
   successor_digest: DigestDoc | null;
+  successor_prior_membership: PriorMembership | null;
   created_at: number;
   updated_at: number;
   cancelled_at: number | null;
@@ -385,15 +392,34 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
   if (existing) {
     if (existing.phase === 'pending_successor' && existing.handoff_expires_at <= now) {
       const raw = randomBytes(HANDOFF_TOKEN_BYTES).toString('base64url');
+      // Compare-and-swap on the exact row we read. Two devices resuming
+      // the same stale handoff must not each walk away believing they
+      // hold the live token — only the winner gets a raw value back.
       const reissued = await dbGet<TransferRow>(
         sql,
         `UPDATE account_deletion_transfers
             SET handoff_token_hash = $2, handoff_expires_at = $3, updated_at = $4
           WHERE id = $1 AND phase = 'pending_successor'
+            AND handoff_token_hash = $5 AND handoff_expires_at = $6
         RETURNING ${COLUMNS}`,
-        [existing.id, hashToken(raw), now + HANDOFF_TOKEN_TTL_MS, now],
+        [
+          existing.id,
+          hashToken(raw),
+          now + HANDOFF_TOKEN_TTL_MS,
+          now,
+          existing.handoff_token_hash,
+          existing.handoff_expires_at,
+        ],
       );
       if (reissued) return ok(c, reissued, raw);
+
+      // Lost the swap — another device already reissued. Report its row.
+      const current = await dbGet<TransferRow>(
+        sql,
+        `SELECT ${COLUMNS} FROM account_deletion_transfers WHERE id = $1`,
+        [existing.id],
+      );
+      return ok(c, current ?? existing, null);
     }
     return ok(c, existing, null);
   }
@@ -706,12 +732,23 @@ accountDeletionTransferRoutes.put(
         } as const;
       }
 
+      // Remember what the successor's membership was before we touch it:
+      // cancellation is legal right up to source deletion, and it has to
+      // put this back exactly as it found it.
+      const priorRows = await tx.unsafe<{ role: string }[]>(
+        `SELECT role FROM memberships WHERE household_id = $1 AND user_id = $2 FOR UPDATE`,
+        [row.source_household_id, userId],
+      );
+      const prior: PriorMembership =
+        priorRows[0]?.role === 'owner' ? 'owner' : priorRows[0] ? 'member' : 'absent';
+
       const updated = await transition(
         tx,
         id,
         ['owner_verified'],
-        `successor_digest = $3, phase = 'verified', updated_at = $4`,
-        [doc, now],
+        `successor_digest = $3, successor_prior_membership = $4,
+         phase = 'verified', updated_at = $5`,
+        [doc, prior, now],
       );
       if (!updated) return PHASE_CONFLICT(row);
 
@@ -733,7 +770,16 @@ accountDeletionTransferRoutes.put(
 
 // ── POST /transfers/:id/source-deleted ────────────────────────────────────
 
-/** The owner reports the source zone verifiably absent. Unlocks `DELETE /api/me`. */
+/**
+ * The owner reports the source zone verifiably absent. Unlocks
+ * `DELETE /api/me`.
+ *
+ * The bound successor must still exist and still own the household. If
+ * they deleted their account (or left) between verification and this
+ * call, the destination copy is gone or unowned and the source is the
+ * last copy — advancing here would authorize destroying it. The owner
+ * cancels and starts a new handoff instead.
+ */
 accountDeletionTransferRoutes.post('/transfers/:id/source-deleted', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const sql = getSql(c.env);
@@ -742,6 +788,26 @@ accountDeletionTransferRoutes.post('/transfers/:id/source-deleted', requireAuth(
   const outcome = await withParty(sql, id, userId, 'owner', async (tx, row) => {
     if (row.phase === 'source_deleted') return { kind: 'ok', row } as const;
     if (row.phase !== 'verified') return PHASE_CONFLICT(row);
+
+    const successorId = row.successor_user_id;
+    const successorRole = successorId
+      ? (
+          await tx.unsafe<{ role: string }[]>(
+            `SELECT role FROM memberships WHERE household_id = $1 AND user_id = $2`,
+            [row.source_household_id, successorId],
+          )
+        )[0]?.role
+      : undefined;
+    if (successorRole !== 'owner') {
+      return {
+        kind: 'error',
+        status: 409,
+        code: 'successor_unavailable',
+        message:
+          'The successor no longer owns the transferred garden. Cancel this transfer and start a new handoff.',
+        phase: row.phase,
+      } as const;
+    }
 
     const updated = await transition(
       tx,
@@ -782,7 +848,12 @@ accountDeletionTransferRoutes.get('/transfers/:id', requireAuth(), async (c) => 
  * after that the transfer is the only thing standing between the owner and
  * a truthful account deletion, so it cannot be withdrawn.
  *
- * Cancelling never touches memberships or garden data.
+ * Cancelling never touches garden data, and it must not leave server
+ * authority behind either: if verification already re-homed membership
+ * ownership, the successor's membership is restored to exactly what it
+ * was before the handoff — removed when the transfer created it, demoted
+ * when it promoted an existing member, untouched when they were already
+ * an owner.
  */
 accountDeletionTransferRoutes.delete('/transfers/:id', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -802,6 +873,26 @@ accountDeletionTransferRoutes.delete('/transfers/:id', requireAuth(), async (c) 
       [now],
     );
     if (!updated) return PHASE_CONFLICT(row);
+
+    // `successor_prior_membership` is written only by the re-home, so its
+    // presence is the marker that there is something to undo.
+    if (row.successor_user_id !== null && row.successor_prior_membership !== null) {
+      const params = [row.source_household_id, row.successor_user_id];
+      if (row.successor_prior_membership === 'absent') {
+        await tx.unsafe(
+          `DELETE FROM memberships
+            WHERE household_id = $1 AND user_id = $2 AND role = 'owner'`,
+          params,
+        );
+      } else if (row.successor_prior_membership === 'member') {
+        await tx.unsafe(
+          `UPDATE memberships SET role = 'member'
+            WHERE household_id = $1 AND user_id = $2 AND role = 'owner'`,
+          params,
+        );
+      }
+    }
+
     return { kind: 'ok', row: updated } as const;
   });
 
