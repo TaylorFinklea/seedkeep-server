@@ -738,14 +738,27 @@ describe('POST /api/account-deletion/transfers/:id/inspect', () => {
     expect(errBody(res.body).error.code).toBe('handoff_expired');
   });
 
-  it('returns not_found for an unknown transfer id', async () => {
+  it('answers an unknown id exactly as it answers a bad token, leaking no existence', async () => {
+    // Inspection is reachable with nothing but a link, so a 404-vs-403
+    // split here would tell an attacker which transfer ids are real.
     const scene = await seedScene();
-    const res = await api('POST', `${BASE}/unknown/inspect`, {
+    const created = await api('POST', BASE, { token: scene.owner.sessionToken });
+    const id = okBody<{ transfer: { id: string } }>(created.body).data.transfer.id;
+
+    const unknown = await api('POST', `${BASE}/unknown/inspect`, {
       token: scene.successor.sessionToken,
       body: { token: 'opaque-capability' },
     });
-    expect(res.status).toBe(404);
-    expect(errBody(res.body).error.code).toBe('not_found');
+    const wrongToken = await api('POST', `${BASE}/${id}/inspect`, {
+      token: scene.successor.sessionToken,
+      body: { token: 'opaque-capability' },
+    });
+
+    expect(unknown.status).toBe(403);
+    expect(errBody(unknown.body).error.code).toBe('invalid_token');
+    expect(unknown.status).toBe(wrongToken.status);
+    expect(errBody(unknown.body).error.code).toBe(errBody(wrongToken.body).error.code);
+    expect(errBody(unknown.body).error.message).toBe(errBody(wrongToken.body).error.message);
   });
 });
 

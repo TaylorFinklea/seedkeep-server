@@ -524,11 +524,13 @@ accountDeletionTransferRoutes.post('/transfers/:id/inspect', requireAuth(), asyn
     `SELECT ${COLUMNS} FROM account_deletion_transfers WHERE id = $1`,
     [c.req.param('id')],
   );
-  if (!row) return fail(c, 404, 'not_found', 'Transfer not found');
 
-  // Token first: never reveal phase or expiry to a caller without the
-  // capability. Inspection deliberately performs no write and no binding.
-  if (!tokenMatches(body.data.token, row.handoff_token_hash)) {
+  // An unknown id and a wrong token are deliberately INDISTINGUISHABLE
+  // here. This is the one route a caller can reach holding nothing but a
+  // link, so a 404-vs-403 split would turn it into an oracle for which
+  // transfer ids exist. Every other route can afford to 404 because it
+  // already required an authenticated party.
+  if (!row || !tokenMatches(body.data.token, row.handoff_token_hash)) {
     return fail(c, 403, 'invalid_token', 'Handoff token is not valid for this transfer.');
   }
   if (row.handoff_expires_at <= Date.now()) {
