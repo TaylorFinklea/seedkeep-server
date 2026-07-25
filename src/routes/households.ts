@@ -74,9 +74,16 @@ householdRoutes.post('/households', authOnly, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'Invalid body' } }, 400);
   }
 
+  // Ordered to match `requireHousehold` (most-recently-joined wins): a
+  // user can hold a second membership after an account-deletion transfer
+  // re-homes ownership to them (`account-deletion-transfers.ts`), and an
+  // unordered pick here could resolve to the WRONG household — possibly
+  // the same wrong one every time, since Postgres gives no ordering
+  // guarantee absent an ORDER BY.
   const existing = await dbGet<MembershipRow>(
     sql,
-    `SELECT household_id, user_id, role, joined_at FROM memberships WHERE user_id = $1 LIMIT 1`,
+    `SELECT household_id, user_id, role, joined_at FROM memberships
+      WHERE user_id = $1 ORDER BY joined_at DESC LIMIT 1`,
     [userId],
   );
   if (existing) {
@@ -419,4 +426,51 @@ householdRoutes.get('/households/me/assistant_key', ...auth, async (c) => {
     updatedAt: r.updated_at,
   }));
   return c.json({ ok: true, data: { providers } });
+});
+
+/**
+ * GET /api/households/:id — a household this user has an EXACT
+ * membership row for, named by id rather than resolved through the
+ * "current household" heuristic (`requireHousehold`: most-recently-joined
+ * membership).
+ *
+ * Exists for the CloudKit account-deletion handoff
+ * (`account-deletion-transfers.ts`): verifying a transfer re-homes
+ * membership ownership by UPSERTing a second `memberships` row for the
+ * successor, who until that moment had none for the source household at
+ * all (a CKShare participant is invisible to this table). The successor
+ * therefore briefly holds TWO memberships, and the client already knows
+ * — from the transfer itself — exactly which household id it is waiting
+ * to own. Resolving that through `requireHousehold`'s heuristic risks
+ * landing on the wrong one; this route answers the question the client
+ * is actually asking.
+ *
+ * 403 `not_a_member`, not 404, for a household that exists but this user
+ * has no membership row for: distinguishing "doesn't exist" from
+ * "exists, not yours" would let an authenticated caller enumerate ids.
+ */
+householdRoutes.get('/households/:id', authOnly, async (c) => {
+  const userId = c.get('userId');
+  const householdId = c.req.param('id');
+  const sql = getSql(c.env);
+  const membership = await dbGet<MembershipRow>(
+    sql,
+    `SELECT household_id, user_id, role FROM memberships WHERE user_id = $1 AND household_id = $2 LIMIT 1`,
+    [userId, householdId],
+  );
+  if (!membership) {
+    return c.json(
+      { ok: false, error: { code: 'not_a_member', message: 'Not a member of this household.' } },
+      403,
+    );
+  }
+  const household = await dbGet<HouseholdRow>(
+    sql,
+    `SELECT id, name, created_at, updated_at FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+    [householdId],
+  );
+  if (!household) {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Household missing' } }, 404);
+  }
+  return c.json({ ok: true, data: { household, role: membership.role } });
 });
