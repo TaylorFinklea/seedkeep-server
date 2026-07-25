@@ -23,6 +23,7 @@ import { petRoutes } from './routes/pets';
 import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
 import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
 import { adminRoutes } from './routes/admin';
+import { accountDeletionTransferRoutes } from './routes/account-deletion-transfers';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -86,6 +87,11 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', wateringStateRoutes);
   app.route('/api/assistant', assistantRoutes);
   app.route('/api', petRoutes);
+
+  // Account-deletion transfer coordination. Authenticated per handler and
+  // scoped by transfer party rather than household, so it mounts on its
+  // own prefix instead of the shared `/api` household surface.
+  app.route('/api/account-deletion', accountDeletionTransferRoutes);
 
   // MCP surface — split into two routers so each mounts at exactly
   // one path: token CRUD under /api, the wire-protocol endpoint at

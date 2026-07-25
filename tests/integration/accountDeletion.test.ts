@@ -1,14 +1,19 @@
 /**
  * M5 · integration tests for DELETE /api/me (account deletion).
  *
- * Covers all four cases from spec A4:
+ * Every request carries an explicit `cloudkit_disposition`: the server
+ * cannot observe CloudKit, so the device states what it did with the
+ * iCloud garden before asking for erasure, and a request without one is
+ * refused (see `auth.ts` and accountDeletionTransfer.test.ts).
+ *
+ * Covers all four data-disposal cases from spec A4:
  *   (a) Sole-member — user, household, seeds, journal, assistant all gone;
  *       catalog_feedback.user_id SET NULL; deletePhoto called for all 3 key
  *       sources (seed photo, journal photo, extraction with a 2-key array).
  *   (b) Multi-member, caller is a non-owner member — caller's membership +
  *       user gone, household + other owner + their seed intact.
- *   (c) Multi-member, caller is the only owner, one other member — that
- *       member promoted to owner, household intact, caller gone.
+ *   (c) Multi-member, caller is the only owner — fails closed without a
+ *       disposition, and otherwise promotes the oldest other member.
  *   (d) User with NO household — deletes cleanly, no 409.
  *
  * Run with:
@@ -16,12 +21,14 @@
  *
  * Prerequisites:
  *   - Local Postgres reachable at DATABASE_URL
- *   - Migrations 0001–0023 applied (`bun run migrate`)
+ *   - Migrations 0001–0025 applied (`bun run migrate`)
  */
 
 import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
 import postgres, { type Sql } from 'postgres';
+import type { Hono } from 'hono';
 import { createApp } from '../../src/index';
+import type { AppEnv } from '../../src/index';
 import type { Env } from '../../src/env';
 
 const DATABASE_URL =
@@ -140,6 +147,30 @@ async function seedFixture(role: 'owner' | 'member' = 'owner'): Promise<Fixture>
   const householdId = await seedHousehold();
   await addMembership(householdId, userId, role);
   return { userId, householdId, sessionToken };
+}
+
+/**
+ * DELETE /api/me with an explicit CloudKit disposition. Pass `null` to
+ * exercise the fail-closed path taken by a client that never did (or
+ * never reported) its CloudKit work.
+ */
+async function deleteMe(
+  app: Hono<AppEnv>,
+  sessionToken: string,
+  body: Record<string, unknown> | null,
+): Promise<Response> {
+  return app.request(
+    '/api/me',
+    {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+        ...(body === null ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === null ? undefined : JSON.stringify(body),
+    },
+    TEST_ENV,
+  );
 }
 
 async function seedCatalogSeed(): Promise<string> {
@@ -267,11 +298,9 @@ describe('DELETE /api/me — sole-member household', () => {
     );
 
     // Call the route.
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, fx.sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
 
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
@@ -355,11 +384,9 @@ describe('DELETE /api/me — sole-member: catalog_feedback survival', () => {
       [feedbackId, catalogSeedId, fx.householdId, fx.userId, Date.now()],
     );
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, fx.sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
     expect(json.ok).toBe(true);
@@ -403,11 +430,9 @@ describe('DELETE /api/me — sole-member: source_photo_keys edge cases', () => {
       [extractionId, fx.householdId, fx.userId, JSON.stringify([]), Date.now()],
     );
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, fx.sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
     expect(json.ok).toBe(true);
@@ -431,11 +456,9 @@ describe('DELETE /api/me — sole-member: source_photo_keys edge cases', () => {
       [extractionId, fx.householdId, fx.userId, 'not-json', Date.now()],
     );
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, fx.sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
     expect(json.ok).toBe(true);
@@ -460,11 +483,9 @@ describe('DELETE /api/me — sole-member: source_photo_keys edge cases', () => {
       [extractionId, fx.householdId, fx.userId, JSON.stringify([123, validKey]), Date.now()],
     );
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${fx.sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, fx.sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
     expect(json.ok).toBe(true);
@@ -497,11 +518,9 @@ describe('DELETE /api/me — multi-member, caller is non-owner', () => {
 
     const app = createApp(TEST_ENV);
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${callerToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, callerToken, {
+      cloudkit_disposition: 'participant_left_share',
+    });
 
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
@@ -557,7 +576,7 @@ describe('DELETE /api/me — multi-member, caller is non-owner', () => {
 // ── (c) Multi-member, caller is the only owner ────────────────────────────────
 
 describe('DELETE /api/me — multi-member, caller is the only owner', () => {
-  it('refuses final deletion until a verified CloudKit transfer records source deletion', async () => {
+  it('refuses to delete anything when no CloudKit disposition is supplied', async () => {
     deletedKeys.length = 0;
     const { userId: ownerUserId, sessionToken: ownerToken } = await seedUser();
     const { userId: memberUserId } = await seedUser();
@@ -566,16 +585,12 @@ describe('DELETE /api/me — multi-member, caller is the only owner', () => {
     await addMembership(householdId, memberUserId, 'member', 5000);
 
     const app = createApp(TEST_ENV);
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${ownerToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, ownerToken, null);
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(400);
     const json = (await res.json()) as { ok: boolean; error: { code: string } };
     expect(json.ok).toBe(false);
-    expect(json.error.code).toBe('cloudkit_transfer_required');
+    expect(json.error.code).toBe('cloudkit_disposition_required');
 
     const ownerRows = await sql.unsafe<{ id: string }[]>(
       `SELECT id FROM "user" WHERE id = $1`,
@@ -593,6 +608,73 @@ describe('DELETE /api/me — multi-member, caller is the only owner', () => {
     await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]).catch(() => {});
     await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [ownerUserId, memberUserId]).catch(() => {});
   });
+
+  it('refuses a shared-transfer claim with no matching transfer', async () => {
+    deletedKeys.length = 0;
+    const { userId: ownerUserId, sessionToken: ownerToken } = await seedUser();
+    const { userId: memberUserId } = await seedUser();
+    const householdId = await seedHousehold();
+    await addMembership(householdId, ownerUserId, 'owner', 0);
+    await addMembership(householdId, memberUserId, 'member', 5000);
+
+    const app = createApp(TEST_ENV);
+    const res = await deleteMe(app, ownerToken, {
+      cloudkit_disposition: 'transfer_source_deleted',
+      transfer_id: 'no-such-transfer',
+    });
+
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { ok: boolean; error: { code: string } };
+    expect(json.ok).toBe(false);
+    expect(json.error.code).toBe('cloudkit_transfer_required');
+
+    const ownerRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [ownerUserId],
+    );
+    expect(ownerRows.length).toBe(1);
+    expect(deletedKeys).toEqual([]);
+
+    await sql.unsafe(`DELETE FROM memberships WHERE household_id = $1`, [householdId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [ownerUserId, memberUserId]).catch(() => {});
+  });
+
+  it('promotes the oldest remaining member once the garden step is reported done', async () => {
+    deletedKeys.length = 0;
+    const { userId: ownerUserId, sessionToken: ownerToken } = await seedUser();
+    const { userId: memberUserId } = await seedUser();
+    const householdId = await seedHousehold();
+    await addMembership(householdId, ownerUserId, 'owner', 0);
+    await addMembership(householdId, memberUserId, 'member', 5000);
+
+    const app = createApp(TEST_ENV);
+    const res = await deleteMe(app, ownerToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
+    expect(json.data.deleted).toBe(true);
+
+    const ownerRows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM "user" WHERE id = $1`,
+      [ownerUserId],
+    );
+    expect(ownerRows.length).toBe(0);
+
+    // Household survives with the promoted member as its owner.
+    const memberships = await sql.unsafe<{ user_id: string; role: string }[]>(
+      `SELECT user_id, role FROM memberships WHERE household_id = $1`,
+      [householdId],
+    );
+    expect(memberships).toEqual([{ user_id: memberUserId, role: 'owner' }]);
+    expect(deletedKeys).toEqual([]);
+
+    await sql.unsafe(`DELETE FROM memberships WHERE household_id = $1`, [householdId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]).catch(() => {});
+    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [memberUserId]).catch(() => {});
+  });
 });
 
 // ── (d) User with NO household ────────────────────────────────────────────────
@@ -604,11 +686,9 @@ describe('DELETE /api/me — user with no household', () => {
     const { userId, sessionToken } = await seedUser();
     const app = createApp(TEST_ENV);
 
-    const res = await app.request(
-      '/api/me',
-      { method: 'DELETE', headers: { Authorization: `Bearer ${sessionToken}` } },
-      TEST_ENV,
-    );
+    const res = await deleteMe(app, sessionToken, {
+      cloudkit_disposition: 'no_cloudkit_garden',
+    });
 
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
