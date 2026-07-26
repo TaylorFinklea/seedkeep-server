@@ -105,13 +105,22 @@ authRoutes.get('/me', requireAuth(), async (c) => {
  *        transfer → refused, so an in-flight handoff can never be
  *        sidestepped by claiming a simpler role.
  *
- * 2. Server-data rule (least-destructive), reached only after gate 1:
+ * 2. Server-data rule (least-destructive), reached only after gate 1.
+ *    A caller can belong to several households — a verified handoff
+ *    re-homes the successor into the departing owner's household while
+ *    they keep their own — so *every* membership is disposed of in this
+ *    one transaction, each by its own rule:
  *    - Sole member → hard-delete the household (cascades all garden data).
  *    - Other members remain, caller is NOT the only owner → delete only
- *      the caller's membership + user row; household survives.
+ *      the caller's membership; household survives.
  *    - Other members remain, caller IS the only owner → promote the
- *      oldest-joined other member to owner, then delete the caller.
+ *      oldest-joined other member to owner, then drop the caller's row.
  *    - No household at all → delete only the user row.
+ *
+ *    Each household's membership rows are locked `FOR UPDATE` before the
+ *    rule is chosen, so two last members deleting at the same moment
+ *    cannot each see the other and leave a household with no members.
+ *    Households are visited in id order to keep that lock order stable.
  *
  *    These counts describe who owns rows in *this* database. They say
  *    nothing about CloudKit — that is entirely gate 1's job.
@@ -242,88 +251,90 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
     );
 
     // ── Gate 2 · server-data disposal ────────────────────────────────────
+    // Every household the caller belongs to, in a stable lock order.
     const membershipRows = await tx.unsafe<{ household_id: string }[]>(
       `SELECT household_id
          FROM memberships
         WHERE user_id = $1
-        ORDER BY joined_at DESC
-        LIMIT 1`,
+        ORDER BY household_id ASC`,
       [userId],
     );
-    const householdId = membershipRows[0]?.household_id ?? null;
 
-    if (householdId === null) {
-      // No household — delete only the user row.
-      await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
-      return { kind: 'deleted', photoKeys: [] } as const;
-    }
+    const photoKeys: string[] = [];
 
-    const allMembers = await tx.unsafe<{ user_id: string; role: string }[]>(
-      `SELECT user_id, role
-         FROM memberships
-        WHERE household_id = $1
-        ORDER BY joined_at ASC`,
-      [householdId],
-    );
-
-    const otherMembers = allMembers.filter((m) => m.user_id !== userId);
-
-    if (otherMembers.length === 0) {
-      // Collect S3 keys from all 3 sources; they are deleted after commit.
-      const seedPhotos = await tx.unsafe<{ r2_key: string }[]>(
-        `SELECT r2_key FROM seed_photos WHERE household_id = $1`,
-        [householdId],
-      );
-      const journalPhotos = await tx.unsafe<{ storage_key: string }[]>(
-        `SELECT storage_key FROM journal_entry_photos WHERE household_id = $1`,
-        [householdId],
-      );
-      const extractions = await tx.unsafe<{ source_photo_keys: string }[]>(
-        `SELECT source_photo_keys FROM catalog_extractions WHERE submitted_by_household = $1`,
+    for (const { household_id: householdId } of membershipRows) {
+      // Locking every member of this household serializes concurrent
+      // deletions by two of its members; the re-read after the wait sees
+      // whatever the winner committed.
+      const allMembers = await tx.unsafe<{ user_id: string; role: string }[]>(
+        `SELECT user_id, role
+           FROM memberships
+          WHERE household_id = $1
+          ORDER BY joined_at ASC
+            FOR UPDATE`,
         [householdId],
       );
 
-      const extractionKeys: string[] = extractions.flatMap((e) => {
-        try {
-          const keys: unknown = JSON.parse(e.source_photo_keys);
-          return Array.isArray(keys) ? (keys as string[]) : [];
-        } catch {
-          return [];
-        }
-      });
+      // The caller's row is gone already — another member's deletion took
+      // the whole household with it. Nothing left to dispose of.
+      if (!allMembers.some((m) => m.user_id === userId)) continue;
 
-      // Hard-delete the household (cascades all child rows), then the user.
-      await tx.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]);
-      await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
+      const otherMembers = allMembers.filter((m) => m.user_id !== userId);
 
-      return {
-        kind: 'deleted',
-        photoKeys: [
+      if (otherMembers.length === 0) {
+        // Collect S3 keys from all 3 sources; they are deleted after commit.
+        const seedPhotos = await tx.unsafe<{ r2_key: string }[]>(
+          `SELECT r2_key FROM seed_photos WHERE household_id = $1`,
+          [householdId],
+        );
+        const journalPhotos = await tx.unsafe<{ storage_key: string }[]>(
+          `SELECT storage_key FROM journal_entry_photos WHERE household_id = $1`,
+          [householdId],
+        );
+        const extractions = await tx.unsafe<{ source_photo_keys: string }[]>(
+          `SELECT source_photo_keys FROM catalog_extractions WHERE submitted_by_household = $1`,
+          [householdId],
+        );
+
+        photoKeys.push(
           ...seedPhotos.map((p) => p.r2_key),
           ...journalPhotos.map((p) => p.storage_key),
-          ...extractionKeys,
-        ],
-      } as const;
-    }
+          ...extractions.flatMap((e) => {
+            try {
+              const keys: unknown = JSON.parse(e.source_photo_keys);
+              return Array.isArray(keys) ? (keys as string[]) : [];
+            } catch {
+              return [];
+            }
+          }),
+        );
 
-    // Someone else still has rows in this household, so it survives. If
-    // the caller was its only owner, hand row ownership to the oldest
-    // remaining member (a verified transfer has already made the successor
-    // an owner, so this only fires for un-transferred households).
-    const heir = otherMembers.some((m) => m.role === 'owner') ? null : otherMembers[0];
-    if (heir) {
+        // Hard-delete the household; cascades all child rows including
+        // the caller's own membership.
+        await tx.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]);
+        continue;
+      }
+
+      // Someone else still has rows in this household, so it survives. If
+      // the caller was its only owner, hand row ownership to the oldest
+      // remaining member (a verified transfer has already made the successor
+      // an owner, so this only fires for un-transferred households).
+      const heir = otherMembers.some((m) => m.role === 'owner') ? null : otherMembers[0];
+      if (heir) {
+        await tx.unsafe(
+          `UPDATE memberships SET role = 'owner' WHERE household_id = $1 AND user_id = $2`,
+          [householdId, heir.user_id],
+        );
+      }
       await tx.unsafe(
-        `UPDATE memberships SET role = 'owner' WHERE household_id = $1 AND user_id = $2`,
-        [householdId, heir.user_id],
+        `DELETE FROM memberships WHERE household_id = $1 AND user_id = $2`,
+        [householdId, userId],
       );
     }
-    await tx.unsafe(
-      `DELETE FROM memberships WHERE household_id = $1 AND user_id = $2`,
-      [householdId, userId],
-    );
+
     await tx.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
 
-    return { kind: 'deleted', photoKeys: [] } as const;
+    return { kind: 'deleted', photoKeys } as const;
   }).catch((err: unknown) => {
     if (!isUniqueViolation(err)) throw err;
     return { kind: 'receipt_conflict' } as const;

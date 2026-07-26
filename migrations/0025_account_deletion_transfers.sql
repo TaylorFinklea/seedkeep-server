@@ -19,6 +19,10 @@
 -- Any non-`source_deleted` phase may move to `cancelled`; `source_deleted`
 -- is terminal and is the only phase from which `DELETE /api/me` accepts a
 -- shared owner.
+--
+-- Superseded in part by 0027, which inserts the `source_deleting` lease
+-- between `verified` and `source_deleted` and widens the CHECK below to
+-- match. Read the two together; this file alone understates the machine.
 
 CREATE TABLE IF NOT EXISTS account_deletion_transfers (
     id                            TEXT PRIMARY KEY,

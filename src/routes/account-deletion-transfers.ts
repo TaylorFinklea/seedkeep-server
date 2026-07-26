@@ -364,24 +364,87 @@ function respond(c: Context<AppEnv>, outcome: Outcome) {
 
 // ── POST /receipts/lookup — recover a lost deletion response ──────────────
 
+/** 20 missed guesses per client per hour, matching photos.ts. */
+const RECEIPT_LOOKUP_MISS_LIMIT = 20;
+const RECEIPT_LOOKUP_MISS_WINDOW_MS = 60 * 60 * 1000;
+/** Sweep the whole map once it grows past this many live clients. */
+const RECEIPT_LOOKUP_CLIENT_CAP = 10_000;
+
+/**
+ * Client hash → miss timestamps still inside the window.
+ *
+ * Deliberately in-process. The budget exists only to blunt bulk guessing
+ * of a 256-bit token, and an unauthenticated endpoint should not be able
+ * to make anyone write rows. Several Fly machines each keep their own
+ * counter, so the real ceiling is `machines × limit` per hour — still
+ * some seventy orders of magnitude short of making a guess feasible.
+ */
+const receiptLookupMisses = new Map<string, number[]>();
+
+/** Drop every bucket with nothing left inside the window. */
+function sweepReceiptLookupMisses(cutoff: number): void {
+  for (const [key, hits] of receiptLookupMisses) {
+    const live = hits.filter((t) => t > cutoff);
+    if (live.length === 0) receiptLookupMisses.delete(key);
+    else receiptLookupMisses.set(key, live);
+  }
+}
+
 /**
  * This capability lookup is intentionally unauthenticated. Successful
  * account deletion cascades the caller's session, so the 256-bit raw
  * receipt token is the only credential available after response loss.
+ *
+ * Two things keep that openness honest:
+ *
+ *  - Receipts stop answering at `expires_at` (30 days). An expired receipt
+ *    returns the same `receipt_not_found` as one that never existed, so
+ *    the endpoint never distinguishes "deleted long ago" from "unknown".
+ *  - Only misses are counted against the per-client budget, and the count
+ *    is checked before the receipt is read, so being rate limited says
+ *    nothing about any particular token. A client holding a real receipt
+ *    can poll it as often as it likes.
  */
 accountDeletionTransferRoutes.post('/receipts/lookup', async (c) => {
   const body = await parseBody(c, receiptLookupBody);
   if (!body.ok) return fail(c, 400, 'bad_request', body.message);
 
+  // Fly terminates TLS and sets Fly-Client-IP; the forwarded chain is the
+  // fallback. An unattributable request shares one bucket rather than
+  // escaping the limit.
+  const clientKey =
+    c.req.header('Fly-Client-IP') ??
+    c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() ??
+    'unattributed';
+  const clientHash = createHash('sha256').update(clientKey, 'utf8').digest('hex');
+
+  const now = Date.now();
+  const cutoff = now - RECEIPT_LOOKUP_MISS_WINDOW_MS;
+  if (receiptLookupMisses.size > RECEIPT_LOOKUP_CLIENT_CAP) sweepReceiptLookupMisses(cutoff);
+
+  const misses = (receiptLookupMisses.get(clientHash) ?? []).filter((t) => t > cutoff);
+  receiptLookupMisses.set(clientHash, misses);
+  if (misses.length >= RECEIPT_LOOKUP_MISS_LIMIT) {
+    return c.json(
+      {
+        ok: false,
+        error: { code: 'rate_limited', message: 'too many receipt lookups in the last hour' },
+        retry_after_seconds: RECEIPT_LOOKUP_MISS_WINDOW_MS / 1000,
+      },
+      429,
+    );
+  }
+
   const receipt = await dbGet<{ deleted_at: number }>(
     getSql(c.env),
     `SELECT deleted_at
        FROM account_deletion_receipts
-      WHERE receipt_hash = $1
+      WHERE receipt_hash = $1 AND expires_at > $2
       LIMIT 1`,
-    [hashToken(body.data.receipt_token)],
+    [hashToken(body.data.receipt_token), now],
   );
   if (!receipt) {
+    misses.push(now);
     return fail(c, 404, 'receipt_not_found', 'Account deletion receipt not found.');
   }
   return c.json({ ok: true, data: { deleted: true, deleted_at: receipt.deleted_at } });

@@ -15,6 +15,16 @@
  *   (c) Multi-member, caller is the only owner — fails closed without a
  *       disposition, and otherwise promotes the oldest other member.
  *   (d) User with NO household — deletes cleanly, no 409.
+ *   (e) Caller with MORE THAN ONE membership — every household the caller
+ *       belongs to is disposed of by its own rule in one transaction, so a
+ *       re-homed transfer successor cannot leave their original household
+ *       behind with no members.
+ *   (f) Two last members deleting concurrently — the household never
+ *       survives with zero members.
+ *
+ * Plus the durable receipt capability: written inside the deletion
+ * transaction, expired receipts are indistinguishable from unknown ones,
+ * and repeated misses from one client are rate limited.
  *
  * Run with:
  *   bun test tests/integration/accountDeletion.test.ts
@@ -245,6 +255,56 @@ afterAll(async () => {
     .catch(() => {});
   await sql.end({ timeout: 5 });
 });
+
+/**
+ * A seed plus a seed photo, returning the storage key the deletion route
+ * is expected to hand to deletePhoto.
+ */
+async function seedSeedWithPhoto(householdId: string): Promise<string> {
+  const seedId = await seedSeed(householdId);
+  const key = `households/${householdId}/seeds/${seedId}/front-test.jpg`;
+  await sql.unsafe(
+    `INSERT INTO seed_photos
+       (id, seed_id, household_id, r2_key, role, captured_at)
+     VALUES ($1, $2, $3, $4, 'front', $5)`,
+    [uid('ad-sp'), seedId, householdId, key, Date.now()],
+  );
+  return key;
+}
+
+async function membershipsOf(userId: string): Promise<string[]> {
+  const rows = await sql.unsafe<{ household_id: string }[]>(
+    `SELECT household_id FROM memberships WHERE user_id = $1`,
+    [userId],
+  );
+  return rows.map((r) => r.household_id);
+}
+
+async function householdExists(householdId: string): Promise<boolean> {
+  const rows = await sql.unsafe<{ id: string }[]>(`SELECT id FROM households WHERE id = $1`, [
+    householdId,
+  ]);
+  return rows.length === 1;
+}
+
+async function lookupReceipt(
+  app: Hono<AppEnv>,
+  receiptToken: string,
+  clientIp?: string,
+): Promise<Response> {
+  return app.request(
+    '/api/account-deletion/receipts/lookup',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(clientIp === undefined ? {} : { 'Fly-Client-IP': clientIp }),
+      },
+      body: JSON.stringify({ receipt_token: receiptToken }),
+    },
+    TEST_ENV,
+  );
+}
 
 // ── (a) Sole-member full deletion ─────────────────────────────────────────────
 
@@ -902,5 +962,259 @@ describe('account-deletion receipts', () => {
     await sql.unsafe(`DELETE FROM memberships WHERE household_id = $1`, [householdId]);
     await sql.unsafe(`DELETE FROM households WHERE id = $1`, [householdId]);
     await sql.unsafe(`DELETE FROM "user" WHERE id IN ($1, $2)`, [ownerId, memberId]);
+  });
+});
+
+// ── (e) Caller belongs to more than one household ─────────────────────────
+
+/**
+ * A transfer successor is re-homed into the departing owner's household
+ * while keeping their original one, so from Task 1 onward a single user
+ * can hold several memberships. Deleting that account must dispose of
+ * every one of them, not just the most recently joined.
+ */
+describe('DELETE /api/me — caller with multiple memberships', () => {
+  it('hard-deletes every sole-member household and collects photos from all of them', async () => {
+    deletedKeys.length = 0;
+
+    const { userId, sessionToken } = await seedUser();
+    // `original` is the older membership; `rehomed` mimics the newest
+    // membership a verified handoff UPSERTs onto the successor.
+    const original = await seedHousehold();
+    const rehomed = await seedHousehold();
+    await addMembership(original, userId, 'owner', -60_000);
+    await addMembership(rehomed, userId, 'owner', 0);
+
+    const originalKey = await seedSeedWithPhoto(original);
+    const rehomedKey = await seedSeedWithPhoto(rehomed);
+
+    const app = createApp(TEST_ENV);
+    const res = await deleteMe(app, sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
+    expect(res.status).toBe(200);
+
+    expect(await householdExists(original)).toBe(false);
+    expect(await householdExists(rehomed)).toBe(false);
+    expect(await membershipsOf(userId)).toEqual([]);
+
+    const userRows = await sql.unsafe<{ id: string }[]>(`SELECT id FROM "user" WHERE id = $1`, [
+      userId,
+    ]);
+    expect(userRows).toEqual([]);
+
+    expect([...deletedKeys].sort()).toEqual([originalKey, rehomedKey].sort());
+  });
+
+  it('applies the disposal rule household by household: delete, promote, and step out', async () => {
+    deletedKeys.length = 0;
+
+    const { userId, sessionToken } = await seedUser();
+    const { userId: heirId } = await seedUser();
+    const { userId: coOwnerId } = await seedUser();
+
+    const soleHousehold = await seedHousehold();
+    const onlyOwnerHousehold = await seedHousehold();
+    const coOwnedHousehold = await seedHousehold();
+
+    await addMembership(soleHousehold, userId, 'owner', -90_000);
+    await addMembership(onlyOwnerHousehold, userId, 'owner', -60_000);
+    await addMembership(onlyOwnerHousehold, heirId, 'member', -30_000);
+    await addMembership(coOwnedHousehold, coOwnerId, 'owner', -20_000);
+    await addMembership(coOwnedHousehold, userId, 'member', 0);
+
+    const soleKey = await seedSeedWithPhoto(soleHousehold);
+    const survivingKey = await seedSeedWithPhoto(onlyOwnerHousehold);
+
+    const app = createApp(TEST_ENV);
+    const res = await deleteMe(app, sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
+    expect(res.status).toBe(200);
+
+    // Sole-member household: gone, photos reclaimed.
+    expect(await householdExists(soleHousehold)).toBe(false);
+
+    // Only-owner household: survives, oldest remaining member promoted.
+    expect(await householdExists(onlyOwnerHousehold)).toBe(true);
+    const promoted = await sql.unsafe<{ user_id: string; role: string }[]>(
+      `SELECT user_id, role FROM memberships WHERE household_id = $1`,
+      [onlyOwnerHousehold],
+    );
+    expect(promoted).toEqual([{ user_id: heirId, role: 'owner' }]);
+
+    // Co-owned household: survives untouched apart from the caller leaving.
+    expect(await householdExists(coOwnedHousehold)).toBe(true);
+    const remaining = await sql.unsafe<{ user_id: string; role: string }[]>(
+      `SELECT user_id, role FROM memberships WHERE household_id = $1`,
+      [coOwnedHousehold],
+    );
+    expect(remaining).toEqual([{ user_id: coOwnerId, role: 'owner' }]);
+
+    expect(await membershipsOf(userId)).toEqual([]);
+    expect(deletedKeys).toEqual([soleKey]);
+    expect(deletedKeys).not.toContain(survivingKey);
+
+    await sql.unsafe(`DELETE FROM memberships WHERE household_id = ANY($1)`, [
+      [onlyOwnerHousehold, coOwnedHousehold],
+    ]);
+    await sql.unsafe(`DELETE FROM households WHERE id = ANY($1)`, [
+      [onlyOwnerHousehold, coOwnedHousehold],
+    ]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id = ANY($1)`, [[heirId, coOwnerId]]);
+  });
+
+  it('disposes of nothing anywhere when the CloudKit transfer gate blocks the deletion', async () => {
+    deletedKeys.length = 0;
+
+    const { userId, sessionToken } = await seedUser();
+    const transferHousehold = await seedHousehold();
+    const otherHousehold = await seedHousehold();
+    await addMembership(transferHousehold, userId, 'owner', -60_000);
+    await addMembership(otherHousehold, userId, 'owner', 0);
+
+    const now = Date.now();
+    const transferId = uid('ad-xfer');
+    await sql.unsafe(
+      `INSERT INTO account_deletion_transfers
+         (id, source_household_id, owner_user_id, handoff_token_hash,
+          handoff_expires_at, phase, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'pending_successor', $6, $6)`,
+      [transferId, transferHousehold, userId, `hash-${transferId}`, now + 3_600_000, now],
+    );
+
+    const app = createApp(TEST_ENV);
+    const res = await deleteMe(app, sessionToken, {
+      cloudkit_disposition: 'owner_zone_deleted',
+    });
+    expect(res.status).toBe(409);
+    const blocked = (await res.json()) as { error: { code: string } };
+    expect(blocked.error.code).toBe('cloudkit_transfer_required');
+
+    // Both memberships and both households survive the refusal intact.
+    expect((await membershipsOf(userId)).sort()).toEqual(
+      [transferHousehold, otherHousehold].sort(),
+    );
+    expect(await householdExists(transferHousehold)).toBe(true);
+    expect(await householdExists(otherHousehold)).toBe(true);
+    expect(deletedKeys).toEqual([]);
+
+    await sql.unsafe(`DELETE FROM account_deletion_transfers WHERE id = $1`, [transferId]);
+    await sql.unsafe(`DELETE FROM memberships WHERE user_id = $1`, [userId]);
+    await sql.unsafe(`DELETE FROM households WHERE id = ANY($1)`, [
+      [transferHousehold, otherHousehold],
+    ]);
+    await sql.unsafe(`DELETE FROM "user" WHERE id = $1`, [userId]);
+  });
+});
+
+// ── (f) The last two members delete at the same time ──────────────────────
+
+describe('DELETE /api/me — last two members deleting concurrently', () => {
+  it('never leaves the household behind with zero members', async () => {
+    deletedKeys.length = 0;
+
+    const owner = await seedUser();
+    const member = await seedUser();
+    const householdId = await seedHousehold();
+    await addMembership(householdId, owner.userId, 'owner', -10_000);
+    await addMembership(householdId, member.userId, 'member', 0);
+
+    const app = createApp(TEST_ENV);
+    const [a, b] = await Promise.all([
+      deleteMe(app, owner.sessionToken, { cloudkit_disposition: 'owner_zone_deleted' }),
+      deleteMe(app, member.sessionToken, { cloudkit_disposition: 'participant_left_share' }),
+    ]);
+
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+
+    const survivors = await sql.unsafe<{ user_id: string }[]>(
+      `SELECT user_id FROM memberships WHERE household_id = $1`,
+      [householdId],
+    );
+    expect(survivors).toEqual([]);
+    expect(await householdExists(householdId)).toBe(false);
+
+    const users = await sql.unsafe<{ id: string }[]>(`SELECT id FROM "user" WHERE id = ANY($1)`, [
+      [owner.userId, member.userId],
+    ]);
+    expect(users).toEqual([]);
+  });
+});
+
+// ── Receipt expiry and lookup rate limiting ───────────────────────────────
+
+describe('account-deletion receipt lookup — expiry and rate limiting', () => {
+  it('treats an expired receipt exactly like an unknown one', async () => {
+    const app = createApp(TEST_ENV);
+    const rawReceipt = uid('expired-receipt');
+    const hash = receiptHash(rawReceipt);
+    const now = Date.now();
+    await sql.unsafe(
+      `INSERT INTO account_deletion_receipts
+          (receipt_hash, deleted_user_id, deleted_at, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [hash, 'ad-user-long-gone', now - 31 * 24 * 60 * 60 * 1000, now - 1000],
+    );
+
+    const expired = await lookupReceipt(app, rawReceipt, '203.0.113.10');
+    const unknown = await lookupReceipt(app, uid('never-issued'), '203.0.113.11');
+
+    expect(expired.status).toBe(404);
+    expect(await expired.json()).toEqual(await unknown.json());
+
+    await sql.unsafe(`DELETE FROM account_deletion_receipts WHERE receipt_hash = $1`, [hash]);
+  });
+
+  it('rate limits repeated misses from one client without penalising a real receipt', async () => {
+    const app = createApp(TEST_ENV);
+    const attacker = '203.0.113.20';
+
+    // A real receipt, held by a well-behaved client on another address.
+    const { sessionToken } = await seedUser();
+    const rawReceipt = uid('rl-receipt');
+    const deleted = await deleteMe(
+      app,
+      sessionToken,
+      {
+        cloudkit_disposition: 'no_cloudkit_garden',
+        deletion_receipt_hash: receiptHash(rawReceipt),
+      },
+      false,
+    );
+    expect(deleted.status).toBe(200);
+
+    let limitedAt = -1;
+    for (let i = 0; i < 25; i += 1) {
+      const res = await lookupReceipt(app, uid('guess'), attacker);
+      if (res.status === 429) {
+        const body = (await res.json()) as {
+          ok: boolean;
+          error: { code: string };
+          retry_after_seconds: number;
+        };
+        expect(body.ok).toBe(false);
+        expect(body.error.code).toBe('rate_limited');
+        expect(body.retry_after_seconds).toBeGreaterThan(0);
+        limitedAt = i;
+        break;
+      }
+      expect(res.status).toBe(404);
+    }
+    expect(limitedAt).toBeGreaterThan(0);
+
+    // A different client is unaffected, and a hit does not consume budget.
+    const holder = '203.0.113.21';
+    for (let i = 0; i < 3; i += 1) {
+      const hit = await lookupReceipt(app, rawReceipt, holder);
+      expect(hit.status).toBe(200);
+      const hitBody = (await hit.json()) as { data: { deleted: boolean } };
+      expect(hitBody.data.deleted).toBe(true);
+    }
+
+    await sql.unsafe(`DELETE FROM account_deletion_receipts WHERE receipt_hash = $1`, [
+      receiptHash(rawReceipt),
+    ]);
   });
 });
