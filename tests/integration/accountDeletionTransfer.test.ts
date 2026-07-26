@@ -27,7 +27,7 @@
  *
  * Prerequisites:
  *   - Local Postgres reachable at DATABASE_URL
- *   - Migrations 0001–0028 applied (`bun run migrate`)
+ *   - Migrations 0001–0029 applied (`bun run migrate`)
  */
 
 import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
@@ -446,6 +446,81 @@ describe('POST /api/account-deletion/transfers', () => {
     const res = await api('POST', BASE, { token: scene.outsider.sessionToken });
     expect(res.status).toBe(403);
     expect(errBody(res.body).error.code).toBe('forbidden');
+  });
+
+  it('moves the garden the caller owns, not the household they joined most recently', async () => {
+    // Joining someone else's garden later must not change which garden a
+    // transfer would hand over.
+    const user = await seedUser();
+    const owned = await seedHousehold();
+    const joinedLater = await seedHousehold();
+    await addMembership(owned, user.userId, 'owner', -60_000);
+    await addMembership(joinedLater, user.userId, 'member', 0);
+
+    const res = await api('POST', BASE, { token: user.sessionToken });
+    expect(res.status).toBe(200);
+    expect(okBody(res.body).data.transfer.source_household_id).toBe(owned);
+  });
+
+  it('refuses to guess which garden is moving when the caller owns two', async () => {
+    // Exactly the shape a verified handoff leaves behind: the successor
+    // keeps their own household and is re-homed as owner of the source.
+    const user = await seedUser();
+    const original = await seedHousehold();
+    const rehomed = await seedHousehold();
+    await addMembership(original, user.userId, 'owner', -60_000);
+    await addMembership(rehomed, user.userId, 'owner', 0);
+
+    const res = await api('POST', BASE, { token: user.sessionToken });
+    expect(res.status).toBe(409);
+    expect(errBody(res.body).error.code).toBe('ambiguous_source_household');
+
+    const rows = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM account_deletion_transfers WHERE owner_user_id = $1`,
+      [user.userId],
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it('refuses a second live handoff of a garden a co-owner is already moving', async () => {
+    const scene = await seedScene();
+    await sql.unsafe(
+      `UPDATE memberships SET role = 'owner' WHERE household_id = $1 AND user_id = $2`,
+      [scene.householdId, scene.bystander.userId],
+    );
+
+    const first = await api('POST', BASE, { token: scene.owner.sessionToken });
+    expect(first.status).toBe(200);
+
+    const second = await api('POST', BASE, { token: scene.bystander.sessionToken });
+    expect(second.status).toBe(409);
+    expect(errBody(second.body).error.code).toBe('source_transfer_active');
+
+    const live = await sql.unsafe<{ id: string }[]>(
+      `SELECT id FROM account_deletion_transfers
+        WHERE source_household_id = $1 AND phase <> 'cancelled'`,
+      [scene.householdId],
+    );
+    expect(live.length).toBe(1);
+  });
+
+  it('lets the garden be handed over again once the first handoff is cancelled', async () => {
+    const scene = await seedScene();
+    await sql.unsafe(
+      `UPDATE memberships SET role = 'owner' WHERE household_id = $1 AND user_id = $2`,
+      [scene.householdId, scene.bystander.userId],
+    );
+
+    const first = await api('POST', BASE, { token: scene.owner.sessionToken });
+    const firstId = okBody(first.body).data.transfer.id;
+    const cancelled = await api('DELETE', `${BASE}/${firstId}`, {
+      token: scene.owner.sessionToken,
+    });
+    expect(cancelled.status).toBe(200);
+
+    const second = await api('POST', BASE, { token: scene.bystander.sessionToken });
+    expect(second.status).toBe(200);
+    expect(okBody(second.body).data.transfer.source_household_id).toBe(scene.householdId);
   });
 
   it('resumes the existing transfer instead of creating a second one', async () => {

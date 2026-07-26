@@ -462,33 +462,26 @@ accountDeletionTransferRoutes.post('/receipts/lookup', async (c) => {
  * device can see the share, so the device decides whether a transfer is
  * needed; an unnecessary transfer is harmless and cancellable.
  *
- * Resume is idempotent: the same id, phase, and creation time come back.
- * The raw token cannot come back with it — only its hash is stored — so
- * `handoff_token` is null on resume. A pending expired token is reissued
- * automatically; an owner who lost an unexpired token uses the explicit
- * `/handoff-token` rotation route. Both paths invalidate the previous link.
+ * Which garden moves is decided by ownership, never by recency. A
+ * verified handoff re-homes the successor into the source household while
+ * they keep their own, so "the caller's household" stopped being a single
+ * row the moment transfers shipped. Owning exactly one household names
+ * the source; owning several is refused outright rather than guessed at,
+ * because guessing wrong hands away the wrong garden and then unlocks
+ * `DELETE /api/me` against it. (Naming the household on the wire is the
+ * eventual fix; it needs a client that sends one.)
+ *
+ * Resume is idempotent: the same id, phase, and creation time come back,
+ * and it happens before the ownership lookup — a transfer already names
+ * its source, so resuming one never has to disambiguate. The raw token
+ * cannot come back with it — only its hash is stored — so `handoff_token`
+ * is null on resume. A pending expired token is reissued automatically;
+ * an owner who lost an unexpired token uses the explicit `/handoff-token`
+ * rotation route. Both paths invalidate the previous link.
  */
 accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const sql = getSql(c.env);
-
-  const membership = await dbGet<{ household_id: string; role: string }>(
-    sql,
-    `SELECT household_id, role
-       FROM memberships
-      WHERE user_id = $1
-      ORDER BY joined_at DESC
-      LIMIT 1`,
-    [userId],
-  );
-  if (!membership || membership.role !== 'owner') {
-    return fail(
-      c,
-      403,
-      'forbidden',
-      'Only the owner of a garden can start a deletion transfer.',
-    );
-  }
 
   const now = Date.now();
   const existing = await dbGet<TransferRow>(
@@ -536,6 +529,31 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
     return ok(c, existing, null);
   }
 
+  const owned = await sql.unsafe<{ household_id: string }[]>(
+    `SELECT household_id
+       FROM memberships
+      WHERE user_id = $1 AND role = 'owner'
+      ORDER BY household_id ASC`,
+    [userId],
+  );
+  if (owned.length === 0) {
+    return fail(
+      c,
+      403,
+      'forbidden',
+      'Only the owner of a garden can start a deletion transfer.',
+    );
+  }
+  if (owned.length > 1) {
+    return fail(
+      c,
+      409,
+      'ambiguous_source_household',
+      'You own more than one garden, so this app cannot tell which one is being handed over. Finish or cancel the other handoff first.',
+    );
+  }
+  const sourceHouseholdId = owned[0]!.household_id;
+
   const raw = randomBytes(HANDOFF_TOKEN_BYTES).toString('base64url');
   try {
     const created = await dbGet<TransferRow>(
@@ -547,7 +565,7 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
     RETURNING ${COLUMNS}`,
       [
         nanoid(16),
-        membership.household_id,
+        sourceHouseholdId,
         userId,
         hashToken(raw),
         now + HANDOFF_TOKEN_TTL_MS,
@@ -556,8 +574,9 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
     );
     if (created) return ok(c, created, raw);
   } catch (err: unknown) {
-    // Two devices tapped "Delete account" at once — the partial unique
-    // index rejected the loser. Resume the winner's transfer.
+    // Either partial unique index can reject this: two of the caller's own
+    // devices tapped "Delete account" at once, or a co-owner is already
+    // moving the same garden.
     if (!isUniqueViolation(err)) throw err;
   }
 
@@ -571,6 +590,21 @@ accountDeletionTransferRoutes.post('/transfers', requireAuth(), async (c) => {
     [userId],
   );
   if (!raced) {
+    const liveOnSource = await dbGet<{ id: string }>(
+      sql,
+      `SELECT id FROM account_deletion_transfers
+        WHERE source_household_id = $1 AND phase <> 'cancelled'
+        LIMIT 1`,
+      [sourceHouseholdId],
+    );
+    if (liveOnSource) {
+      return fail(
+        c,
+        409,
+        'source_transfer_active',
+        'Another owner of this garden already started handing it over. Finish or cancel that handoff first.',
+      );
+    }
     return fail(c, 409, 'conflict', 'Could not create a transfer. Reload and try again.');
   }
   return ok(c, raced, null);

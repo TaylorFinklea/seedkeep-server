@@ -31,7 +31,7 @@
  *
  * Prerequisites:
  *   - Local Postgres reachable at DATABASE_URL
- *   - Migrations 0001–0028 applied (`bun run migrate`)
+ *   - Migrations 0001–0029 applied (`bun run migrate`)
  */
 
 import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
@@ -1158,8 +1158,10 @@ describe('account-deletion receipt lookup — expiry and rate limiting', () => {
       [hash, 'ad-user-long-gone', now - 31 * 24 * 60 * 60 * 1000, now - 1000],
     );
 
-    const expired = await lookupReceipt(app, rawReceipt, '203.0.113.10');
-    const unknown = await lookupReceipt(app, uid('never-issued'), '203.0.113.11');
+    // The miss budget is per client and lives for an hour, so every test
+    // takes a fresh bucket — repeated runs in one process stay identical.
+    const expired = await lookupReceipt(app, rawReceipt, uid('client-expired'));
+    const unknown = await lookupReceipt(app, uid('never-issued'), uid('client-unknown'));
 
     expect(expired.status).toBe(404);
     expect(await expired.json()).toEqual(await unknown.json());
@@ -1169,7 +1171,7 @@ describe('account-deletion receipt lookup — expiry and rate limiting', () => {
 
   it('rate limits repeated misses from one client without penalising a real receipt', async () => {
     const app = createApp(TEST_ENV);
-    const attacker = '203.0.113.20';
+    const attacker = uid('client-attacker');
 
     // A real receipt, held by a well-behaved client on another address.
     const { sessionToken } = await seedUser();
@@ -1196,16 +1198,17 @@ describe('account-deletion receipt lookup — expiry and rate limiting', () => {
         };
         expect(body.ok).toBe(false);
         expect(body.error.code).toBe('rate_limited');
-        expect(body.retry_after_seconds).toBeGreaterThan(0);
+        expect(body.retry_after_seconds).toBe(3600);
         limitedAt = i;
         break;
       }
       expect(res.status).toBe(404);
     }
-    expect(limitedAt).toBeGreaterThan(0);
+    // Exactly 20 misses are free; the 21st (index 20) is refused.
+    expect(limitedAt).toBe(20);
 
     // A different client is unaffected, and a hit does not consume budget.
-    const holder = '203.0.113.21';
+    const holder = uid('client-holder');
     for (let i = 0; i < 3; i += 1) {
       const hit = await lookupReceipt(app, rawReceipt, holder);
       expect(hit.status).toBe(200);
