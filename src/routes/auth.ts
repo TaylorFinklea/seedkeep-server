@@ -363,5 +363,13 @@ authRoutes.delete('/me', requireAuth(), async (c) => {
   // Best-effort S3 deletion — mirrors seeds.ts:467-478.
   await Promise.allSettled(outcome.photoKeys.map((k) => deletePhoto(c.env, k)));
 
+  const signOutResponse = await getAuth(c.env).api.signOut({
+    headers: c.req.raw.headers,
+    asResponse: true,
+  });
+  for (const cookie of signOutResponse.headers.getSetCookie()) {
+    c.header('Set-Cookie', cookie, { append: true });
+  }
+
   return c.json({ ok: true, data: { deleted: true } });
 });

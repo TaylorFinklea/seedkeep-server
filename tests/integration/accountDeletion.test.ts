@@ -378,6 +378,8 @@ describe('DELETE /api/me — sole-member household', () => {
     });
 
     expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toContain('better-auth.session_token=');
+    expect(res.headers.get('set-cookie')).toContain('Max-Age=0');
     const json = (await res.json()) as { ok: boolean; data: { deleted: boolean } };
     expect(json.ok).toBe(true);
     expect(json.data.deleted).toBe(true);
