@@ -6,9 +6,12 @@ import {
   makeOTPRequest,
   normalizeOTPEmail,
   OTPFixedWindowLimiter,
+  consumeOTPSendLimits,
   otpSendRateLimits,
+  otpSendEmailRateLimit,
   otpSignInFailureRateLimits,
   parseLimitedJSONBody,
+  settleOTPSendAttempt,
   settleOTPSignInAttempt,
   withOTPAdvisoryLock,
   type OTPAdvisoryConnection,
@@ -137,7 +140,50 @@ describe('OTP fixed-window rate limiter', () => {
     expect(limiter.consume('send:email:b@example.test', 3, 600_000, 2_005).allowed).toBe(true);
   });
 
-  it('checks failure counters without consuming, clears a successful email prefix, and caps new keys', () => {
+  it('checks the IP send budget before creating an email key', () => {
+    const limiter = new OTPFixedWindowLimiter();
+    const calls: string[] = [];
+    const consume = vi.spyOn(limiter, 'consume').mockImplementation((key, max, windowMs, now) => {
+      calls.push(key);
+      return key.startsWith('otp:send:ip:')
+        ? { allowed: false, retryAfterSeconds: 20 }
+        : { allowed: true };
+    });
+    expect(consumeOTPSendLimits(limiter, 'person@example.test', '192.0.2.1', 1_000))
+      .toEqual({ allowed: false, retryAfterSeconds: 20 });
+    expect(calls).toEqual(['otp:send:ip:192.0.2.1']);
+    consume.mockRestore();
+  });
+
+  it('does not reserve an email key before auth or record better-auth rate-limit responses', () => {
+    const limiter = new OTPFixedWindowLimiter();
+    consumeOTPSendLimits(limiter, 'person@example.test', '192.0.2.1', 1_000);
+    settleOTPSendAttempt(limiter, 'person@example.test', 429, 1_001);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect(limiter.consume('otp:send:email:person@example.test', 5, 600_000, 1_002 + attempt).allowed).toBe(true);
+    }
+    expect(limiter.consume(otpSendEmailRateLimit('person@example.test').key, 5, 600_000, 1_007))
+      .toEqual({ allowed: false, retryAfterSeconds: 600 });
+    const anotherEmail = 'other@example.test';
+    settleOTPSendAttempt(limiter, anotherEmail, 200, 1_008);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect(limiter.consume(otpSendEmailRateLimit(anotherEmail).key, 5, 600_000, 1_009 + attempt).allowed).toBe(true);
+    }
+    expect(limiter.consume(otpSendEmailRateLimit(anotherEmail).key, 5, 600_000, 1_013).allowed).toBe(false);
+  });
+
+  it('does not evict an existing counter for an email later rejected by better-auth', () => {
+    const limiter = new OTPFixedWindowLimiter(3, 1);
+    limiter.consume('otp:send:email:target@example.test', 1, 600_000, 1_000);
+    limiter.consume('otp:send:ip:192.0.2.1', 3, 60_000, 1_000);
+    limiter.consume('unrelated-counter', 1, 600_000, 1_000);
+    expect(consumeOTPSendLimits(limiter, 'rejected@example.test', '192.0.2.1', 1_001).allowed).toBe(true);
+    settleOTPSendAttempt(limiter, 'rejected@example.test', 429, 1_002);
+    expect(limiter.consume('otp:send:email:target@example.test', 1, 600_000, 1_003))
+      .toEqual({ allowed: false, retryAfterSeconds: 600 });
+  });
+
+  it('checks failure counters without consuming, ignores auth 429s, and clears successful email prefixes', () => {
     const limiter = new OTPFixedWindowLimiter(2, 1);
     const emailKey = 'otp:signin:email:person@example.test';
     const limits = otpSignInFailureRateLimits('person@example.test', '192.0.2.1')
@@ -147,16 +193,25 @@ describe('OTP fixed-window rate limiter', () => {
     expect(limiter.checkMany(limits, 1_001).allowed).toBe(true);
     settleOTPSignInAttempt(limiter, 'person@example.test', limits, 503, 1_001);
     expect(limiter.checkMany(limits, 1_001).allowed).toBe(true);
+    settleOTPSignInAttempt(limiter, 'person@example.test', limits, 429, 1_001);
+    expect(limiter.checkMany(limits, 1_001).allowed).toBe(true);
     settleOTPSignInAttempt(limiter, 'person@example.test', limits, 400, 1_002);
     expect(limiter.checkMany(limits, 1_002).allowed).toBe(true);
     settleOTPSignInAttempt(limiter, 'person@example.test', limits, 401, 1_003);
     expect(limiter.checkMany(limits, 1_003).allowed).toBe(false);
     settleOTPSignInAttempt(limiter, 'person@example.test', limits, 200, 1_004);
     expect(limiter.checkMany(limits, 1_004).allowed).toBe(true);
-    limiter.consume('unrelated-key', 3, 60_000, 1_004);
-    limiter.consume('second-key', 1, 60_000, 1_004);
-    expect(limiter.consume('new-key', 1, 60_000, 1_005)).toEqual({ allowed: false, retryAfterSeconds: 60 });
-    expect(limiter.consume('unrelated-key', 3, 60_000, 1_005).allowed).toBe(true);
+  });
+
+  it('evicts the least recently used key when the map is full', () => {
+    const limiter = new OTPFixedWindowLimiter(2, 1);
+    limiter.consume('target-email', 1, 600_000, 1_000);
+    limiter.consume('recent-ip', 3, 60_000, 1_001);
+    limiter.consume('recent-ip', 3, 60_000, 1_002);
+    limiter.consume('recent-ip', 3, 60_000, 1_003);
+    expect(limiter.consume('new-email', 1, 600_000, 1_004).allowed).toBe(true);
+    expect(limiter.consume('recent-ip', 3, 60_000, 1_005))
+      .toEqual({ allowed: false, retryAfterSeconds: 60 });
   });
 });
 
@@ -166,8 +221,9 @@ describe('OTP advisory lock acquisition', () => {
     const lock = (result: boolean): OTPAdvisoryConnection => ({
       tryLock: async () => { events.push(`try:${result}`); return result; },
       unlock: async () => { events.push('unlock'); },
+      unlockAll: async () => { events.push('unlock-all'); },
+      terminateBackend: async () => { events.push('terminate'); },
       release: () => { events.push('release'); },
-      discard: async () => { events.push('discard'); },
     });
     const connections = [lock(false), lock(true)];
     const outcome = await withOTPAdvisoryLock(
@@ -185,8 +241,9 @@ describe('OTP advisory lock acquisition', () => {
     const reserve = vi.fn(async (): Promise<OTPAdvisoryConnection> => ({
       tryLock: async () => false,
       unlock: async () => {},
+      unlockAll: async () => {},
+      terminateBackend: async () => {},
       release: () => { releases += 1; },
-      discard: async () => {},
     }));
     const outcome = await withOTPAdvisoryLock(reserve, async () => 'unreachable', {
       maxWaitMs: 40,
@@ -206,8 +263,9 @@ describe('OTP advisory lock acquisition', () => {
     const reserve = async (): Promise<OTPAdvisoryConnection> => ({
       tryLock: () => tryLockPromise,
       unlock: async () => { events.push('unlock'); },
+      unlockAll: async () => { events.push('unlock-all'); },
+      terminateBackend: async () => { events.push('terminate'); },
       release: () => { events.push('release'); },
-      discard: async () => { events.push('discard'); },
     });
     const handler = vi.fn(async () => 'must not run');
     const outcome = await withOTPAdvisoryLock(reserve, handler, { maxWaitMs: 10 });
@@ -225,8 +283,9 @@ describe('OTP advisory lock acquisition', () => {
       const connection: OTPAdvisoryConnection = {
         tryLock: async () => { throw new Error('lock query failed'); },
         unlock: async () => {},
+        unlockAll: async () => {},
+        terminateBackend: async () => {},
         release: () => {},
-        discard: async () => {},
       };
       await expect(withOTPAdvisoryLock(async () => connection, async () => 'unused'))
         .rejects.toThrow('lock query failed');
@@ -236,41 +295,64 @@ describe('OTP advisory lock acquisition', () => {
     }
   });
 
-  it('discards a session when unlock fails', async () => {
+  it('uses unlock-all on the same session when a single unlock fails', async () => {
     const events: string[] = [];
     const connection: OTPAdvisoryConnection = {
       tryLock: async () => true,
       unlock: async () => { events.push('unlock'); throw new Error('unlock failed'); },
+      unlockAll: async () => { events.push('unlock-all'); },
+      terminateBackend: async () => { events.push('terminate'); },
       release: () => { events.push('release'); },
-      discard: async () => { events.push('discard'); },
     };
     await expect(withOTPAdvisoryLock(async () => connection, async () => 'ok'))
-      .rejects.toThrow('unlock failed');
-    expect(events).toEqual(['unlock', 'discard']);
+      .resolves.toEqual({ acquired: true, value: 'ok' });
+    expect(events).toEqual(['unlock', 'unlock-all', 'release']);
   });
 
-  it('returns a handler timeout outcome and releases the held lock', async () => {
+  it('terminates only the reserved backend when unlock-all fails', async () => {
+    const events: string[] = [];
+    const connection: OTPAdvisoryConnection = {
+      tryLock: async () => true,
+      unlock: async () => { events.push('unlock'); throw new Error('unlock failed'); },
+      unlockAll: async () => { events.push('unlock-all'); throw new Error('session failed'); },
+      terminateBackend: async () => { events.push('terminate'); throw new Error('backend ended'); },
+      release: () => { events.push('release'); },
+    };
+    await expect(withOTPAdvisoryLock(async () => connection, async () => 'ok'))
+      .resolves.toEqual({ acquired: true, value: 'ok' });
+    expect(events).toEqual(['unlock', 'unlock-all', 'terminate', 'release']);
+  });
+
+  it('keeps the lock until a timed-out handler settles, then releases it', async () => {
     vi.useFakeTimers();
     try {
       const events: string[] = [];
+      let markReleased!: () => void;
       const connection: OTPAdvisoryConnection = {
         tryLock: async () => true,
         unlock: async () => { events.push('unlock'); },
-        release: () => { events.push('release'); },
-        discard: async () => { events.push('discard'); },
+        unlockAll: async () => { events.push('unlock-all'); },
+        terminateBackend: async () => { events.push('terminate'); },
+        release: () => { events.push('release'); markReleased(); },
       };
       let markStarted!: () => void;
+      let resolveHandler!: (value: string) => void;
       let handlerSignal: AbortSignal | undefined;
       const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      const released = new Promise<void>((resolve) => { markReleased = resolve; });
+      const handlerPromise = new Promise<string>((resolve) => { resolveHandler = resolve; });
       const pending = withOTPAdvisoryLock(async () => connection, (_connection, signal) => {
         handlerSignal = signal;
         markStarted();
-        return new Promise(() => {});
+        return handlerPromise;
       }, { handlerTimeoutMs: 15_000 });
       await started;
       await vi.advanceTimersByTimeAsync(15_000);
       await expect(pending).resolves.toEqual({ acquired: false, timedOut: true });
       expect(handlerSignal?.aborted).toBe(true);
+      expect(events).toEqual([]);
+      resolveHandler('settled');
+      await released;
       expect(events).toEqual(['unlock', 'release']);
     } finally {
       vi.useRealTimers();

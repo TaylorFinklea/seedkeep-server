@@ -4,10 +4,10 @@ import type { AppEnv } from '../index';
 import { finalizeMailSendFailure, getAuth, getSessionCookie, publicBaseURL } from '../lib/auth';
 import { getMailer } from '../lib/mail';
 import { isAllowedAppOrigin } from '../lib/web/origins';
-import { getBunSocketIP, isJSONMediaType, isValidOTPEmail, makeOTPRequest, normalizeOTPEmail, OTPFixedWindowLimiter, otpSendRateLimits, otpSignInFailureRateLimits, parseLimitedJSONBody, settleOTPSignInAttempt, withOTPAdvisoryLock } from '../lib/web/otpSecurity';
+import { consumeOTPSendLimits, getBunSocketIP, isJSONMediaType, isValidOTPEmail, makeOTPRequest, normalizeOTPEmail, OTPFixedWindowLimiter, otpSendEmailRateLimit, otpSignInFailureRateLimits, parseLimitedJSONBody, settleOTPSendAttempt, settleOTPSignInAttempt, withOTPAdvisoryLock } from '../lib/web/otpSecurity';
 import { requireAuth } from '../middleware/auth';
 import { dbGet, isUniqueViolation } from '../db/helpers';
-import { discardOTPLockSql, getOTPLockSql, getSql } from '../db/client';
+import { getOTPLockSql, getSql } from '../db/client';
 import { deletePhoto } from '../lib/storage';
 import { TRANSFER_PHASE_SOURCE_DELETED } from './account-deletion-transfers';
 
@@ -131,7 +131,7 @@ authRoutes.all('/auth/*', async (c) => {
   // Each code allows 3 guesses; sign-in requests allow at most 30 failed
   // guesses per email per 10 minutes and 10 per email/IP pair.
   const rate = send
-    ? otpRateLimiter.consumeMany(otpSendRateLimits(email, clientIP))
+    ? consumeOTPSendLimits(otpRateLimiter, email, clientIP)
     : otpRateLimiter.checkMany(attemptKeys);
   if (!rate.allowed) {
     return c.json({ ok: false, error: { code: 'rate_limited', retry_after_seconds: rate.retryAfterSeconds } }, 429);
@@ -144,10 +144,15 @@ authRoutes.all('/auth/*', async (c) => {
     async () => {
       const connection = await lockSql.reserve();
       try {
+        // This connection belongs only to advisory locking. better-auth runs
+        // SQL through the shared application pool, so changing its session
+        // statement_timeout here cannot bound those queries. Setting a
+        // timeout in that pool would affect unrelated routes; Kysely's
+        // adapter has no per-request connection/transaction hook here.
         await connection.unsafe("SET statement_timeout = '3s'");
         await connection.unsafe("SET lock_timeout = '3s'");
       } catch (error) {
-        await discardOTPLockSql(c.env);
+        connection.release();
         throw error;
       }
       return {
@@ -161,19 +166,24 @@ authRoutes.all('/auth/*', async (c) => {
           const result = await connection.unsafe<{ unlocked: boolean }[]>(
             'SELECT pg_advisory_unlock(hashtext($1)) AS unlocked', [`otp:${email}`],
           );
-          if (!result[0]?.unlocked) {
-            await connection.unsafe('SELECT pg_advisory_unlock_all()');
-            throw new Error('OTP advisory lock was not held at unlock');
-          }
+          if (!result[0]?.unlocked) throw new Error('OTP advisory lock was not held at unlock');
         },
+        unlockAll: async () => { await connection.unsafe('SELECT pg_advisory_unlock_all()'); },
+        terminateBackend: async () => { await connection.unsafe('SELECT pg_terminate_backend(pg_backend_pid())'); },
         release: () => connection.release(),
-        discard: async () => { await discardOTPLockSql(c.env); },
         deleteVerification: (identifier: string) => connection.unsafe('DELETE FROM verification WHERE identifier = $1', [identifier]),
       };
     },
     async (connection, signal) => {
+      if (send) {
+        const emailRate = otpRateLimiter.checkMany([otpSendEmailRateLimit(email)]);
+        if (!emailRate.allowed) {
+          return c.json({ ok: false, error: { code: 'rate_limited', retry_after_seconds: emailRate.retryAfterSeconds } }, 429);
+        }
+      }
       const processedRequest = makeOTPRequest(request, body, trustedIPHeader, signal);
       const response = await auth.handler(processedRequest);
+      if (send) settleOTPSendAttempt(otpRateLimiter, email, response.status);
       if (!send) settleOTPSignInAttempt(otpRateLimiter, email, attemptKeys, response.status);
       const mailFailed = send
         && await finalizeMailSendFailure(processedRequest, email, (identifier) =>

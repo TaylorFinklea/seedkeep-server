@@ -46,9 +46,32 @@ export async function parseLimitedJSONBody(
 
 export function otpSendRateLimits(email: string, ip: string) {
   return [
-    { key: `otp:send:email:${email}`, max: 5, windowMs: 10 * 60_000 },
+    otpSendEmailRateLimit(email),
     { key: `otp:send:ip:${ip}`, max: 3, windowMs: 60_000 },
   ];
+}
+
+/** Charge the source IP first, then check the email budget without reserving a key. */
+export function consumeOTPSendLimits(
+  limiter: OTPFixedWindowLimiter,
+  email: string,
+  ip: string,
+  now = Date.now(),
+): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
+  const [emailLimit, ipLimit] = otpSendRateLimits(email, ip);
+  const ipResult = limiter.consume(ipLimit.key, ipLimit.max, ipLimit.windowMs, now);
+  if (!ipResult.allowed) return ipResult;
+  return limiter.checkMany([emailLimit], now);
+}
+
+export function otpSendEmailRateLimit(email: string) {
+  return { key: `otp:send:email:${email}`, max: 5, windowMs: 10 * 60_000 };
+}
+
+export function settleOTPSendAttempt(limiter: OTPFixedWindowLimiter, email: string, status: number, now = Date.now()): void {
+  if (status === 429) return;
+  const limit = otpSendEmailRateLimit(email);
+  limiter.consume(limit.key, limit.max, limit.windowMs, now);
 }
 
 export function otpSignInFailureRateLimits(email: string, ip: string) {
@@ -66,7 +89,9 @@ export function settleOTPSignInAttempt(
   now = Date.now(),
 ): void {
   if (status >= 200 && status < 300) limiter.clearPrefix(`otp:signin:email:${email}`);
-  else if (status < 500) limiter.recordMany(limits, now);
+  // better-auth can reject requests at its own rate limit. Do not let those
+  // responses create or advance our email failure counters.
+  else if (status < 500 && status !== 429) limiter.recordMany(limits, now);
 }
 
 export function isJSONMediaType(contentType: string | null): boolean {
@@ -141,18 +166,22 @@ export class OTPFixedWindowLimiter {
 
   constructor(private readonly maxKeys = 50_000, private readonly pruneBatchSize = 100) {}
 
-  private inspect(keys: Array<{ key: string; max: number; windowMs: number }>, now: number): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
+  private inspect(keys: Array<{ key: string; max: number; windowMs: number }>, now: number, reserveKeys: boolean): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
     this.prune(now);
     let retryAfterSeconds = 0;
     for (const { key, max, windowMs } of keys) {
       const entry = this.windows.get(key);
+      if (entry) {
+        this.windows.delete(key);
+        this.windows.set(key, entry);
+      }
       if (entry && now - entry.start < windowMs && entry.count >= max) {
         retryAfterSeconds = Math.max(retryAfterSeconds, Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000)));
       }
     }
     if (retryAfterSeconds) return { allowed: false, retryAfterSeconds };
     const newKeys = new Set(keys.filter(({ key }) => !this.windows.has(key)).map(({ key }) => key));
-    if (newKeys.size > 0 && !this.makeRoom(newKeys.size, now)) {
+    if (reserveKeys && newKeys.size > 0 && !this.makeRoom(newKeys.size, now)) {
       return { allowed: false, retryAfterSeconds: 60 };
     }
     return { allowed: true };
@@ -167,6 +196,14 @@ export class OTPFixedWindowLimiter {
       for (const [key, entry] of this.windows) {
         if (now - entry.start >= 10 * 60_000) this.deleteKey(key);
       }
+    }
+    // At capacity, evict least-recently-used entries instead of locking out
+    // new emails. An attacker needs about 50k fresh keys, each still subject
+    // to the per-IP send limit, to evict a target's counter.
+    while (this.windows.size + required > this.maxKeys) {
+      const oldest = this.windows.keys().next();
+      if (oldest.done) break;
+      this.deleteKey(oldest.value);
     }
     return this.windows.size + required <= this.maxKeys;
   }
@@ -185,14 +222,14 @@ export class OTPFixedWindowLimiter {
   }
 
   consumeMany(limits: Array<{ key: string; max: number; windowMs: number }>, now = Date.now()): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
-    const result = this.inspect(limits, now);
+    const result = this.inspect(limits, now, true);
     if (!result.allowed) return result;
     this.recordMany(limits, now);
     return { allowed: true };
   }
 
   checkMany(limits: Array<{ key: string; max: number; windowMs: number }>, now = Date.now()): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
-    return this.inspect(limits, now);
+    return this.inspect(limits, now, false);
   }
 
   recordMany(limits: Array<{ key: string; max: number; windowMs: number }>, now = Date.now()): void {
@@ -210,6 +247,9 @@ export class OTPFixedWindowLimiter {
       entry = { start: now, count: 0 };
       this.windows.set(key, entry);
       this.addKey(key);
+    } else {
+      this.windows.delete(key);
+      this.windows.set(key, entry);
     }
     if (entry.count >= max) {
       return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000)) };
@@ -223,8 +263,26 @@ export class OTPFixedWindowLimiter {
 export interface OTPAdvisoryConnection {
   tryLock(): Promise<boolean>;
   unlock(): Promise<void>;
+  unlockAll(): Promise<void>;
+  terminateBackend(): Promise<void>;
   release(): void;
-  discard(): Promise<void> | void;
+}
+
+/** Release a reserved session after trying progressively stronger cleanup. */
+async function releaseOTPAdvisoryConnection(connection: OTPAdvisoryConnection): Promise<void> {
+  try {
+    await connection.unlock();
+  } catch {
+    try {
+      await connection.unlockAll();
+    } catch {
+      // Terminating this backend releases its session locks. The query often
+      // rejects because it ends its own session, which is safe.
+      try { await connection.terminateBackend(); } catch { /* best-effort */ }
+    }
+  } finally {
+    connection.release();
+  }
 }
 
 export interface OTPAdvisoryOptions {
@@ -274,10 +332,8 @@ export async function withOTPAdvisoryLock<T, C extends OTPAdvisoryConnection>(
         candidate.tryLock().then(
           async (locked) => {
             if (timedOut) {
-              if (locked) {
-                try { await candidate.unlock(); candidate.release(); }
-                catch { await candidate.discard(); }
-              } else candidate.release();
+              if (locked) await releaseOTPAdvisoryConnection(candidate);
+              else candidate.release();
               return null;
             }
             return locked;
@@ -296,7 +352,7 @@ export async function withOTPAdvisoryLock<T, C extends OTPAdvisoryConnection>(
       ]);
     } catch (error) {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
-      await candidate.discard();
+      candidate.release();
       throw error;
     }
     if (timeoutId !== undefined) clearTimeout(timeoutId);
@@ -311,32 +367,32 @@ export async function withOTPAdvisoryLock<T, C extends OTPAdvisoryConnection>(
   }
 
   if (!connection) return { acquired: false };
-  try {
-    const abortController = new AbortController();
-    let timedOut = false;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    const value = await Promise.race([
-      handler(connection, abortController.signal),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          abortController.abort(new Error('OTP handler timed out'));
-          reject(new Error('OTP handler timed out'));
-        }, handlerTimeoutMs);
-      }),
-    ]).catch((error) => {
-      if (timedOut) return { acquired: false as const, timedOut: true as const };
-      throw error;
-    }).finally(() => { if (timeoutId !== undefined) clearTimeout(timeoutId); });
-    if (typeof value === 'object' && value !== null && 'timedOut' in value) return value;
-    return { acquired: true, value };
-  } finally {
-    try {
-      await connection.unlock();
-    } catch (error) {
-      try { await connection.discard(); } catch { /* the pool close is best-effort */ }
-      throw error;
-    }
-    connection.release();
+  const abortController = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  // Convert rejection to a value immediately so the detached settle path is
+  // always observed and can never create an unhandled promise rejection.
+  const settledHandler = Promise.resolve()
+    .then(() => handler(connection!, abortController.signal))
+    .then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+  const outcome = await Promise.race([
+    settledHandler.then((settled) => ({ kind: 'settled' as const, settled })),
+    new Promise<{ kind: 'timeout' }>((resolve) => {
+      timeoutId = setTimeout(() => {
+        abortController.abort(new Error('OTP handler timed out'));
+        resolve({ kind: 'timeout' });
+      }, handlerTimeoutMs);
+    }),
+  ]);
+  if (timeoutId !== undefined) clearTimeout(timeoutId);
+  if (outcome.kind === 'timeout') {
+    // Keep the advisory lock until all handler work has actually settled.
+    void settledHandler.then(() => releaseOTPAdvisoryConnection(connection!)).catch(() => {});
+    return { acquired: false, timedOut: true };
   }
+  await releaseOTPAdvisoryConnection(connection);
+  if (!outcome.settled.ok) throw outcome.settled.error;
+  return { acquired: true, value: outcome.settled.value };
 }
