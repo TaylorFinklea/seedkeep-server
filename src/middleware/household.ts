@@ -15,26 +15,29 @@ interface MembershipRow {
  * route. Substitutes for missing native row-level security — every
  * downstream query must filter by `household_id`.
  *
- * Phase 1 enforces a 1:1 user-to-household relationship at the API layer:
- * if the user has more than one membership row (which shouldn't happen
- * in Phase 1) we pick the most recent one. The schema permits multiple
- * memberships so we can lift the restriction later.
+ * X-Household-Id can select any membership held by the caller. Older clients
+ * omit it and retain the most-recent-membership behavior.
  */
 export const requireHousehold = () =>
   createMiddleware<AppEnv>(async (c, next) => {
     const userId = c.get('userId');
     const sql = getSql(c.env);
+    const selectedId = c.req.header('X-Household-Id');
     const membership = await dbGet<MembershipRow>(
       sql,
       `SELECT household_id, user_id, role
          FROM memberships
         WHERE user_id = $1
+          AND ($2::text IS NULL OR household_id = $2)
         ORDER BY joined_at DESC
         LIMIT 1`,
-      [userId],
+      [userId, selectedId ?? null],
     );
 
     if (!membership) {
+      if (selectedId !== undefined) {
+        return c.json({ ok: false, error: { code: 'household_forbidden', message: 'Household is not available to this user' } }, 403);
+      }
       return c.json(
         {
           ok: false,

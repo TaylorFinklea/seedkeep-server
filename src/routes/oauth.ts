@@ -26,7 +26,7 @@ import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { dbGet, dbRun } from '../db/helpers';
 import { getSql } from '../db/client';
-import { getAuth } from '../lib/auth';
+import { getAuth, getSessionCookie, publicBaseURL } from '../lib/auth';
 
 // 20 pairing-code mints per user per hour.
 const PAIRING_MINT_LIMIT = 20;
@@ -81,6 +81,9 @@ oauthPublicRoutes.all('/oauth2/userinfo',  proxyToBetterAuth('/api/auth/oauth2/u
 oauthPublicRoutes.post('/oauth2/consent', async (c) => {
   c.header('Content-Security-Policy', "frame-ancestors 'none'");
   c.header('X-Frame-Options', 'DENY');
+  if (c.req.header('Origin') !== new URL(publicBaseURL(c.env)).origin) {
+    return c.json({ ok: false, error: { code: 'csrf_origin_rejected', message: 'Request Origin is not allowed' } }, 403);
+  }
   const auth = getAuth(c.env);
   const formData = await c.req.formData();
   // The consent form has a hidden `<input name="accept" value="true">`
@@ -101,14 +104,10 @@ oauthPublicRoutes.post('/oauth2/consent', async (c) => {
   const url = new URL(c.req.raw.url);
   url.pathname = '/api/auth/oauth2/consent';
 
-  // Better-auth's CSRF middleware requires `Origin` to be present
-  // (and to match the request URL's origin). Forward whatever the
-  // browser sent; if the form was posted same-origin the browser
-  // already set it. Falls back to the reconstructed public origin
-  // behind Fly's TLS proxy.
+  // The exact public Origin was checked above; forward it unchanged.
   const proto = c.req.header('x-forwarded-proto') ?? 'https';
   const host = c.req.header('host') ?? url.host;
-  const origin = c.req.header('origin') ?? `${proto}://${host}`;
+  const origin = c.req.header('origin')!;
 
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -250,6 +249,9 @@ const PairBody = z.object({
 oauthPublicRoutes.post('/oauth/pair', async (c) => {
   c.header('Content-Security-Policy', "frame-ancestors 'none'");
   c.header('X-Frame-Options', 'DENY');
+  if (c.req.header('Origin') !== new URL(publicBaseURL(c.env)).origin) {
+    return c.json({ ok: false, error: { code: 'csrf_origin_rejected', message: 'Request Origin is not allowed' } }, 403);
+  }
   const sql = getSql(c.env);
   const formData = await c.req.formData();
   const parsed = PairBody.safeParse({
@@ -320,17 +322,13 @@ oauthPublicRoutes.post('/oauth/pair', async (c) => {
   // `serializeSignedCookie` to match better-auth's format exactly —
   // a plain hono setCookie produces an unsigned value that better-
   // auth rejects, kicking the user back into the loginPage loop.
-  const isHttps = c.env.APP_ENV === 'production';
-  const cookieName = `${isHttps ? '__Secure-' : ''}better-auth.session_token`;
+  const sessionCookie = await getSessionCookie(c.env);
   const cookieValue = await serializeSignedCookie(
-    cookieName,
+    sessionCookie.name,
     session.token,
     c.env.BETTER_AUTH_SECRET,
     {
-      path: '/',
-      httpOnly: true,
-      secure: isHttps,
-      sameSite: 'Lax',
+      ...sessionCookie.attributes,
       maxAge: 60 * 60 * 24 * 30,
     },
   );
