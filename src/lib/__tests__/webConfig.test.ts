@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../env';
-import { consumeMailSendFailure, finalizeMailSendFailure, publicBaseURL, removeFailedOTPVerification, validateWebConfig } from '../auth';
+import { authConfigurationKey, authTrustedOrigins, consumeMailSendFailure, finalizeMailSendFailure, publicBaseURL, removeFailedOTPVerification, validateWebConfig } from '../auth';
 import { clearSentMail, getMailer, sentMail } from '../mail';
 import { appOrigins, isAllowedAppOrigin } from '../web/origins';
 
@@ -13,7 +13,7 @@ const env = (overrides: Partial<Env> = {}): Env => ({
   APPLE_IAP_SHARED_SECRET: undefined, ASSISTANT_KEY_MASTER: undefined, ADMIN_SECRET: undefined, ...overrides,
 });
 
-afterEach(() => { clearSentMail(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { clearSentMail(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe('web origin policy', () => {
   it('parses, trims, de-slashes, and deduplicates configured origins', () => {
@@ -47,6 +47,15 @@ describe('mailer selection', () => {
     expect(getMailer(env({ MAIL_PROVIDER: 'resend', RESEND_API_KEY: '  ' }))).toBeNull();
   });
 
+  it('refuses the memory provider outside development and test processes', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    expect(getMailer(env({ APP_ENV: 'production', MAIL_PROVIDER: 'memory' }))).toBeNull();
+    expect(getMailer(env({ APP_ENV: 'staging', MAIL_PROVIDER: 'memory' }))).toBeNull();
+    expect(getMailer(env({ APP_ENV: 'development', MAIL_PROVIDER: 'memory' }))).not.toBeNull();
+    vi.stubEnv('NODE_ENV', 'test');
+    expect(getMailer(env({ APP_ENV: 'production', MAIL_PROVIDER: 'memory' }))).not.toBeNull();
+  });
+
   it('sends Resend mail with the configured sender and rejects provider errors', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -55,9 +64,12 @@ describe('mailer selection', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://api.resend.com/emails', expect.objectContaining({
       method: 'POST', headers: { Authorization: 'Bearer test-key', 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: 'Sender <sender@example.test>', to: ['person@example.test'], subject: 'Sign in', text: 'Code' }),
+      signal: expect.any(AbortSignal),
     }));
     fetchMock.mockResolvedValue(new Response(null, { status: 503 }));
     await expect(mailer!.send({ to: 'person@example.test', subject: 'Sign in', text: 'Code' })).rejects.toThrow(/Resend rejected email/);
+    fetchMock.mockRejectedValue(new DOMException('The operation timed out', 'TimeoutError'));
+    await expect(mailer!.send({ to: 'person@example.test', subject: 'Sign in', text: 'Code' })).rejects.toThrow(/timed out/);
   });
 
   it('captures memory provider messages for the test helpers', async () => {
@@ -82,6 +94,16 @@ describe('public web configuration', () => {
     expect(() => validateWebConfig(env({ APP_ENV: 'staging' }))).toThrow(/PUBLIC_BASE_URL and APP_ORIGINS/);
     expect(() => validateWebConfig(env({ APP_ENV: 'staging', PUBLIC_BASE_URL: 'https://api.test', APP_ORIGINS: 'http://app.test' }))).toThrow(/https origins/);
     expect(() => validateWebConfig(env({ APP_ENV: 'production', APP_ORIGINS: 'https://app.test' }))).not.toThrow();
+  });
+
+  it('keys auth instances by all relevant configuration and trusts both development loopbacks', () => {
+    const base = env();
+    expect(authConfigurationKey(base)).toBe(authConfigurationKey({ ...base }));
+    expect(authConfigurationKey(base)).not.toBe(authConfigurationKey({ ...base, APP_ORIGINS: 'https://other.example.test' }));
+    expect(authConfigurationKey(base)).not.toBe(authConfigurationKey({ ...base, RESEND_API_KEY: 'another-key' }));
+    expect(authTrustedOrigins(base)).toContain('http://localhost:*');
+    expect(authTrustedOrigins(base)).toContain('http://127.0.0.1:*');
+    expect(authTrustedOrigins(env({ APP_ENV: 'production' }))).not.toContain('http://127.0.0.1:*');
   });
 });
 
