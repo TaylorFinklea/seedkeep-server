@@ -1,58 +1,141 @@
 #!/usr/bin/env bash
 # deploy.sh — guarded Fly deploy for seedkeep-server.
 #
-# Guards:
-#   1. Refuse a dirty working tree (--dirty to override, prints diffstat).
-#   2. Run test:all (typecheck + migrate + vitest + integration) — one shared
-#      gate definition used by local dev, deploy, and CI.
-#   3. fly deploy (uses fly.toml in the repo root).
-#   4. Post-deploy curl of /api/health and print the response.
-#
 # Usage:
-#   scripts/deploy.sh [--dirty]
+#   scripts/deploy.sh <staging|production>
 #
-# The --dirty flag is an explicit escape hatch for emergencies. It prints
-# the diffstat so the operator knows exactly what they're shipping.
+# There is no default environment. Every target goes through the same gate:
+#   1. Refuse a dirty tree. Untracked files count (git status --porcelain).
+#   2. Explicit typecheck.
+#   3. Unit and integration tests against an isolated local database,
+#      seedkeep_deploygate. DATABASE_URL is overridden, so a remote
+#      DATABASE_URL in the environment is never used by the gate.
+#   4. Production only: typed confirmation, unless CONFIRM=production is set.
+#   5. fly deploy --config <config> --app <app>.
+#   6. Poll the public /api/health for up to 120 seconds. A failed health
+#      check exits non-zero.
+#
+# Targets:
+#   staging     fly.staging.toml  app seedkeep-server-staging
+#               https://api-staging.seedkeep.app
+#   production  fly.toml          app seedkeep-server
+#               https://seedkeep-server.fly.dev
 
 set -euo pipefail
 
-DIRTY_OK=false
-for arg in "$@"; do
-  if [[ "$arg" == "--dirty" ]]; then
-    DIRTY_OK=true
-  fi
-done
+usage() {
+  echo "usage: scripts/deploy.sh <staging|production>" >&2
+  exit 2
+}
+
+if [[ $# -ne 1 ]]; then
+  usage
+fi
+
+case "$1" in
+  staging)
+    FLY_CONFIG="fly.staging.toml"
+    FLY_APP="seedkeep-server-staging"
+    HEALTH_BASE="https://api-staging.seedkeep.app"
+    ;;
+  production)
+    FLY_CONFIG="fly.toml"
+    FLY_APP="seedkeep-server"
+    HEALTH_BASE="https://seedkeep-server.fly.dev"
+    ;;
+  *)
+    echo "[deploy] ERROR: unknown environment '$1'" >&2
+    usage
+    ;;
+esac
+DEPLOY_ENV="$1"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# ── 1. Working tree check ────────────────────────────────────────────────
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  if [[ "$DIRTY_OK" == "true" ]]; then
-    echo "[deploy] WARNING: deploying with uncommitted changes (--dirty):"
-    git diff --stat HEAD
-    echo ""
-  else
-    echo "[deploy] ERROR: working tree is dirty. Commit or stash your changes,"
-    echo "         or re-run with --dirty to override (prints diffstat)."
+# ── 1. Working tree check (tracked changes AND untracked files) ──────────
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "[deploy] ERROR: working tree is dirty (including untracked files):" >&2
+  git status --short >&2
+  echo "[deploy] Commit, stash, or remove these files, then re-run." >&2
+  exit 1
+fi
+
+# ── 2. Gate: typecheck ───────────────────────────────────────────────────
+echo "[deploy] typecheck..."
+bun run typecheck
+
+# ── 3. Gate: tests against an isolated local database ────────────────────
+# Local development credentials only (same as docker-compose and CI). These
+# never point at a remote host.
+GATE_ADMIN_URL="postgres://seedkeep:dev-only@localhost:5432/postgres"
+GATE_DB_URL="postgres://seedkeep:dev-only@localhost:5432/seedkeep_deploygate"
+
+echo "[deploy] recreating local database seedkeep_deploygate..."
+GATE_ADMIN_URL="$GATE_ADMIN_URL" bun -e '
+  import postgres from "postgres";
+  const sql = postgres(process.env.GATE_ADMIN_URL, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe("DROP DATABASE IF EXISTS seedkeep_deploygate WITH (FORCE)");
+    await sql.unsafe("CREATE DATABASE seedkeep_deploygate");
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
+'
+
+# Dummy values for required env vars, as in CI. No gate test contacts S3,
+# Apple, or Anthropic.
+export DATABASE_URL="$GATE_DB_URL"
+export S3_ACCESS_KEY_ID="ci-dummy-key"
+export S3_SECRET_ACCESS_KEY="ci-dummy-secret"
+export S3_BUCKET="ci-dummy-bucket"
+export BETTER_AUTH_SECRET="ci-better-auth-secret-32chars-xxxxx"
+export APPLE_CLIENT_ID="ci-apple-client"
+export APPLE_CLIENT_SECRET="ci-apple-secret"
+
+echo "[deploy] migrating seedkeep_deploygate..."
+bun run migrate
+
+echo "[deploy] unit tests (vitest)..."
+bun run test
+
+echo "[deploy] integration tests..."
+bun test tests/integration/
+
+echo "[deploy] gate passed."
+
+# ── 4. Production confirmation ───────────────────────────────────────────
+if [[ "$DEPLOY_ENV" == "production" && "${CONFIRM:-}" != "production" ]]; then
+  answer=""
+  read -r -p "[deploy] Type 'production' to deploy seedkeep-server to PRODUCTION: " answer || true
+  if [[ "$answer" != "production" ]]; then
+    echo "[deploy] ERROR: confirmation not given. Nothing deployed." >&2
     exit 1
   fi
 fi
 
-# ── 2. Full test gate (typecheck + migrate + vitest + integration) ────────
-echo "[deploy] running test:all..."
-bun run test:all
+# ── 5. Fly deploy ────────────────────────────────────────────────────────
+echo "[deploy] deploying ${FLY_APP} with ${FLY_CONFIG}..."
+fly deploy --config "$FLY_CONFIG" --app "$FLY_APP"
 
-# ── 3. Fly deploy ────────────────────────────────────────────────────────
-echo "[deploy] deploying to Fly..."
-fly deploy
+# ── 6. Health check (poll up to 120s) ────────────────────────────────────
+HEALTH_URL="${HEALTH_BASE}/api/health"
+echo "[deploy] polling ${HEALTH_URL} for up to 120 seconds..."
+deadline=$(( $(date +%s) + 120 ))
+healthy=false
+body=""
+while [[ $(date +%s) -lt $deadline ]]; do
+  if body="$(curl -sf --max-time 10 "$HEALTH_URL" 2>/dev/null)" && [[ "$body" == *'"ok":true'* ]]; then
+    healthy=true
+    break
+  fi
+  sleep 5
+done
 
-# ── 4. Health check ──────────────────────────────────────────────────────
-# Give the new instance a moment to start accepting traffic.
-sleep 5
-APP_URL="https://seedkeep-server.fly.dev"
-echo "[deploy] checking ${APP_URL}/api/health..."
-curl -sf "${APP_URL}/api/health" | python3 -m json.tool || \
-  echo "[deploy] WARNING: health check returned non-200 or invalid JSON"
+if [[ "$healthy" != "true" ]]; then
+  echo "[deploy] ERROR: health check failed for ${HEALTH_URL} within 120 seconds." >&2
+  exit 1
+fi
 
-echo "[deploy] done"
+echo "[deploy] healthy: ${body}"
+echo "[deploy] done (${DEPLOY_ENV})"
