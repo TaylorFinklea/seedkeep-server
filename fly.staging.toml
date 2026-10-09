@@ -1,0 +1,60 @@
+# fly.staging.toml — staging app configuration for seedkeep-server.
+#
+# Copy of fly.toml with the staging app name and staging non-secret config.
+# Secrets (DATABASE_URL, S3_*, BETTER_AUTH_SECRET, APPLE_*, RESEND_API_KEY,
+# ANTHROPIC_API_KEY, ...) are set with `fly secrets set --app
+# seedkeep-server-staging`, never in this file.
+#
+# Deploy with scripts/deploy.sh staging.
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'seedkeep-server-staging'
+primary_region = 'iad'
+
+[env]
+  APP_ENV = "staging"
+  PUBLIC_BASE_URL = "https://api-staging.seedkeep.app"
+  APP_ORIGINS = "https://app-staging.seedkeep.app"
+  MAIL_PROVIDER = "resend"
+  MAIL_FROM = "Seedkeep Staging <login@seedkeep.app>"
+
+[build]
+
+[deploy]
+  # Applies pending migrations on a temporary machine before the new
+  # release serves traffic. The migration runner is idempotent.
+  release_command = "bun run migrate"
+
+[processes]
+  app = "bun run src/server.ts"
+  worker = "bun run src/worker.ts"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  # Staging keeps one app machine warm so health polling after a deploy
+  # reaches a running instance without a cold start.
+  min_machines_running = 1
+  processes = ['app']
+  # Allow in-flight Anthropic streaming calls (~90s) plus a margin to drain.
+  kill_timeout = 120
+
+  [[http_service.checks]]
+    grace_period = '10s'
+    interval = '15s'
+    method = 'GET'
+    path = '/api/health'
+    port = 8787
+    timeout = '5s'
+    tls_skip_verify = false
+
+[[vm]]
+  # Same sizing as production (see fly.toml).
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

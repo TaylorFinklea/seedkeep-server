@@ -62,6 +62,38 @@ Seedkeep is designed for self-hosting as a first-class workflow:
 
 The repo ships a multi-stage `Dockerfile` and a working `docker-compose.yml` you can drop on any Docker host.
 
+## Web clients
+
+The browser app signs in with an emailed one-time code and then calls the API with an HttpOnly session cookie. Native iOS clients keep using Bearer tokens.
+
+- **Allowed origins.** `APP_ORIGINS` is a comma-separated list of exact web origins, for example `https://app-staging.seedkeep.app` or `https://app.seedkeep.app`. Development also allows `http://localhost:*` and `http://127.0.0.1:*`. Production does not.
+- **Public URL.** `PUBLIC_BASE_URL` is the URL clients use to reach this server. Staging requires it. Production defaults to `https://seedkeep-server.fly.dev`, which the claude.ai OAuth issuer depends on. Do not change that default.
+- **Mail.** `MAIL_PROVIDER` is `resend`, `log` or `memory`. `resend` needs `RESEND_API_KEY`. `MAIL_FROM` defaults to `Seedkeep <login@seedkeep.app>`. `log` prints codes to the console and is refused in staging and production. If `MAIL_PROVIDER` is unset, it defaults to `log` in development and to no mailer elsewhere. With no mailer, sign-in code requests return `503 mail_not_configured`.
+- **Sign-in.** `POST /api/auth/email-otp/send-verification-otp` with `{ "email", "type": "sign-in" }`, then `POST /api/auth/sign-in/email-otp` with `{ "email", "otp" }`. Codes are 6 digits, expire after 5 minutes and allow 3 attempts. Sending is limited to 3 per minute per client IP, and the client IP comes from the `fly-client-ip` header.
+- **Cookie.** The session cookie is `__Secure-better-auth.session_token` outside development. It is HttpOnly, SameSite=Lax, Path=/ and host-only.
+- **CSRF.** Cookie-authenticated unsafe requests (POST, PUT, PATCH, DELETE) need an `Origin` header from `APP_ORIGINS`. Otherwise they get `403 csrf_origin_rejected`. Bearer requests are not affected.
+- **Households.** `GET /api/households` lists the caller's households, newest first. Send `X-Household-Id` to choose which household a request acts on. A household the caller does not belong to gets `403 household_forbidden`. Without the header, the newest membership is used, as before.
+
+## Deploying
+
+Deploys go through `scripts/deploy.sh`. It takes a required target, so there is no default environment.
+
+```bash
+scripts/deploy.sh staging      # fly.staging.toml -> app seedkeep-server-staging
+scripts/deploy.sh production   # fly.toml -> app seedkeep-server
+```
+
+The script runs these steps in order, and any failure stops it before anything is deployed:
+
+1. Refuses a dirty tree. Untracked files count, so commit or remove them first.
+2. Runs `bun run typecheck`.
+3. Recreates the local `seedkeep_deploygate` database, migrates it, and runs `bun run test` and `bun test tests/integration/` against it. It overrides `DATABASE_URL`, so a remote database is never used for the gate. It requires the local Postgres from `docker compose up -d db`.
+4. For production only, asks you to type `production`. Set `CONFIRM=production` to skip the prompt in automation.
+5. Runs `fly deploy --config <config> --app <app>`.
+6. Polls `/api/health` on the public host for up to 120 seconds and exits non-zero if it never reports healthy.
+
+Secrets are not in the Fly config files. Set them per app with `fly secrets set --app <app>`, for example `DATABASE_URL`, `S3_*`, `BETTER_AUTH_SECRET`, `APPLE_*`, `RESEND_API_KEY` and `ANTHROPIC_API_KEY`. `fly.staging.toml` sets the non-secret staging values: `APP_ENV`, `PUBLIC_BASE_URL`, `APP_ORIGINS`, `MAIL_PROVIDER` and `MAIL_FROM`.
+
 ## Repo layout
 
 ```
