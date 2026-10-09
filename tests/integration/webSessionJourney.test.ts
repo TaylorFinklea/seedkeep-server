@@ -33,6 +33,12 @@ import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { createHash } from 'node:crypto';
 import postgres, { type Sql } from 'postgres';
 import { createApp } from '../../src/index';
+
+// These tests simulate requests arriving through Fly's proxy, so the
+// per-test `fly-client-ip` values are trusted as client IPs (the limiter
+// only trusts that header when FLY_APP_NAME is set). Without this, every
+// test shares one fallback rate-limit bucket. CI and deploy.sh do not set it.
+process.env.FLY_APP_NAME ??= 'seedkeep-integration-test';
 import type { Env } from '../../src/env';
 import { sentMail } from '../../src/lib/mail';
 
