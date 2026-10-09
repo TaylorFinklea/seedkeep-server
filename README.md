@@ -74,6 +74,13 @@ The browser app signs in with an emailed one-time code and then calls the API wi
 - **CSRF.** Cookie-authenticated unsafe requests (POST, PUT, PATCH, DELETE) need an `Origin` header from `APP_ORIGINS`. Otherwise they get `403 csrf_origin_rejected`. Bearer requests are not affected.
 - **Households.** `GET /api/households` lists the caller's households, newest first. Send `X-Household-Id` to choose which household a request acts on. A household the caller does not belong to gets `403 household_forbidden`. Without the header, the newest membership is used, as before.
 
+### Rate limits and client IPs
+
+- Rate limits are per machine. Each Fly machine keeps its own counters, so a limit is not shared across machines.
+- The `fly-client-ip` header is trusted only when `FLY_APP_NAME` is set, which means traffic arrives through Fly's proxy. When it is unset, as in local development and tests, the header is ignored.
+- The server must not be reachable on Fly's private 6PN network by untrusted apps. Direct 6PN traffic can forge `fly-client-ip`. Verify this on staging before relying on the per-IP limits.
+- OTP guessing budget per email: at most 5 codes per 10 minutes, with 3 attempts each.
+
 ## Deploying
 
 Deploys go through `scripts/deploy.sh`. It takes a required target, so there is no default environment.
