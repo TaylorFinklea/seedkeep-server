@@ -24,6 +24,12 @@ const env: Env = {
 };
 
 describe('MCP OAuth discovery metadata', () => {
+  it('reuses auth for identical configuration and builds a distinct instance when mail config changes', () => {
+    const auth = getAuth(env);
+    expect(getAuth({ ...env })).toBe(auth);
+    expect(getAuth({ ...env, MAIL_FROM: 'Other <other@example.test>' })).not.toBe(auth);
+  });
+
   it('advertises Seedkeep scopes in both OAuth discovery documents', async () => {
     const auth = getAuth(env);
 

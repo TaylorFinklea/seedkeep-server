@@ -1,16 +1,31 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../index';
-import { finalizeMailSendFailure, getAuth, getSessionCookie } from '../lib/auth';
+import { finalizeMailSendFailure, getAuth, getSessionCookie, publicBaseURL } from '../lib/auth';
 import { getMailer } from '../lib/mail';
 import { isAllowedAppOrigin } from '../lib/web/origins';
+import { getBunSocketIP, isJSONMediaType, makeOTPRequest, normalizeOTPEmail, OTPFixedWindowLimiter, withOTPAdvisoryLock } from '../lib/web/otpSecurity';
 import { requireAuth } from '../middleware/auth';
 import { dbGet, isUniqueViolation } from '../db/helpers';
-import { getSql } from '../db/client';
+import { getOTPLockSql, getSql } from '../db/client';
 import { deletePhoto } from '../lib/storage';
 import { TRANSFER_PHASE_SOURCE_DELETED } from './account-deletion-transfers';
 
 export const authRoutes = new Hono<AppEnv>();
+
+// Fixed-window counters are process-local; limits are per server machine.
+const otpRateLimiter = new OTPFixedWindowLimiter();
+const TRUSTED_FLY_CLIENT_IP_HEADER = 'fly-client-ip';
+
+export function isCookieFreeOAuthEndpoint(path: string, method: string): boolean {
+  const upperMethod = method.toUpperCase();
+  return (path === '/oauth2/token' && upperMethod === 'POST')
+    || (path === '/oauth2/register' && upperMethod === 'POST')
+    || (path === '/oauth2/userinfo' && upperMethod === 'GET')
+    // better-auth MCP plugin's actual cookie-independent endpoint paths.
+    || (path === '/mcp/token' && upperMethod === 'POST')
+    || (path === '/mcp/register' && upperMethod === 'POST');
+}
 
 /**
  * What the client did about its CloudKit garden before asking us to erase
@@ -67,24 +82,35 @@ authRoutes.all('/auth/*', async (c) => {
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/api\/auth/, '') || '/';
   const unsafe = !['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase());
-  const oauthServerPath = path.startsWith('/oauth2/') || path.startsWith('/mcp/');
   const cookie = await getSessionCookie(c.env);
   const cookiePresent = (request.headers.get('cookie') ?? '').split(';')
     .some((part) => part.trim().startsWith(`${cookie.name}=`));
 
-  if (unsafe && !oauthServerPath) {
+  const cookieFreeOAuth = !cookiePresent && isCookieFreeOAuthEndpoint(path, request.method);
+  if (unsafe && !cookieFreeOAuth) {
     const origin = request.headers.get('origin');
-    if (origin ? !isAllowedAppOrigin(c.env, origin) : cookiePresent) {
+    const serverOrigin = new URL(publicBaseURL(c.env)).origin;
+    if (origin ? origin !== serverOrigin && !isAllowedAppOrigin(c.env, origin) : cookiePresent) {
       return c.json({ ok: false, error: { code: 'csrf_origin_rejected', message: 'Request Origin is not allowed' } }, 403);
     }
   }
 
-  let body: Record<string, unknown> | undefined;
-  if (path === '/email-otp/send-verification-otp' || path === '/sign-in/email-otp') {
-    body = await request.clone().json().catch(() => undefined) as Record<string, unknown> | undefined;
+  const otpPath = path === '/email-otp/send-verification-otp' || path === '/sign-in/email-otp';
+  if (!otpPath) return auth.handler(request);
+  if (!isJSONMediaType(request.headers.get('content-type'))) {
+    return c.json({ ok: false, error: { code: 'unsupported_media_type', message: 'OTP endpoints require application/json' } }, 415);
   }
+  const parsedBody = await request.json().catch(() => null) as unknown;
+  if (!parsedBody || typeof parsedBody !== 'object' || Array.isArray(parsedBody)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'A JSON object is required' } }, 400);
+  }
+  const body = parsedBody as Record<string, unknown>;
+  if (typeof body.email !== 'string' || body.email.length === 0) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'A non-empty email is required' } }, 400);
+  }
+  const email = normalizeOTPEmail(body.email);
   if (path === '/email-otp/send-verification-otp') {
-    if (body?.type !== 'sign-in') {
+    if (body.type !== 'sign-in') {
       return c.json({ ok: false, error: { code: 'bad_request', message: 'Only sign-in codes are supported' } }, 400);
     }
     if (!getMailer(c.env)) {
@@ -92,25 +118,52 @@ authRoutes.all('/auth/*', async (c) => {
     }
   }
 
-  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
-  const serializedOTP = email && (path === '/email-otp/send-verification-otp' || path === '/sign-in/email-otp');
-  if (!serializedOTP) return auth.handler(request);
-
-  const connection = await getSql(c.env).reserve();
-  try {
-    await connection.unsafe('SELECT pg_advisory_lock(hashtext($1))', [`otp:${email}`]);
-    const response = await auth.handler(request);
-    const mailFailed = path === '/email-otp/send-verification-otp'
-      && await finalizeMailSendFailure(request, email, (identifier) =>
-        connection.unsafe('DELETE FROM verification WHERE identifier = $1', [identifier]));
-    if (mailFailed) {
-      return c.json({ ok: false, error: { code: 'mail_send_failed', message: 'Could not send sign-in code' } }, 502);
-    }
-    return response;
-  } finally {
-    await connection.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [`otp:${email}`]).catch(() => undefined);
-    connection.release();
+  const send = path === '/email-otp/send-verification-otp';
+  const trustedIPHeader = process.env.FLY_APP_NAME ? TRUSTED_FLY_CLIENT_IP_HEADER : null;
+  const clientIP = trustedIPHeader
+    ? request.headers.get(trustedIPHeader)?.trim() || 'unknown'
+    : getBunSocketIP(c.env, request) || 'unknown';
+  otpRateLimiter.prune();
+  const rate = otpRateLimiter.consumeMany([
+    { key: `otp:${path}:email:${email}`, max: send ? 3 : 10, windowMs: 10 * 60_000 },
+    { key: `otp:${path}:ip:${clientIP}`, max: send ? 3 : 10, windowMs: 60_000 },
+  ]);
+  if (!rate.allowed) {
+    return c.json({ ok: false, error: { code: 'rate_limited', retry_after_seconds: rate.retryAfterSeconds } }, 429);
   }
+
+  const processedRequest = makeOTPRequest(request, body, trustedIPHeader);
+  const lockSql = getOTPLockSql(c.env);
+  const outcome = await withOTPAdvisoryLock(
+    async () => {
+      const connection = await lockSql.reserve();
+      return {
+        tryLock: async () => {
+          const result = await connection.unsafe<{ locked: boolean }[]>(
+            'SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [`otp:${email}`],
+          );
+          return Boolean(result[0]?.locked);
+        },
+        unlock: async () => { await connection.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [`otp:${email}`]); },
+        release: () => connection.release(),
+        deleteVerification: (identifier: string) => connection.unsafe('DELETE FROM verification WHERE identifier = $1', [identifier]),
+      };
+    },
+    async (connection) => {
+      const response = await auth.handler(processedRequest);
+      const mailFailed = send
+        && await finalizeMailSendFailure(processedRequest, email, (identifier) =>
+          connection.deleteVerification(identifier));
+      if (mailFailed) {
+        return c.json({ ok: false, error: { code: 'mail_send_failed', message: 'Could not send sign-in code' } }, 502);
+      }
+      return response;
+    },
+  );
+  if (!outcome.acquired) {
+    return c.json({ ok: false, error: { code: 'otp_busy' } }, 429);
+  }
+  return outcome.value;
 });
 
 /**

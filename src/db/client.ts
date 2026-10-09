@@ -15,6 +15,7 @@ import type { Env } from '../env';
 
 let _sql: Sql | null = null;
 let _kysely: Kysely<Record<string, never>> | null = null;
+let _otpLockSql: Sql | null = null;
 
 export function getSql(env: Env): Sql {
   if (_sql) return _sql;
@@ -51,6 +52,17 @@ export function getSql(env: Env): Sql {
   return _sql;
 }
 
+/** Separate, small pool for session-level OTP advisory locks. */
+export function getOTPLockSql(env: Env): Sql {
+  if (_otpLockSql) return _otpLockSql;
+  _otpLockSql = postgres(env.DATABASE_URL, {
+    max: 3,
+    transform: { undefined: null },
+    onnotice: () => { /* silence Postgres NOTICE messages */ },
+  });
+  return _otpLockSql;
+}
+
 /**
  * Kysely instance over the same `postgres.js` connection. Used only by
  * better-auth's adapter; route handlers should prefer the raw helpers.
@@ -70,6 +82,8 @@ export function getKysely(env: Env): Kysely<Record<string, never>> {
 export async function closeDb(): Promise<void> {
   await _kysely?.destroy();
   await _sql?.end({ timeout: 5 });
+  await _otpLockSql?.end({ timeout: 5 });
   _kysely = null;
   _sql = null;
+  _otpLockSql = null;
 }

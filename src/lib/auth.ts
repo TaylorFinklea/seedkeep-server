@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { betterAuth } from 'better-auth';
 import { emailOTP, mcp } from 'better-auth/plugins';
 import { APIError } from 'better-auth/api';
@@ -39,7 +40,30 @@ export function validateWebConfig(env: Env): void {
 // upper bound from the library doesn't accept our literal config.
 type AuthInstance = ReturnType<typeof buildAuth>;
 
-let _auth: AuthInstance | null = null;
+const authInstances = new Map<string, AuthInstance>();
+
+const AUTH_CONFIG_KEYS = [
+  'APP_ENV', 'PORT', 'PUBLIC_BASE_URL', 'APP_ORIGINS', 'MAIL_PROVIDER', 'MAIL_FROM',
+  'RESEND_API_KEY', 'BETTER_AUTH_SECRET', 'DATABASE_URL', 'APPLE_CLIENT_ID', 'APPLE_CLIENT_SECRET',
+] as const;
+
+export function authConfigurationKey(env: Env): string {
+  const config = AUTH_CONFIG_KEYS.map((key) => [key, env[key] ?? null]);
+  return createHash('sha256').update(JSON.stringify(config)).digest('hex');
+}
+
+export function authTrustedOrigins(env: Env): string[] {
+  const base = publicBaseURL(env);
+  return [
+    'seedkeep://*',
+    'https://api.seedkeep.app',
+    'https://claude.ai',
+    'https://*.claude.ai',
+    base,
+    ...appOrigins(env),
+    ...(env.APP_ENV === 'development' ? ['http://localhost:*', 'http://127.0.0.1:*'] : []),
+  ];
+}
 
 const OIDC_SCOPES = [
   'openid', 'profile', 'email', 'offline_access', MCP_READ_SCOPE, MCP_WRITE_SCOPE,
@@ -115,15 +139,7 @@ function buildAuth(env: Env) {
       expiresIn: 60 * 60 * 24 * 30, // 30 days
       updateAge: 60 * 60 * 24,      // refresh every 24h
     },
-    trustedOrigins: [
-      'seedkeep://*',
-      'https://api.seedkeep.app',
-      'https://claude.ai',
-      'https://*.claude.ai',
-      base,
-      ...appOrigins(env),
-      ...(env.APP_ENV === 'development' ? ['http://localhost:*'] : []),
-    ],
+    trustedOrigins: authTrustedOrigins(env),
     rateLimit: {
       enabled: true,
       customRules: {
@@ -189,8 +205,16 @@ function buildAuth(env: Env) {
 }
 
 export function getAuth(env: Env): AuthInstance {
-  if (!_auth) _auth = buildAuth(env);
-  return _auth;
+  const key = authConfigurationKey(env);
+  let auth = authInstances.get(key);
+  if (!auth) {
+    // Hono may reuse and mutate its bindings object between app.request calls.
+    // Capture the config used for this cached instance so the mailer closure
+    // cannot silently follow a later request's environment.
+    auth = buildAuth({ ...env });
+    authInstances.set(key, auth);
+  }
+  return auth;
 }
 
 export async function getSessionCookie(env: Env): Promise<{

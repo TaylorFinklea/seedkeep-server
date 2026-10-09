@@ -20,6 +20,7 @@ const memoryMessages: MailMessage[] = [];
  * Mailer for this environment, or null when mail is not configured
  * (sign-in-code endpoints then return 503 mail_not_configured).
  * - 'resend' requires RESEND_API_KEY.
+ * - 'memory' is available only in development or test processes.
  * - 'log' is refused when APP_ENV is production or staging.
  * - Default when MAIL_PROVIDER is unset: 'log' in development, otherwise null.
  */
@@ -27,6 +28,7 @@ export function getMailer(env: Env): Mailer | null {
   const provider = env.MAIL_PROVIDER ?? (env.APP_ENV === 'development' ? 'log' : undefined);
   const from = env.MAIL_FROM?.trim() || 'Seedkeep <login@seedkeep.app>';
   if (provider === 'memory') {
+    if (env.APP_ENV !== 'development' && process.env.NODE_ENV !== 'test') return null;
     return { async send(message) { memoryMessages.push({ ...message }); } };
   }
   if (provider === 'log') {
@@ -43,6 +45,7 @@ export function getMailer(env: Env): Mailer | null {
         method: 'POST',
         headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ from, to: [message.to], subject: message.subject, text: message.text, ...(message.html ? { html: message.html } : {}) }),
+        signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) throw new Error(`Resend rejected email (${response.status})`);
     } };
