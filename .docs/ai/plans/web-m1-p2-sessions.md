@@ -259,7 +259,7 @@ Precedence:
    Secure outside development.
 3. `GET /api/me` with only the cookie → 200.
 4. `POST /api/households` with the cookie and `Origin: https://app.example.test`
-   → 201. The same call without Origin, or with `Origin: https://evil.test`,
+   → 200 (the existing contract). The same call without Origin, or with `Origin: https://evil.test`,
    → 403 `csrf_origin_rejected`.
 5. `GET /api/households` lists the household.
 6. With two households, `X-Household-Id` selects one. A foreign id → 403
