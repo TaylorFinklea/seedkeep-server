@@ -87,7 +87,7 @@ The script runs these steps in order, and any failure stops it before anything i
 
 1. Refuses a dirty tree. Untracked files count, so commit or remove them first.
 2. Runs `bun run typecheck`.
-3. Recreates the local `seedkeep_deploygate` database, migrates it, and runs `bun run test` and `bun test tests/integration/` against it. It overrides `DATABASE_URL`, so a remote database is never used for the gate. It requires the local Postgres from `docker compose up -d db`.
+3. Recreates the local `seedkeep_deploygate` database, migrates it, and runs `bun run test` and `bun test tests/integration/` against it. Each gate command runs under `env -i` with an explicit allowlist (`PATH`, `HOME`, the dummy CI values and the local `DATABASE_URL`). Real settings in your shell, such as `APP_ENV`, `MAIL_PROVIDER`, `RESEND_API_KEY`, `ANTHROPIC_API_KEY` or a remote `DATABASE_URL`, never reach the gate. It requires the local Postgres from `docker compose up -d db`.
 4. For production only, asks you to type `production`. Set `CONFIRM=production` to skip the prompt in automation.
 5. Runs `fly deploy --config <config> --app <app>`.
 6. Polls `/api/health` on the public host for up to 120 seconds and exits non-zero if it never reports healthy.

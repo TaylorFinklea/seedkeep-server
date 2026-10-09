@@ -89,7 +89,19 @@ const NO_MAIL_ENV: Env = { ...BASE_ENV, MAIL_PROVIDER: undefined };
 /** Same, but the Resend provider is selected (fetch is mocked per test). */
 const RESEND_ENV: Env = { ...BASE_ENV, MAIL_PROVIDER: 'resend', RESEND_API_KEY: 'ci-dummy-resend-key' };
 
-const app = createApp(WEB_ENV);
+// createApp() captures the env it was given and overwrites each request's
+// bindings with it, so every env used in a test needs its own app instance.
+type App = ReturnType<typeof createApp>;
+const apps = new Map<Env, App>();
+
+function appFor(env: Env): App {
+  let app = apps.get(env);
+  if (!app) {
+    app = createApp(env);
+    apps.set(env, app);
+  }
+  return app;
+}
 
 const cleanup = {
   userIds: new Set<string>(),
@@ -130,7 +142,7 @@ function call(env: Env, path: string, init: CallInit = {}): Promise<Response> {
   } else if (init.raw !== undefined) {
     body = init.raw;
   }
-  return app.request(path, { method: init.method ?? 'GET', headers, body }, env);
+  return appFor(env).request(path, { method: init.method ?? 'GET', headers, body }, env);
 }
 
 interface Envelope<T = unknown> {
@@ -833,5 +845,169 @@ describe('Session tokens', () => {
 
     const after = await call(WEB_ENV, '/api/me', { headers: { Cookie: user.cookie } });
     expect(after.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Security fix round
+// ─────────────────────────────────────────────────────────────────────────
+
+const SETTLE_LIMIT_MS = 10_000;
+
+/** Resolves to the value, or the sentinel if `ms` elapses first. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | 'deadline'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'deadline'>((resolve) => {
+    timer = setTimeout(() => resolve('deadline'), ms);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+function errorCodeOf(body: unknown): string | null {
+  const b = body as { error?: { code?: string }; code?: string } | null;
+  return b?.error?.code ?? b?.code ?? null;
+}
+
+describe('OTP send does not deadlock under pool pressure (a)', () => {
+  it('12 concurrent sends for 12 emails from 12 IPs all settle within 10s and /api/health still answers', async () => {
+    const requests = Array.from({ length: 12 }, () => ({ email: uniqueEmail(), ip: freshIp() }));
+
+    const started = Date.now();
+    const sends = Promise.all(
+      requests.map(async ({ email, ip }) => {
+        const res = await requestCode(WEB_ENV, email, ip);
+        const body = await res.json().catch(() => null);
+        return { status: res.status, code: errorCodeOf(body) };
+      }),
+    );
+    const outcome = await withDeadline(sends, SETTLE_LIMIT_MS);
+
+    expect(outcome).not.toBe('deadline');
+    expect(Date.now() - started).toBeLessThan(SETTLE_LIMIT_MS);
+    const results = outcome as Array<{ status: number; code: string | null }>;
+    expect(results.length).toBe(12);
+    for (const r of results) {
+      if (r.status === 200) continue;
+      expect(r.status).toBe(429);
+      expect(['otp_busy', 'rate_limited']).toContain(r.code);
+    }
+
+    const health = await call(WEB_ENV, '/api/health');
+    expect(health.status).toBe(200);
+  }, 30_000);
+});
+
+describe('Sign-in Content-Type gate (b)', () => {
+  it('form-encoded bodies under a mixed Content-Type get 415 and cannot be used to guess the code', async () => {
+    const email = uniqueEmail();
+    expect((await requestCode(WEB_ENV, email, freshIp())).status).toBe(200);
+    const code = latestCode(email);
+
+    const mixedContentType = 'application/x-www-form-urlencoded,application/json';
+
+    // 8 concurrent wrong guesses sent as form bodies under the mixed header.
+    const malformed = await Promise.all(
+      [1, 2, 3, 4, 5, 6, 7, 8].map((step) =>
+        call(WEB_ENV, '/api/auth/sign-in/email-otp', {
+          method: 'POST',
+          headers: {
+            Origin: APP_ORIGIN,
+            'Content-Type': mixedContentType,
+            'fly-client-ip': freshIp(),
+          },
+          raw: new URLSearchParams({ email, otp: wrongCode(code, step) }).toString(),
+        }),
+      ),
+    );
+    for (const res of malformed) {
+      expect(res.status).toBe(415);
+      expect(errorCodeOf(await res.json())).toBe('unsupported_media_type');
+    }
+
+    // 3 normal wrong guesses (JSON), each from its own IP.
+    for (const step of [9, 10, 11]) {
+      const res = await signInWithCode(WEB_ENV, email, wrongCode(code, step), freshIp());
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    }
+
+    // The correct code must not sign in now.
+    const correct = await signInWithCode(WEB_ENV, email, code, freshIp());
+    expect(correct.status).not.toBe(200);
+    expect(hasSessionSetCookie(correct)).toBe(false);
+  });
+});
+
+describe('Per-email send limit without a trusted IP header (c)', () => {
+  it('with no fly-client-ip, the 4th send for one email is 429 rate_limited (3 per 10 minutes)', async () => {
+    const email = uniqueEmail();
+    const send = () =>
+      call(WEB_ENV, '/api/auth/email-otp/send-verification-otp', {
+        method: 'POST',
+        headers: { Origin: APP_ORIGIN },
+        body: { email, type: 'sign-in' },
+      });
+
+    for (let i = 0; i < 3; i += 1) {
+      expect((await send()).status).toBe(200);
+    }
+    const fourth = await send();
+    expect(fourth.status).toBe(429);
+    expect(errorCodeOf(await fourth.json())).toBe('rate_limited');
+  });
+});
+
+describe('OAuth consent Origin gate (d)', () => {
+  it('POST /api/auth/oauth2/consent with a valid session cookie and a foreign Origin is 403', async () => {
+    const user = await webSignIn();
+    const res = await call(WEB_ENV, '/api/auth/oauth2/consent', {
+      method: 'POST',
+      headers: { Cookie: user.cookie, Origin: 'https://evil.test' },
+      body: { accept: true, consent_code: 'not-a-real-consent' },
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('Resend timeouts (e)', () => {
+  it('an aborted or timed-out Resend request returns 502 mail_send_failed and leaves no usable code', async () => {
+    for (const name of ['AbortError', 'TimeoutError']) {
+      const email = uniqueEmail();
+      const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+        (async () => {
+          throw new DOMException(`request ${name}`, name);
+        }) as unknown as typeof fetch,
+      );
+      let res: Response;
+      try {
+        res = await requestCode(RESEND_ENV, email, freshIp());
+      } finally {
+        fetchSpy.mockRestore();
+      }
+      expect(res.status).toBe(502);
+      expect(errorCodeOf(await res.json())).toBe('mail_send_failed');
+
+      const rows = await sql.unsafe<{ n: number }[]>(
+        `SELECT count(*)::int AS n FROM verification WHERE identifier = $1`,
+        [`sign-in-otp-${email}`],
+      );
+      expect(rows[0]!.n).toBe(0);
+    }
+  });
+});
+
+describe('Memory mailer refused outside test (f)', () => {
+  it('APP_ENV production with MAIL_PROVIDER memory and NODE_ENV not test gives 503 mail_not_configured', async () => {
+    const PROD_MEMORY_ENV: Env = { ...BASE_ENV, APP_ENV: 'production', MAIL_PROVIDER: 'memory' };
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    let res: Response;
+    try {
+      res = await requestCode(PROD_MEMORY_ENV, uniqueEmail(), freshIp());
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
+    expect(res.status).toBe(503);
+    expect(errorCodeOf(await res.json())).toBe('mail_not_configured');
   });
 });
