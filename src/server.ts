@@ -7,8 +7,10 @@
 import { loadEnv } from './env';
 import { createApp } from './index';
 import { closeDb } from './db/client';
+import { validateWebConfig } from './lib/auth';
 
 const env = loadEnv();
+validateWebConfig(env);
 const app = createApp(env);
 
 const server = Bun.serve({

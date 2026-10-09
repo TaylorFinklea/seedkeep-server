@@ -1,7 +1,9 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../index';
-import { getAuth } from '../lib/auth';
+import { finalizeMailSendFailure, getAuth, getSessionCookie } from '../lib/auth';
+import { getMailer } from '../lib/mail';
+import { isAllowedAppOrigin } from '../lib/web/origins';
 import { requireAuth } from '../middleware/auth';
 import { dbGet, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
@@ -61,7 +63,54 @@ const deleteAccountBody = z
  */
 authRoutes.all('/auth/*', async (c) => {
   const auth = getAuth(c.env);
-  return auth.handler(c.req.raw);
+  const request = c.req.raw;
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/^\/api\/auth/, '') || '/';
+  const unsafe = !['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase());
+  const oauthServerPath = path.startsWith('/oauth2/') || path.startsWith('/mcp/');
+  const cookie = await getSessionCookie(c.env);
+  const cookiePresent = (request.headers.get('cookie') ?? '').split(';')
+    .some((part) => part.trim().startsWith(`${cookie.name}=`));
+
+  if (unsafe && !oauthServerPath) {
+    const origin = request.headers.get('origin');
+    if (origin ? !isAllowedAppOrigin(c.env, origin) : cookiePresent) {
+      return c.json({ ok: false, error: { code: 'csrf_origin_rejected', message: 'Request Origin is not allowed' } }, 403);
+    }
+  }
+
+  let body: Record<string, unknown> | undefined;
+  if (path === '/email-otp/send-verification-otp' || path === '/sign-in/email-otp') {
+    body = await request.clone().json().catch(() => undefined) as Record<string, unknown> | undefined;
+  }
+  if (path === '/email-otp/send-verification-otp') {
+    if (body?.type !== 'sign-in') {
+      return c.json({ ok: false, error: { code: 'bad_request', message: 'Only sign-in codes are supported' } }, 400);
+    }
+    if (!getMailer(c.env)) {
+      return c.json({ ok: false, error: { code: 'mail_not_configured', message: 'Email sign-in is not configured' } }, 503);
+    }
+  }
+
+  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const serializedOTP = email && (path === '/email-otp/send-verification-otp' || path === '/sign-in/email-otp');
+  if (!serializedOTP) return auth.handler(request);
+
+  const connection = await getSql(c.env).reserve();
+  try {
+    await connection.unsafe('SELECT pg_advisory_lock(hashtext($1))', [`otp:${email}`]);
+    const response = await auth.handler(request);
+    const mailFailed = path === '/email-otp/send-verification-otp'
+      && await finalizeMailSendFailure(request, email, (identifier) =>
+        connection.unsafe('DELETE FROM verification WHERE identifier = $1', [identifier]));
+    if (mailFailed) {
+      return c.json({ ok: false, error: { code: 'mail_send_failed', message: 'Could not send sign-in code' } }, 502);
+    }
+    return response;
+  } finally {
+    await connection.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [`otp:${email}`]).catch(() => undefined);
+    connection.release();
+  }
 });
 
 /**

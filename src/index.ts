@@ -24,6 +24,7 @@ import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
 import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
 import { adminRoutes } from './routes/admin';
 import { accountDeletionTransferRoutes } from './routes/account-deletion-transfers';
+import { isAllowedAppOrigin } from './lib/web/origins';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -54,13 +55,12 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.use('*', cors({
     origin: (origin) => {
       if (!origin) return origin;
-      if (origin.startsWith('http://localhost:')) return origin;
-      return null;
+      return isAllowedAppOrigin(env, origin) ? origin : null;
     },
     credentials: true,
-    allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization'],
-    exposeHeaders: ['x-request-id'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Household-Id', 'If-Match'],
+    exposeHeaders: ['x-request-id', 'ETag'],
   }));
 
   app.use('*', envelope());

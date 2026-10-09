@@ -14,6 +14,8 @@ export interface Mailer {
   send(message: MailMessage): Promise<void>;
 }
 
+const memoryMessages: MailMessage[] = [];
+
 /**
  * Mailer for this environment, or null when mail is not configured
  * (sign-in-code endpoints then return 503 mail_not_configured).
@@ -22,14 +24,36 @@ export interface Mailer {
  * - Default when MAIL_PROVIDER is unset: 'log' in development, otherwise null.
  */
 export function getMailer(env: Env): Mailer | null {
-  void env;
+  const provider = env.MAIL_PROVIDER ?? (env.APP_ENV === 'development' ? 'log' : undefined);
+  const from = env.MAIL_FROM?.trim() || 'Seedkeep <login@seedkeep.app>';
+  if (provider === 'memory') {
+    return { async send(message) { memoryMessages.push({ ...message }); } };
+  }
+  if (provider === 'log') {
+    if (env.APP_ENV === 'production' || env.APP_ENV === 'staging') return null;
+    return { async send(message) {
+      console.info(`[mail:dev] to=${message.to} subject=${message.subject} text=${message.text}`);
+    } };
+  }
+  if (provider === 'resend') {
+    const key = env.RESEND_API_KEY?.trim();
+    if (!key) return null;
+    return { async send(message) {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to: [message.to], subject: message.subject, text: message.text, ...(message.html ? { html: message.html } : {}) }),
+      });
+      if (!response.ok) throw new Error(`Resend rejected email (${response.status})`);
+    } };
+  }
   return null;
 }
 
 /** Test helper: messages captured by the 'memory' provider, newest last. */
 export function sentMail(): readonly MailMessage[] {
-  return [];
+  return memoryMessages.map((message) => ({ ...message }));
 }
 
 /** Test helper: clear captured messages. */
-export function clearSentMail(): void {}
+export function clearSentMail(): void { memoryMessages.length = 0; }

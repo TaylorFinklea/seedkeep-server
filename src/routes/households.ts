@@ -49,6 +49,19 @@ const createHouseholdSchema = z.object({
 
 const LocationBody = z.object({ zip: z.string().regex(/^\d{5}$/) });
 
+householdRoutes.get('/households', authOnly, async (c) => {
+  const rows = await dbAll<{ id: string; name: string; role: 'owner' | 'member'; joined_at: number }>(
+    getSql(c.env),
+    `SELECT h.id, h.name, m.role, m.joined_at
+       FROM memberships m
+       JOIN households h ON h.id = m.household_id
+      WHERE m.user_id = $1 AND h.deleted_at IS NULL
+      ORDER BY m.joined_at DESC`,
+    [c.get('userId')],
+  );
+  return c.json({ ok: true, data: { households: rows } });
+});
+
 interface ZipLocationRow {
   zip: string;
   latitude: number;
