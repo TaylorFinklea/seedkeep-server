@@ -167,7 +167,7 @@ function buildAuth(env: Env) {
               subject: 'Your Seedkeep sign-in code',
               text: `Your Seedkeep sign-in code is ${otp}. It expires in 5 minutes. If you didn't ask for it, ignore this email.`,
               html: `<p>Your Seedkeep sign-in code is <strong>${otp}</strong>.</p><p>It expires in 5 minutes. If you didn't ask for it, ignore this email.</p>`,
-            });
+            }, ctx?.request?.signal);
           } catch {
             if (ctx?.request) {
               await removeFailedOTPVerification(ctx.request, () =>

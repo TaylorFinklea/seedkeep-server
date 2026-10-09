@@ -4,10 +4,10 @@ import type { AppEnv } from '../index';
 import { finalizeMailSendFailure, getAuth, getSessionCookie, publicBaseURL } from '../lib/auth';
 import { getMailer } from '../lib/mail';
 import { isAllowedAppOrigin } from '../lib/web/origins';
-import { getBunSocketIP, isJSONMediaType, makeOTPRequest, normalizeOTPEmail, OTPFixedWindowLimiter, withOTPAdvisoryLock } from '../lib/web/otpSecurity';
+import { getBunSocketIP, isJSONMediaType, isValidOTPEmail, makeOTPRequest, normalizeOTPEmail, OTPFixedWindowLimiter, otpSendRateLimits, otpSignInFailureRateLimits, parseLimitedJSONBody, settleOTPSignInAttempt, withOTPAdvisoryLock } from '../lib/web/otpSecurity';
 import { requireAuth } from '../middleware/auth';
 import { dbGet, isUniqueViolation } from '../db/helpers';
-import { getOTPLockSql, getSql } from '../db/client';
+import { discardOTPLockSql, getOTPLockSql, getSql } from '../db/client';
 import { deletePhoto } from '../lib/storage';
 import { TRANSFER_PHASE_SOURCE_DELETED } from './account-deletion-transfers';
 
@@ -100,13 +100,17 @@ authRoutes.all('/auth/*', async (c) => {
   if (!isJSONMediaType(request.headers.get('content-type'))) {
     return c.json({ ok: false, error: { code: 'unsupported_media_type', message: 'OTP endpoints require application/json' } }, 415);
   }
-  const parsedBody = await request.json().catch(() => null) as unknown;
+  const parsed = await parseLimitedJSONBody(request);
+  if (!parsed.ok && parsed.reason === 'too_large') {
+    return c.json({ ok: false, error: { code: 'body_too_large' } }, 413);
+  }
+  const parsedBody = parsed.ok ? parsed.value : null;
   if (!parsedBody || typeof parsedBody !== 'object' || Array.isArray(parsedBody)) {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'A JSON object is required' } }, 400);
   }
   const body = parsedBody as Record<string, unknown>;
-  if (typeof body.email !== 'string' || body.email.length === 0) {
-    return c.json({ ok: false, error: { code: 'bad_request', message: 'A non-empty email is required' } }, 400);
+  if (typeof body.email !== 'string' || !isValidOTPEmail(body.email)) {
+    return c.json({ ok: false, error: { code: 'invalid_email' } }, 400);
   }
   const email = normalizeOTPEmail(body.email);
   if (path === '/email-otp/send-verification-otp') {
@@ -123,20 +127,29 @@ authRoutes.all('/auth/*', async (c) => {
   const clientIP = trustedIPHeader
     ? request.headers.get(trustedIPHeader)?.trim() || 'unknown'
     : getBunSocketIP(c.env, request) || 'unknown';
-  otpRateLimiter.prune();
-  const rate = otpRateLimiter.consumeMany([
-    { key: `otp:${path}:email:${email}`, max: send ? 3 : 10, windowMs: 10 * 60_000 },
-    { key: `otp:${path}:ip:${clientIP}`, max: send ? 3 : 10, windowMs: 60_000 },
-  ]);
+  const attemptKeys = otpSignInFailureRateLimits(email, clientIP);
+  // Each code allows 3 guesses; sign-in requests allow at most 30 failed
+  // guesses per email per 10 minutes and 10 per email/IP pair.
+  const rate = send
+    ? otpRateLimiter.consumeMany(otpSendRateLimits(email, clientIP))
+    : otpRateLimiter.checkMany(attemptKeys);
   if (!rate.allowed) {
     return c.json({ ok: false, error: { code: 'rate_limited', retry_after_seconds: rate.retryAfterSeconds } }, 429);
   }
 
-  const processedRequest = makeOTPRequest(request, body, trustedIPHeader);
   const lockSql = getOTPLockSql(c.env);
-  const outcome = await withOTPAdvisoryLock(
+  let outcome;
+  try {
+    outcome = await withOTPAdvisoryLock(
     async () => {
       const connection = await lockSql.reserve();
+      try {
+        await connection.unsafe("SET statement_timeout = '3s'");
+        await connection.unsafe("SET lock_timeout = '3s'");
+      } catch (error) {
+        await discardOTPLockSql(c.env);
+        throw error;
+      }
       return {
         tryLock: async () => {
           const result = await connection.unsafe<{ locked: boolean }[]>(
@@ -144,13 +157,24 @@ authRoutes.all('/auth/*', async (c) => {
           );
           return Boolean(result[0]?.locked);
         },
-        unlock: async () => { await connection.unsafe('SELECT pg_advisory_unlock(hashtext($1))', [`otp:${email}`]); },
+        unlock: async () => {
+          const result = await connection.unsafe<{ unlocked: boolean }[]>(
+            'SELECT pg_advisory_unlock(hashtext($1)) AS unlocked', [`otp:${email}`],
+          );
+          if (!result[0]?.unlocked) {
+            await connection.unsafe('SELECT pg_advisory_unlock_all()');
+            throw new Error('OTP advisory lock was not held at unlock');
+          }
+        },
         release: () => connection.release(),
+        discard: async () => { await discardOTPLockSql(c.env); },
         deleteVerification: (identifier: string) => connection.unsafe('DELETE FROM verification WHERE identifier = $1', [identifier]),
       };
     },
-    async (connection) => {
+    async (connection, signal) => {
+      const processedRequest = makeOTPRequest(request, body, trustedIPHeader, signal);
       const response = await auth.handler(processedRequest);
+      if (!send) settleOTPSignInAttempt(otpRateLimiter, email, attemptKeys, response.status);
       const mailFailed = send
         && await finalizeMailSendFailure(processedRequest, email, (identifier) =>
           connection.deleteVerification(identifier));
@@ -159,8 +183,13 @@ authRoutes.all('/auth/*', async (c) => {
       }
       return response;
     },
-  );
+    { maxWaitMs: 2_000, handlerTimeoutMs: 15_000 },
+    );
+  } catch {
+    return c.json({ ok: false, error: { code: 'otp_unavailable' } }, 503);
+  }
   if (!outcome.acquired) {
+    if (outcome.timedOut) return c.json({ ok: false, error: { code: 'otp_unavailable' } }, 503);
     return c.json({ ok: false, error: { code: 'otp_busy' } }, 429);
   }
   return outcome.value;

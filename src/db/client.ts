@@ -13,13 +13,14 @@ import type { Env } from '../env';
  * signal handler.
  */
 
-let _sql: Sql | null = null;
-let _kysely: Kysely<Record<string, never>> | null = null;
-let _otpLockSql: Sql | null = null;
+const sqlByDatabaseURL = new Map<string, Sql>();
+const kyselyByDatabaseURL = new Map<string, Kysely<Record<string, never>>>();
+const otpLockSqlByDatabaseURL = new Map<string, Sql>();
 
 export function getSql(env: Env): Sql {
-  if (_sql) return _sql;
-  _sql = postgres(env.DATABASE_URL, {
+  const existing = sqlByDatabaseURL.get(env.DATABASE_URL);
+  if (existing) return existing;
+  const sql = postgres(env.DATABASE_URL, {
     max: 10,
     // postgres.js defaults to camelCase column transform — disable so our
     // snake_case schema deserializes literally.
@@ -49,18 +50,29 @@ export function getSql(env: Env): Sql {
     },
     onnotice: () => { /* silence Postgres NOTICE messages */ },
   });
-  return _sql;
+  sqlByDatabaseURL.set(env.DATABASE_URL, sql);
+  return sql;
 }
 
 /** Separate, small pool for session-level OTP advisory locks. */
 export function getOTPLockSql(env: Env): Sql {
-  if (_otpLockSql) return _otpLockSql;
-  _otpLockSql = postgres(env.DATABASE_URL, {
-    max: 3,
+  const existing = otpLockSqlByDatabaseURL.get(env.DATABASE_URL);
+  if (existing) return existing;
+  const sql = postgres(env.DATABASE_URL, {
+    max: 5,
+    connect_timeout: 3,
     transform: { undefined: null },
     onnotice: () => { /* silence Postgres NOTICE messages */ },
   });
-  return _otpLockSql;
+  otpLockSqlByDatabaseURL.set(env.DATABASE_URL, sql);
+  return sql;
+}
+
+/** End and forget the lock pool after an unlock failure so no poisoned session can be reused. */
+export async function discardOTPLockSql(env: Env): Promise<void> {
+  const sql = otpLockSqlByDatabaseURL.get(env.DATABASE_URL);
+  otpLockSqlByDatabaseURL.delete(env.DATABASE_URL);
+  await sql?.end({ timeout: 0 });
 }
 
 /**
@@ -71,19 +83,21 @@ export function getOTPLockSql(env: Env): Sql {
  * because better-auth manages its own table types internally.
  */
 export function getKysely(env: Env): Kysely<Record<string, never>> {
-  if (_kysely) return _kysely;
-  _kysely = new Kysely({
+  const existing = kyselyByDatabaseURL.get(env.DATABASE_URL);
+  if (existing) return existing;
+  const kysely = new Kysely<Record<string, never>>({
     dialect: new PostgresJSDialect({ postgres: getSql(env) }),
   });
-  return _kysely;
+  kyselyByDatabaseURL.set(env.DATABASE_URL, kysely);
+  return kysely;
 }
 
 /** Close pooled connections. Call from a SIGINT/SIGTERM handler. */
 export async function closeDb(): Promise<void> {
-  await _kysely?.destroy();
-  await _sql?.end({ timeout: 5 });
-  await _otpLockSql?.end({ timeout: 5 });
-  _kysely = null;
-  _sql = null;
-  _otpLockSql = null;
+  await Promise.all([...kyselyByDatabaseURL.values()].map((kysely) => kysely.destroy()));
+  await Promise.all([...sqlByDatabaseURL.values()].map((sql) => sql.end({ timeout: 5 })));
+  await Promise.all([...otpLockSqlByDatabaseURL.values()].map((sql) => sql.end({ timeout: 5 })));
+  kyselyByDatabaseURL.clear();
+  sqlByDatabaseURL.clear();
+  otpLockSqlByDatabaseURL.clear();
 }

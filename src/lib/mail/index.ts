@@ -11,7 +11,7 @@ export interface MailMessage {
 
 export interface Mailer {
   /** Resolves when the provider accepted the message; rejects otherwise. */
-  send(message: MailMessage): Promise<void>;
+  send(message: MailMessage, signal?: AbortSignal): Promise<void>;
 }
 
 const memoryMessages: MailMessage[] = [];
@@ -40,12 +40,12 @@ export function getMailer(env: Env): Mailer | null {
   if (provider === 'resend') {
     const key = env.RESEND_API_KEY?.trim();
     if (!key) return null;
-    return { async send(message) {
+    return { async send(message, signal) {
       const response = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ from, to: [message.to], subject: message.subject, text: message.text, ...(message.html ? { html: message.html } : {}) }),
-        signal: AbortSignal.timeout(10_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000),
       });
       if (!response.ok) throw new Error(`Resend rejected email (${response.status})`);
     } };
