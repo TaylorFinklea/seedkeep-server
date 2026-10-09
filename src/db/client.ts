@@ -68,13 +68,6 @@ export function getOTPLockSql(env: Env): Sql {
   return sql;
 }
 
-/** End and forget the lock pool after an unlock failure so no poisoned session can be reused. */
-export async function discardOTPLockSql(env: Env): Promise<void> {
-  const sql = otpLockSqlByDatabaseURL.get(env.DATABASE_URL);
-  otpLockSqlByDatabaseURL.delete(env.DATABASE_URL);
-  await sql?.end({ timeout: 0 });
-}
-
 /**
  * Kysely instance over the same `postgres.js` connection. Used only by
  * better-auth's adapter; route handlers should prefer the raw helpers.
