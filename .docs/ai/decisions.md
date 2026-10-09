@@ -2,6 +2,26 @@
 
 > Architecture decision records. Append-only — one entry per decision.
 
+## [2026-10-09] Browser sessions: email one-time codes, host-only cookies, exact-Origin CSRF
+
+**Context**: The web app replaces the iOS app (umbrella decision 2026-10-09). Browsers need a sign-in method that doesn't depend on the Apple Developer membership. They also need sessions that work with `<img>` and that resist CSRF, while native Bearer clients keep working. Spec: `plans/web-m1-p2-sessions.md`.
+
+**Decision**:
+- **Sign-in:** better-auth `emailOTP`, sign-in type only. Every other emailOTP path is in `disabledPaths`. Mail goes through Resend in staging and production; log and memory mailers are for development and tests only.
+- **Sessions:** better-auth's default session cookie, host-only on the API host (`__Secure-` prefix, HttpOnly, SameSite=Lax). `__Host-` isn't achievable because better-auth prefixes custom names.
+- **`requireAuth` precedence:** a present Bearer header never falls back to the cookie. Bearer and cookie naming different users → 401.
+- **Origin gate:** cookie-authenticated unsafe requests need an exact `APP_ORIGINS` Origin. This applies to `/api/auth/*` (except cookie-free OAuth token, registration and userinfo paths) and to the API's own OAuth pages, which need the API origin.
+- **CORS:** credentialed and exact; localhost only outside production; PUT allowed.
+- **Explicit household:** `X-Household-Id` selects one, with membership checked.
+- **OTP handling:**
+  - Strict JSON on the OTP paths, with the request rebuilt before better-auth sees it.
+  - Serialized per email by a Postgres advisory lock on a dedicated lock pool. Try-lock with bounded waits; the lock is held until the handler settles.
+  - In-process limiters that never skip: per IP, per email, and failures per (email, IP). The client IP comes from `fly-client-ip` only when `FLY_APP_NAME` is set.
+
+**Accepted residual risk**: anyone can use up one address's send budget (5 codes per 10 minutes) and so delay that user's sign-in. The guessing budget is negligible: at most 5 codes × 3 attempts per 10 minutes against a 6-digit code. CAPTCHA or proof-of-work would be the mitigation if abuse appears. Limits are per machine.
+
+**Review**: Opus 5.5 and GPT-6.1 Sol found and confirmed, across rounds, an unauthenticated pool-exhaustion deadlock, an OTP lock bypass through a mixed Content-Type, a rate-limiter bypass without `fly-client-ip`, OAuth login CSRF, limiter memory exhaustion, and lock-lifetime hazards. All were fixed with regression tests.
+
 ## [2026-07-16] R1 garden-tool kill switch: fail closed at the Sprout + MCP boundaries
 
 **Context**: Implements the umbrella ADR "R1 fails closed at the server boundary for all garden tools, including already-issued Sprout/MCP credentials" (`~/git/seedkeep/.docs/ai/decisions.md`, 2026-07-16) and bead `seedkeep-27d.9`. The iOS gate hides in-app Sprout/MCP routes, but credentials already pasted into Claude Desktop or claude.ai never pass through iOS again — `/mcp` would still resolve those tokens against the user's (possibly parked) Postgres household and register the full read/write tool set.
