@@ -1017,3 +1017,93 @@ describe('Memory mailer refused outside test (f)', () => {
     expect(errorCodeOf(await res.json())).toBe('mail_not_configured');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 2 final hardening
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('OTP request validation', () => {
+  it('an overlong email (300 characters) is 400 invalid_email', async () => {
+    const email = `${'a'.repeat(290)}@example.invalid`;
+    expect(email.length).toBe(306);
+    const res = await requestCode(WEB_ENV, email, freshIp());
+    expect(res.status).toBe(400);
+    expect(errorCodeOf(await res.json())).toBe('invalid_email');
+  });
+
+  it('a request body over 4 KiB is 413', async () => {
+    const res = await call(WEB_ENV, '/api/auth/email-otp/send-verification-otp', {
+      method: 'POST',
+      headers: { Origin: APP_ORIGIN, 'Content-Type': 'application/json', 'fly-client-ip': freshIp() },
+      raw: JSON.stringify({ email: uniqueEmail(), type: 'sign-in', pad: 'x'.repeat(5000) }),
+    });
+    expect(res.status).toBe(413);
+  });
+});
+
+describe('Per-email send cap (5 per 10 minutes)', () => {
+  it('from six different fly-client-ip values, the 6th send to one email is 429 rate_limited', async () => {
+    const email = uniqueEmail();
+    for (let i = 0; i < 5; i += 1) {
+      const res = await requestCode(WEB_ENV, email, freshIp());
+      expect(res.status).toBe(200);
+    }
+    const sixth = await requestCode(WEB_ENV, email, freshIp());
+    expect(sixth.status).toBe(429);
+    expect(errorCodeOf(await sixth.json())).toBe('rate_limited');
+  });
+});
+
+describe('Failed sign-in budget is per (email, IP) (3)', () => {
+  it('three wrong guesses from one IP do not lock out a correct sign-in with a new code from a fresh IP', async () => {
+    const email = uniqueEmail();
+    const firstIp = freshIp();
+    expect((await requestCode(WEB_ENV, email, firstIp)).status).toBe(200);
+    const firstCode = latestCode(email);
+
+    for (const step of [1, 2, 3]) {
+      const res = await signInWithCode(WEB_ENV, email, wrongCode(firstCode, step), firstIp);
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(hasSessionSetCookie(res)).toBe(false);
+    }
+
+    // Request a new code, then sign in from a different IP.
+    const secondIp = freshIp();
+    expect((await requestCode(WEB_ENV, email, secondIp)).status).toBe(200);
+    const newCode = latestCode(email);
+    const ok = await signInWithCode(WEB_ENV, email, newCode, freshIp());
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { user: { id: string } };
+    cleanup.userIds.add(body.user.id);
+    expect(hasSessionSetCookie(ok)).toBe(true);
+  });
+});
+
+describe('Concurrent sends from distinct clients (4)', () => {
+  it('20 concurrent sends to 20 emails from 20 IPs settle within 10s as 200 or 429 otp_busy, and health answers', async () => {
+    const requests = Array.from({ length: 20 }, () => ({ email: uniqueEmail(), ip: freshIp() }));
+
+    const started = Date.now();
+    const sends = Promise.all(
+      requests.map(async ({ email, ip }) => {
+        const res = await requestCode(WEB_ENV, email, ip);
+        const body = await res.json().catch(() => null);
+        return { status: res.status, code: errorCodeOf(body) };
+      }),
+    );
+    const outcome = await withDeadline(sends, SETTLE_LIMIT_MS);
+
+    expect(outcome).not.toBe('deadline');
+    expect(Date.now() - started).toBeLessThan(SETTLE_LIMIT_MS);
+    const results = outcome as Array<{ status: number; code: string | null }>;
+    expect(results.length).toBe(20);
+    for (const r of results) {
+      if (r.status === 200) continue;
+      expect(r.status).toBe(429);
+      expect(r.code).toBe('otp_busy');
+    }
+
+    const health = await call(WEB_ENV, '/api/health');
+    expect(health.status).toBe(200);
+  }, 30_000);
+});
