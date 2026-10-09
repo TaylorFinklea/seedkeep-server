@@ -28,6 +28,28 @@ const schema = z.object({
     .default(false)
     .transform((v) => v === true || v === 'true'),
 
+  // Public URL clients use to reach this server (OAuth issuer, better-auth
+  // baseURL). Defaults per APP_ENV: production → https://seedkeep-server.fly.dev
+  // (unchanged OAuth issuer), development → http://localhost:PORT. Required
+  // for staging (enforced in publicBaseURL()).
+  PUBLIC_BASE_URL: z.url().optional(),
+
+  // Exact web-app origins allowed to call this API with cookies, comma
+  // separated, e.g. "https://app.seedkeep.app". Used for CORS, better-auth
+  // trustedOrigins, and the CSRF Origin gate. Development additionally
+  // allows http://localhost:* origins.
+  // Parsed by appOrigins() in src/lib/web/origins.ts.
+  APP_ORIGINS: z.string().optional(),
+
+  // Transactional mail for email one-time sign-in codes.
+  // 'log' prints codes to the server log (development only); 'memory' keeps
+  // them in-process for tests; 'resend' sends via Resend's HTTP API.
+  MAIL_PROVIDER: z.enum(['resend', 'log', 'memory']).optional(),
+  // Trimmed by the mailer; blank means unset.
+  RESEND_API_KEY: z.string().optional(),
+  // Default sender (applied in src/lib/mail): 'Seedkeep <login@seedkeep.app>'.
+  MAIL_FROM: z.string().optional(),
+
   // Auth
   BETTER_AUTH_SECRET: z.string().min(16),
   APPLE_CLIENT_ID: z.string().min(1),

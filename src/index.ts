@@ -35,6 +35,8 @@ export type AppEnv = {
   Variables: {
     userId: string;
     householdId: string;
+    /** How requireAuth() authenticated this request. Cookie requests passed the CSRF Origin gate. */
+    authMethod: 'bearer' | 'cookie';
   };
 };
 
