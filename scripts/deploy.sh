@@ -61,18 +61,36 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-# ── 2. Gate: typecheck ───────────────────────────────────────────────────
-echo "[deploy] typecheck..."
-bun run typecheck
-
-# ── 3. Gate: tests against an isolated local database ────────────────────
+# ── 2. Gate ──────────────────────────────────────────────────────────────
 # Local development credentials only (same as docker-compose and CI). These
 # never point at a remote host.
 GATE_ADMIN_URL="postgres://seedkeep:dev-only@localhost:5432/postgres"
 GATE_DB_URL="postgres://seedkeep:dev-only@localhost:5432/seedkeep_deploygate"
 
+# Every gate command runs under `env -i` with an explicit allowlist. Nothing
+# else from the calling shell reaches the gate: no APP_ENV, MAIL_PROVIDER,
+# RESEND_API_KEY, ANTHROPIC_API_KEY, or a remote DATABASE_URL. The secret-like
+# values are dummies, as in CI. No gate test contacts S3, Apple, Anthropic or
+# Resend.
+gate() {
+  env -i \
+    PATH="$PATH" \
+    HOME="$HOME" \
+    DATABASE_URL="$GATE_DB_URL" \
+    S3_ACCESS_KEY_ID="ci-dummy-key" \
+    S3_SECRET_ACCESS_KEY="ci-dummy-secret" \
+    S3_BUCKET="ci-dummy-bucket" \
+    BETTER_AUTH_SECRET="ci-better-auth-secret-32chars-xxxxx" \
+    APPLE_CLIENT_ID="ci-apple-client" \
+    APPLE_CLIENT_SECRET="ci-apple-secret" \
+    "$@"
+}
+
+echo "[deploy] typecheck..."
+gate bun run typecheck
+
 echo "[deploy] recreating local database seedkeep_deploygate..."
-GATE_ADMIN_URL="$GATE_ADMIN_URL" bun -e '
+env -i PATH="$PATH" HOME="$HOME" GATE_ADMIN_URL="$GATE_ADMIN_URL" bun -e '
   import postgres from "postgres";
   const sql = postgres(process.env.GATE_ADMIN_URL, { max: 1, onnotice: () => {} });
   try {
@@ -83,24 +101,14 @@ GATE_ADMIN_URL="$GATE_ADMIN_URL" bun -e '
   }
 '
 
-# Dummy values for required env vars, as in CI. No gate test contacts S3,
-# Apple, or Anthropic.
-export DATABASE_URL="$GATE_DB_URL"
-export S3_ACCESS_KEY_ID="ci-dummy-key"
-export S3_SECRET_ACCESS_KEY="ci-dummy-secret"
-export S3_BUCKET="ci-dummy-bucket"
-export BETTER_AUTH_SECRET="ci-better-auth-secret-32chars-xxxxx"
-export APPLE_CLIENT_ID="ci-apple-client"
-export APPLE_CLIENT_SECRET="ci-apple-secret"
-
 echo "[deploy] migrating seedkeep_deploygate..."
-bun run migrate
+gate bun run migrate
 
 echo "[deploy] unit tests (vitest)..."
-bun run test
+gate bun run test
 
 echo "[deploy] integration tests..."
-bun test tests/integration/
+gate bun test tests/integration/
 
 echo "[deploy] gate passed."
 
