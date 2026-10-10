@@ -284,6 +284,7 @@ mcpTransportRoutes.all('/mcp', async (c) => {
     householdId,
     scopes: oauthScopes,
     gardenToolsEnabled: c.env.GARDEN_TOOLS_ENABLED,
+    env: c.env,
   });
 
   // Stateless streamable HTTP transport. New session per request, no

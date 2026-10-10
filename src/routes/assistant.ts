@@ -649,7 +649,7 @@ assistantRoutes.post('/tool_calls/:id/confirm', ...auth, async (c) => {
     } catch {
       storedWas = undefined;
     }
-    applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId }, storedWas);
+    applyResult = await executeProposedChange(tc.tool_name, args, { sql, householdId, env: c.env }, storedWas);
     now = Date.now();
     await dbRun(sql,
       `UPDATE assistant_tool_calls

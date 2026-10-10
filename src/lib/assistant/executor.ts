@@ -12,6 +12,8 @@ import { nanoid } from 'nanoid';
 import type { getSql } from '../../db/client';
 import { dbGet, dbAll, dbRun, type Queryable } from '../../db/helpers';
 import { validateToolArgs, TOOL_REGISTRY, type ToolName } from './tools';
+import type { Env } from '../../env';
+import { deletePhoto } from '../storage';
 
 /// Safe JSON.parse for TEXT-stored JSON payloads (pet_personality,
 /// goodbye_note). Returns null on any error — these blobs are written by
@@ -38,6 +40,8 @@ export interface ToolExecutionContext {
   sql: ReturnType<typeof getSql>;
   householdId: string;
   clientPetState?: Record<string, ClientPetStateEntry>;
+  /** Storage config; when present, photo objects removed by destructive tools are deleted after commit. */
+  env?: Env;
 }
 
 export interface ToolExecutionResult {
@@ -540,9 +544,19 @@ interface ProposedChange {
   becomes: unknown;
 }
 
-async function removeJournalChildren(tx: Queryable, householdId: string, entryIds: string[]): Promise<void> {
+async function removeJournalChildren(
+  tx: Queryable,
+  householdId: string,
+  entryIds: string[],
+  photoKeys: string[],
+): Promise<void> {
   if (!entryIds.length) return;
-  await dbRun(tx, `DELETE FROM journal_entry_photos WHERE household_id = $1 AND entry_id = ANY($2)`, [householdId, entryIds]);
+  const photos = await dbAll<{ storage_key: string }>(
+    tx,
+    `DELETE FROM journal_entry_photos WHERE household_id = $1 AND entry_id = ANY($2) RETURNING storage_key`,
+    [householdId, entryIds],
+  );
+  photoKeys.push(...photos.map((p) => p.storage_key));
   await dbRun(tx, `DELETE FROM journal_checklist_items WHERE entry_id = ANY($1)`, [entryIds]);
 }
 
@@ -637,6 +651,23 @@ async function applyDestructive(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext,
 ): Promise<unknown> {
+  // Photo rows are hard-deleted inside the transaction; their objects are
+  // removed best-effort only after it commits (a rollback keeps them).
+  const photoKeys: string[] = [];
+  const result = await applyDestructiveTx(name, args, ctx, photoKeys);
+  if (ctx.env && photoKeys.length) {
+    const env = ctx.env;
+    await Promise.allSettled(photoKeys.map((key) => deletePhoto(env, key)));
+  }
+  return result;
+}
+
+async function applyDestructiveTx(
+  name: ToolName,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext,
+  photoKeys: string[],
+): Promise<unknown> {
   const { sql, householdId } = ctx;
   const now = Date.now();
 
@@ -725,7 +756,7 @@ async function applyDestructive(
           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
         await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
-        await removeJournalChildren(tx, householdId, entryIds);
+        await removeJournalChildren(tx, householdId, entryIds, photoKeys);
       });
       return { deleted_id: args.id };
     }
@@ -736,7 +767,7 @@ async function applyDestructive(
         if (!current) return;
         await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
-        await removeJournalChildren(tx, householdId, [String(args.id)]);
+        await removeJournalChildren(tx, householdId, [String(args.id)], photoKeys);
       });
       return { deleted_id: args.id };
     }
@@ -756,8 +787,13 @@ async function applyDestructive(
           WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, eventIds, householdId]);
         await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
-        await dbRun(tx, `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [args.id, householdId]);
-        await removeJournalChildren(tx, householdId, entryIds);
+        const seedPhotos = await dbAll<{ r2_key: string }>(
+          tx,
+          `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2 RETURNING r2_key`,
+          [args.id, householdId],
+        );
+        photoKeys.push(...seedPhotos.map((p) => p.r2_key));
+        await removeJournalChildren(tx, householdId, entryIds, photoKeys);
       });
       return { deleted_id: args.id };
     }
@@ -777,7 +813,7 @@ async function applyDestructive(
           WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, eventIds, householdId]);
         await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
-        await removeJournalChildren(tx, householdId, entryIds);
+        await removeJournalChildren(tx, householdId, entryIds, photoKeys);
       });
       return { deleted_id: args.id };
     }

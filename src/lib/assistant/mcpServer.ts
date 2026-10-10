@@ -25,6 +25,7 @@ import {
 } from './executor';
 import type { ToolDef } from './tools';
 import { isMcpToolAllowed } from './mcpScopes';
+import type { Env } from '../../env';
 
 /**
  * Build a fully-configured MCP server scoped to a single household.
@@ -74,8 +75,10 @@ export function buildMcpServer(args: {
   householdId: string;
   scopes?: ReadonlySet<string>;
   gardenToolsEnabled: boolean;
+  /** Storage config so destructive tools can delete photo objects after commit. */
+  env?: Env;
 }): McpServer {
-  const { sql, householdId, scopes, gardenToolsEnabled } = args;
+  const { sql, householdId, scopes, gardenToolsEnabled, env } = args;
 
   const server = new McpServer(
     { name: 'seedkeep', version: '1.0.0' },
@@ -109,7 +112,7 @@ export function buildMcpServer(args: {
         inputSchema: zodSchemaShape(def.schema),
       },
       async (rawArgs: unknown) => {
-        const ctx = { sql, householdId };
+        const ctx = { sql, householdId, env };
         const result = await executeMcpTool({ def, rawArgs, ctx, scopes, gardenToolsEnabled });
         return mcpResponse(result);
       },
