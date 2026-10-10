@@ -286,6 +286,9 @@ describe('locations — versions, If-Match and deletes', () => {
 
     const deleted = await call(app, fx, 'DELETE', `/api/locations/${loc.id}`, { ifMatch: '"2"' });
     expect(deleted.status).toBe(200);
+    expect(deleted.json.data.version).toBe(3);
+    expect(deleted.json.data.deleted_at).toEqual(expect.any(Number));
+    expect(deleted.etag).toBe('"3"');
     expect(await rowVersion('locations', loc.id)).toBe(3);
 
     const again = await call(app, fx, 'DELETE', `/api/locations/${loc.id}`);
@@ -393,6 +396,8 @@ describe('tags — versions, If-Match and deletes', () => {
 
     const res = await call(app, fx, 'DELETE', `/api/tags/${tag.id}`, { ifMatch: '"1"' });
     expect(res.status).toBe(200);
+    expect(res.json.data.version).toBe(2);
+    expect(res.etag).toBe('"2"');
     expect(await rowVersion('tags', tag.id)).toBe(2);
 
     const links = await sql.unsafe<{ n: number }[]>(
@@ -530,6 +535,8 @@ describe('beds — versions, If-Match and deletes', () => {
 
     const res = await call(app, fx, 'DELETE', `/api/beds/${bed.id}`, { ifMatch: '"1"' });
     expect(res.status).toBe(200);
+    expect(res.json.data.version).toBe(2);
+    expect(res.etag).toBe('"2"');
 
     expect(await rowVersion('beds', bed.id)).toBe(2);
     expect(await rowVersion('planting_events', eventId)).toBe(2);
