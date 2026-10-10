@@ -7,6 +7,13 @@ import { requireHousehold } from '../middleware/household';
 import { dbAll, dbGet, dbRun, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, deltaCursorWhere, parseDeltaQuery } from '../lib/sync';
+import { deletePhoto } from '../lib/storage';
+import {
+  expectedVersion,
+  invalidIfMatch,
+  setVersionHeader,
+  versionConflict,
+} from '../lib/versioning';
 
 export const bedRoutes = new Hono<AppEnv>();
 
@@ -23,6 +30,7 @@ interface BedRow {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  version: number;
 }
 
 interface BedDTO {
@@ -36,11 +44,13 @@ interface BedDTO {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  version: number;
 }
 
 function rowToDTO(row: BedRow): BedDTO {
   return {
     ...row,
+    version: Number(row.version),
     width_feet: row.width_feet === null ? null : Number(row.width_feet),
     length_feet: row.length_feet === null ? null : Number(row.length_feet),
   };
@@ -63,7 +73,7 @@ const createSchema = upsertSchema.extend({
 
 const SELECT_COLS = `id, household_id, name, description,
   width_feet::text AS width_feet, length_feet::text AS length_feet,
-  sort_order, created_at, updated_at, deleted_at`;
+  sort_order, created_at, updated_at, deleted_at, version`;
 
 /**
  * GET /api/beds?since=<ms>&limit=<n>
@@ -107,8 +117,8 @@ bedRoutes.post('/beds', ...auth, async (c) => {
   try {
     await dbRun(
       sql,
-      `INSERT INTO beds (id, household_id, name, description, width_feet, length_feet, sort_order, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      `INSERT INTO beds (id, household_id, name, description, width_feet, length_feet, sort_order, created_at, updated_at, version)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)`,
       [
         id, householdId,
         parsed.data.name,
@@ -130,7 +140,9 @@ bedRoutes.post('/beds', ...auth, async (c) => {
         [id, householdId],
       );
       if (existing) {
-        return c.json({ ok: true, data: { bed: rowToDTO(existing) } });
+        const dto = rowToDTO(existing);
+        setVersionHeader(c, dto.version);
+        return c.json({ ok: true, data: { bed: dto } });
       }
       return c.json({
         ok: false,
@@ -139,6 +151,7 @@ bedRoutes.post('/beds', ...auth, async (c) => {
     }
     throw err;
   }
+  setVersionHeader(c, 1);
   return c.json({
     ok: true,
     data: {
@@ -150,6 +163,7 @@ bedRoutes.post('/beds', ...auth, async (c) => {
         length_feet: parsed.data.length_feet ?? null,
         sort_order: sortOrder,
         created_at: now, updated_at: now, deleted_at: null,
+        version: 1,
       } satisfies BedDTO,
     },
   });
@@ -159,75 +173,147 @@ bedRoutes.patch('/beds/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const body = await c.req.json().catch(() => null);
   const parsed = upsertSchema.partial().safeParse(body);
   if (!parsed.success) {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
-  const existing = await dbGet<BedRow>(
-    sql,
-    `SELECT ${SELECT_COLS}
-       FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
+
+  // Field-selective: only the provided columns are written. No read-merge-write.
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  const set = (column: string, value: unknown) => {
+    params.push(value);
+    sets.push(`${column} = $${params.length}`);
+  };
+  if (parsed.data.name !== undefined) set('name', parsed.data.name);
+  if (parsed.data.description !== undefined) set('description', parsed.data.description ?? null);
+  if (parsed.data.width_feet !== undefined) set('width_feet', parsed.data.width_feet ?? null);
+  if (parsed.data.length_feet !== undefined) set('length_feet', parsed.data.length_feet ?? null);
+  if (parsed.data.sort_order !== undefined) set('sort_order', parsed.data.sort_order);
+  set('updated_at', Date.now());
+  sets.push('version = version + 1');
+  params.push(id, householdId);
+  let where = `id = $${params.length - 1} AND household_id = $${params.length} AND deleted_at IS NULL`;
+  if (expected !== null) {
+    params.push(expected);
+    where += ` AND version = $${params.length}`;
   }
-  const now = Date.now();
-  const name = parsed.data.name ?? existing.name;
-  const description = parsed.data.description === undefined
-    ? existing.description
-    : parsed.data.description ?? null;
-  const width = parsed.data.width_feet === undefined
-    ? (existing.width_feet === null ? null : Number(existing.width_feet))
-    : parsed.data.width_feet ?? null;
-  const length = parsed.data.length_feet === undefined
-    ? (existing.length_feet === null ? null : Number(existing.length_feet))
-    : parsed.data.length_feet ?? null;
-  const sortOrder = parsed.data.sort_order ?? existing.sort_order;
-  await dbRun(
+
+  const updated = await dbGet<BedRow>(
     sql,
-    `UPDATE beds SET name = $1, description = $2, width_feet = $3, length_feet = $4,
-       sort_order = $5, updated_at = $6 WHERE id = $7`,
-    [name, description, width, length, sortOrder, now, id],
+    `UPDATE beds SET ${sets.join(', ')} WHERE ${where} RETURNING ${SELECT_COLS}`,
+    params,
   );
-  return c.json({
-    ok: true,
-    data: {
-      bed: {
-        id, household_id: householdId,
-        name, description,
-        width_feet: width, length_feet: length,
-        sort_order: sortOrder,
-        created_at: existing.created_at, updated_at: now, deleted_at: null,
-      } satisfies BedDTO,
-    },
-  });
+  if (!updated) {
+    // Nothing matched. Missing or deleted is 404; a stale version is 409
+    // with the current row so the client can merge and retry.
+    const current = expected === null ? null : await dbGet<BedRow>(
+      sql,
+      `SELECT ${SELECT_COLS} FROM beds WHERE id = $1 AND household_id = $2 LIMIT 1`,
+      [id, householdId],
+    );
+    if (!current || current.deleted_at !== null) {
+      return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
+    }
+    return versionConflict(c, rowToDTO(current));
+  }
+  const dto = rowToDTO(updated);
+  setVersionHeader(c, dto.version);
+  return c.json({ ok: true, data: { bed: dto } });
 });
 
 bedRoutes.delete('/beds/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  const result = await dbRun(
-    sql,
-    `UPDATE beds SET deleted_at = $1, updated_at = $2
-       WHERE id = $3 AND household_id = $4 AND deleted_at IS NULL`,
-    [now, now, id, householdId],
-  );
-  if (result.meta.changes === 0) {
+
+  // One transaction for the tombstone and the whole cascade:
+  //   bed → planting events → their journal entries
+  //   bed → journal entries attached directly to the bed
+  //   journal entry → checklist items and photo rows (hard-deleted)
+  // Every tombstoned row gets version + 1 and updated_at = deleted_at = now.
+  const outcome = await sql.begin(async (tx) => {
+    // Lock the bed first. Planting-event creates take FOR SHARE on the bed,
+    // so a concurrent create serializes with this delete.
+    const bed = await dbGet<BedRow>(
+      tx,
+      `SELECT ${SELECT_COLS} FROM beds
+        WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+      [id, householdId],
+    );
+    if (!bed) return { kind: 'not_found' as const };
+    if (expected !== null && Number(bed.version) !== expected) {
+      return { kind: 'conflict' as const, current: rowToDTO(bed) };
+    }
+
+    await dbRun(
+      tx,
+      `UPDATE beds SET deleted_at = $1, updated_at = $2, version = version + 1
+        WHERE id = $3 AND household_id = $4`,
+      [now, now, id, householdId],
+    );
+
+    // Journal entries under this bed: attached to one of its planting events
+    // (active or already tombstoned, so the closure is complete) or directly
+    // to the bed.
+    const entryIds = (await dbAll<{ id: string }>(
+      tx,
+      `UPDATE journal_entries SET deleted_at = $1, updated_at = $2, version = version + 1
+        WHERE household_id = $3 AND deleted_at IS NULL
+          AND (bed_id = $4
+               OR planting_event_id IN (
+                 SELECT pe.id FROM planting_events pe
+                  WHERE pe.bed_id = $4 AND pe.household_id = $3))
+        RETURNING id`,
+      [now, now, householdId, id],
+    )).map((row) => row.id);
+
+    let photoKeys: string[] = [];
+    if (entryIds.length > 0) {
+      await dbRun(
+        tx,
+        `DELETE FROM journal_checklist_items WHERE entry_id = ANY($1)`,
+        [entryIds],
+      );
+      photoKeys = (await dbAll<{ storage_key: string }>(
+        tx,
+        `DELETE FROM journal_entry_photos WHERE entry_id = ANY($1) RETURNING storage_key`,
+        [entryIds],
+      )).map((row) => row.storage_key);
+    }
+
+    await dbRun(
+      tx,
+      `UPDATE planting_events SET deleted_at = $1, updated_at = $2, version = version + 1
+        WHERE bed_id = $3 AND household_id = $4 AND deleted_at IS NULL`,
+      [now, now, id, householdId],
+    );
+
+    return { kind: 'ok' as const, photoKeys };
+  });
+
+  if (outcome.kind === 'not_found') {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
   }
-  // Cascade soft-delete to children — planting_events + journal_entries
-  // scoped to this bed. iOS sees matching tombstones on the next pull.
-  await dbRun(sql,
-    `UPDATE planting_events SET deleted_at = $1, updated_at = $1
-       WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId]);
-  await dbRun(sql,
-    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-       WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId]);
+  if (outcome.kind === 'conflict') {
+    return versionConflict(c, outcome.current);
+  }
+
+  // Photo objects are removed after commit, best-effort. A failure leaves an
+  // orphaned object, never a half-applied cascade.
+  const results = await Promise.allSettled(
+    outcome.photoKeys.map((key) => deletePhoto(c.env, key)),
+  );
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.warn('bed cascade: photo object delete failed', result.reason);
+    }
+  }
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });

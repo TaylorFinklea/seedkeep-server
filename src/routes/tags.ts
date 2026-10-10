@@ -7,6 +7,12 @@ import { requireHousehold } from '../middleware/household';
 import { dbAll, dbGet, dbRun, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, deltaCursorWhere, parseDeltaQuery } from '../lib/sync';
+import {
+  expectedVersion,
+  invalidIfMatch,
+  setVersionHeader,
+  versionConflict,
+} from '../lib/versioning';
 
 export const tagRoutes = new Hono<AppEnv>();
 
@@ -20,7 +26,10 @@ interface TagRow {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  version: number;
 }
+
+const TAG_COLS = `id, household_id, name, color, created_at, updated_at, deleted_at, version`;
 
 const upsertSchema = z.object({
   name: z.string().trim().min(1).max(40),
@@ -42,7 +51,7 @@ tagRoutes.get('/tags', ...auth, async (c) => {
   const params = [householdId, ...cursor.params, query.limit];
   const items = await dbAll<TagRow>(
     sql,
-    `SELECT id, household_id, name, color, created_at, updated_at, deleted_at
+    `SELECT ${TAG_COLS}
        FROM tags
       WHERE household_id = $1 AND ${cursor.clause}
       ORDER BY updated_at ASC, id ASC
@@ -66,8 +75,8 @@ tagRoutes.post('/tags', ...auth, async (c) => {
   try {
     await dbRun(
       sql,
-      `INSERT INTO tags (id, household_id, name, color, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO tags (id, household_id, name, color, created_at, updated_at, version)
+       VALUES ($1, $2, $3, $4, $5, $6, 1)`,
       [id, householdId, parsed.data.name, color, now, now],
     );
   } catch (err) {
@@ -77,11 +86,11 @@ tagRoutes.post('/tags', ...auth, async (c) => {
       // this household — same response shape as a fresh create.
       const existing = await dbGet<TagRow>(
         sql,
-        `SELECT id, household_id, name, color, created_at, updated_at, deleted_at
-           FROM tags WHERE id = $1 AND household_id = $2 LIMIT 1`,
+        `SELECT ${TAG_COLS} FROM tags WHERE id = $1 AND household_id = $2 LIMIT 1`,
         [id, householdId],
       );
       if (existing) {
+        setVersionHeader(c, existing.version);
         return c.json({ ok: true, data: { tag: existing } });
       }
       return c.json({
@@ -91,6 +100,7 @@ tagRoutes.post('/tags', ...auth, async (c) => {
     }
     throw err;
   }
+  setVersionHeader(c, 1);
   return c.json({
     ok: true,
     data: {
@@ -102,6 +112,7 @@ tagRoutes.post('/tags', ...auth, async (c) => {
         created_at: now,
         updated_at: now,
         deleted_at: null,
+        version: 1,
       },
     },
   });
@@ -111,62 +122,101 @@ tagRoutes.patch('/tags/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const body = await c.req.json().catch(() => null);
   const parsed = upsertSchema.partial().safeParse(body);
   if (!parsed.success) {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
-  const existing = await dbGet<TagRow>(
-    sql,
-    `SELECT id, household_id, name, color, created_at, updated_at, deleted_at
-       FROM tags WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'Tag not found' } }, 404);
+
+  // Field-selective: only the provided columns are written. No read-merge-write.
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  const set = (column: string, value: unknown) => {
+    params.push(value);
+    sets.push(`${column} = $${params.length}`);
+  };
+  if (parsed.data.name !== undefined) set('name', parsed.data.name);
+  if (parsed.data.color !== undefined) set('color', parsed.data.color ?? null);
+  set('updated_at', Date.now());
+  sets.push('version = version + 1');
+  params.push(id, householdId);
+  let where = `id = $${params.length - 1} AND household_id = $${params.length} AND deleted_at IS NULL`;
+  if (expected !== null) {
+    params.push(expected);
+    where += ` AND version = $${params.length}`;
   }
-  const now = Date.now();
-  const name = parsed.data.name ?? existing.name;
-  const color = parsed.data.color !== undefined ? parsed.data.color : existing.color;
-  await dbRun(
+
+  const updated = await dbGet<TagRow>(
     sql,
-    `UPDATE tags SET name = $1, color = $2, updated_at = $3 WHERE id = $4`,
-    [name, color, now, id],
+    `UPDATE tags SET ${sets.join(', ')} WHERE ${where} RETURNING ${TAG_COLS}`,
+    params,
   );
-  return c.json({
-    ok: true,
-    data: { tag: { ...existing, name, color, updated_at: now } },
-  });
+  if (!updated) {
+    // Nothing matched. Missing or deleted is 404; a stale version is 409
+    // with the current row so the client can merge and retry.
+    const current = expected === null ? null : await dbGet<TagRow>(
+      sql,
+      `SELECT ${TAG_COLS} FROM tags WHERE id = $1 AND household_id = $2 LIMIT 1`,
+      [id, householdId],
+    );
+    if (!current || current.deleted_at !== null) {
+      return c.json({ ok: false, error: { code: 'not_found', message: 'Tag not found' } }, 404);
+    }
+    return versionConflict(c, current);
+  }
+  setVersionHeader(c, updated.version);
+  return c.json({ ok: true, data: { tag: updated } });
 });
 
 tagRoutes.delete('/tags/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  const result = await dbRun(
-    sql,
-    `UPDATE tags SET deleted_at = $1, updated_at = $2
-       WHERE id = $3 AND household_id = $4 AND deleted_at IS NULL`,
-    [now, now, id, householdId],
-  );
-  if (result.meta.changes === 0) {
+
+  const outcome = await sql.begin(async (tx) => {
+    const row = await dbGet<TagRow>(
+      tx,
+      `SELECT ${TAG_COLS} FROM tags
+        WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+      [id, householdId],
+    );
+    if (!row) return { kind: 'not_found' as const };
+    if (expected !== null && Number(row.version) !== expected) {
+      return { kind: 'conflict' as const, current: row };
+    }
+    await dbRun(
+      tx,
+      `UPDATE tags SET deleted_at = $1, updated_at = $2, version = version + 1
+        WHERE id = $3 AND household_id = $4`,
+      [now, now, id, householdId],
+    );
+    // Bump each seed that carries this tag so delta-syncing clients re-pull
+    // them and drop the stale tag_id. Must run before the join rows are gone.
+    await dbRun(
+      tx,
+      `UPDATE seeds SET updated_at = $1, version = version + 1
+        WHERE household_id = $2
+          AND id IN (SELECT seed_id FROM seed_tags WHERE tag_id = $3 AND household_id = $2)`,
+      [now, householdId, id],
+    );
+    await dbRun(
+      tx,
+      `DELETE FROM seed_tags WHERE tag_id = $1 AND household_id = $2`,
+      [id, householdId],
+    );
+    return { kind: 'ok' as const };
+  });
+
+  if (outcome.kind === 'not_found') {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Tag not found' } }, 404);
   }
-  // Remove join rows so seeds no longer surface the deleted tag_id in their
-  // tag_ids array.  Bump updated_at on affected seeds so delta-syncing clients
-  // re-pull them and drop the stale tag_id from local state.
-  await dbRun(
-    sql,
-    `UPDATE seeds SET updated_at = $1
-       WHERE household_id = $2
-         AND id IN (SELECT seed_id FROM seed_tags WHERE tag_id = $3 AND household_id = $2)`,
-    [now, householdId, id],
-  );
-  await dbRun(
-    sql,
-    `DELETE FROM seed_tags WHERE tag_id = $1 AND household_id = $2`,
-    [id, householdId],
-  );
+  if (outcome.kind === 'conflict') {
+    return versionConflict(c, outcome.current);
+  }
   return c.json({ ok: true, data: { id, deleted_at: now } });
 });
