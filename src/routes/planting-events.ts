@@ -4,11 +4,13 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation } from '../db/helpers';
+import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation, type Queryable } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, deltaCursorWhere, parseDeltaQuery } from '../lib/sync';
 import { decryptApiKey } from '../lib/assistant/keyEncryption';
 import { run as spawnPet } from '../lib/pets/spawn';
+import { expectedVersion, invalidIfMatch, setVersionHeader, versionConflict } from '../lib/versioning';
+import { deletePhoto } from '../lib/storage';
 
 export const plantingEventRoutes = new Hono<AppEnv>();
 
@@ -46,6 +48,7 @@ interface PlantingEventRow {
   pet_name: string | null;
   pet_personality: string | null;
   pet_spawned_at: number | null;
+  version: number;
 }
 
 const upsertSchema = z.object({
@@ -74,7 +77,21 @@ const SELECT_COLS = `id, household_id, bed_id, seed_id, catalog_seed_id, kind,
   completed_at, notes,
   x_feet::float8 AS x_feet, y_feet::float8 AS y_feet,
   created_at, updated_at, deleted_at,
-  pet_seed, pet_rarity, pet_creature_kind, pet_name, pet_personality, pet_spawned_at`;
+  pet_seed, pet_rarity, pet_creature_kind, pet_name, pet_personality, pet_spawned_at, version`;
+
+async function lockEventParents(q: Queryable, householdId: string, bedId: string | null, seedId: string | null): Promise<boolean> {
+  if (bedId) {
+    const bed = await dbGet<{ id: string }>(q,
+      `SELECT id FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [bedId, householdId]);
+    if (!bed) return false;
+  }
+  if (seedId) {
+    const seed = await dbGet<{ id: string }>(q,
+      `SELECT id FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [seedId, householdId]);
+    if (!seed) return false;
+  }
+  return true;
+}
 
 plantingEventRoutes.get('/planting-events', ...auth, async (c) => {
   const householdId = c.get('householdId');
@@ -107,6 +124,15 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
   }
   const id = parsed.data.id ?? nanoid();
   const now = Date.now();
+  if (parsed.data.id) {
+    const existing = await dbGet<PlantingEventRow>(sql,
+      `SELECT ${SELECT_COLS} FROM planting_events WHERE id = $1 AND household_id = $2 LIMIT 1`, [id, householdId]);
+    if (existing) {
+      setVersionHeader(c, existing.version);
+      return c.json({ ok: true, data: { planting_event: existing } });
+    }
+    if (await dbGet(sql, `SELECT id FROM planting_events WHERE id = $1`, [id])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  }
 
   // Phase 5 — spawn a plant pet for this event. Identity columns are
   // populated inline so the POST response carries the fully-rolled pet.
@@ -155,7 +181,11 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
   const journalEntryId = nanoid();
   const checklistItemId = nanoid();
   try {
-    await dbBatch(sql, [
+    await sql.begin(async (tx) => {
+      if (!await lockEventParents(tx, householdId, parsed.data.bed_id ?? null, parsed.data.seed_id ?? null)) {
+        throw Object.assign(new Error('invalid_reference'), { code: 'EVENT_INVALID_REFERENCE' });
+      }
+      const statements = [
       {
         sql: `INSERT INTO planting_events (
            id, household_id, bed_id, seed_id, catalog_seed_id,
@@ -199,7 +229,9 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
          VALUES ($1, $2, 'Watered', FALSE, 0, $3)`,
         params: [checklistItemId, journalEntryId, now],
       },
-    ]);
+      ];
+      for (const stmt of statements) await dbRun(tx, stmt.sql, stmt.params);
+    });
   } catch (err) {
     if (isUniqueViolation(err)) {
       // Retry of a create that already committed (response lost on the
@@ -214,6 +246,7 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
         [id, householdId],
       );
       if (existing) {
+        setVersionHeader(c, existing.version);
         return c.json({ ok: true, data: { planting_event: existing } });
       }
       return c.json({
@@ -221,7 +254,7 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
         error: { code: 'conflict', message: 'A record with this id already exists.' },
       }, 409);
     }
-    if (isFkViolation(err)) {
+    if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) {
       return c.json({
         ok: false,
         error: {
@@ -245,6 +278,7 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
   if (!row) {
     // Defensive — the row was just inserted; this would indicate a
     // serious DB inconsistency. Fall through with a synthesized payload.
+    setVersionHeader(c, 1);
     return c.json({
       ok: true,
       data: {
@@ -266,10 +300,12 @@ plantingEventRoutes.post('/planting-events', ...auth, async (c) => {
           pet_name: spawn.petName,
           pet_personality: spawn.petPersonalityJson,
           pet_spawned_at: now,
+          version: 1,
         } satisfies PlantingEventRow,
       },
     });
   }
+  setVersionHeader(c, row.version);
   return c.json({ ok: true, data: { planting_event: row } });
 });
 
@@ -398,47 +434,39 @@ plantingEventRoutes.patch('/planting-events/:id', ...auth, async (c) => {
   if (!parsed.success) {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
-  const existing = await dbGet<PlantingEventRow>(
-    sql,
-    `SELECT ${SELECT_COLS}
-       FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
-  }
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  const merged: PlantingEventRow = {
-    ...existing,
-    bed_id: parsed.data.bed_id === undefined ? existing.bed_id : parsed.data.bed_id ?? null,
-    seed_id: parsed.data.seed_id === undefined ? existing.seed_id : parsed.data.seed_id ?? null,
-    catalog_seed_id: parsed.data.catalog_seed_id === undefined ? existing.catalog_seed_id : parsed.data.catalog_seed_id ?? null,
-    kind: parsed.data.kind ?? existing.kind,
-    planned_for: parsed.data.planned_for ?? existing.planned_for,
-    completed_at: parsed.data.completed_at === undefined ? existing.completed_at : parsed.data.completed_at ?? null,
-    notes: parsed.data.notes === undefined ? existing.notes : parsed.data.notes ?? null,
-    x_feet: parsed.data.x_feet === undefined ? existing.x_feet : parsed.data.x_feet ?? null,
-    y_feet: parsed.data.y_feet === undefined ? existing.y_feet : parsed.data.y_feet ?? null,
-    updated_at: now,
-  };
+  const columns: Record<string, unknown> = {};
+  for (const key of ['bed_id', 'seed_id', 'catalog_seed_id', 'kind', 'planned_for', 'completed_at', 'notes', 'x_feet', 'y_feet'] as const) {
+    if (parsed.data[key] !== undefined) columns[key] = parsed.data[key] ?? null;
+  }
+  const names = Object.keys(columns);
+  const sets = names.map((key, i) => `${key} = $${i + 1}`);
+  sets.push(`updated_at = $${names.length + 1}`, 'version = version + 1');
+  const params: unknown[] = [...names.map((key) => columns[key]), now, id, householdId];
+  let where = `id = $${names.length + 2} AND household_id = $${names.length + 3} AND deleted_at IS NULL`;
+  if (expected !== null) { params.push(expected); where += ` AND version = $${params.length}`; }
+  let outcome: { row: PlantingEventRow | null; current: PlantingEventRow | null };
   try {
-    await dbRun(
-      sql,
-      `UPDATE planting_events SET
-         bed_id = $1, seed_id = $2, catalog_seed_id = $3,
-         kind = $4, planned_for = $5, completed_at = $6, notes = $7,
-         x_feet = $8, y_feet = $9,
-         updated_at = $10
-       WHERE id = $11`,
-      [
-        merged.bed_id, merged.seed_id, merged.catalog_seed_id,
-        merged.kind, merged.planned_for, merged.completed_at, merged.notes,
-        merged.x_feet, merged.y_feet,
-        now, id,
-      ],
-    );
+    outcome = await sql.begin(async (tx) => {
+      const nextBed = parsed.data.bed_id !== undefined ? parsed.data.bed_id ?? null : null;
+      const nextSeed = parsed.data.seed_id !== undefined ? parsed.data.seed_id ?? null : null;
+      if (!await lockEventParents(tx, householdId, nextBed, nextSeed)) throw new Error('invalid_reference');
+      const owner = await dbGet<PlantingEventRow>(tx,
+        `SELECT ${SELECT_COLS} FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [id, householdId]);
+      if (!owner) return { row: null, current: null };
+      const changed = await tx.unsafe<{ id: string }[]>(
+        `UPDATE planting_events SET ${sets.join(', ')} WHERE ${where} RETURNING *`, params as never);
+      if (!changed[0]) {
+        return { row: null, current: await dbGet<PlantingEventRow>(tx,
+          `SELECT ${SELECT_COLS} FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`, [id, householdId]) };
+      }
+      return { row: await dbGet<PlantingEventRow>(tx,
+        `SELECT ${SELECT_COLS} FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`, [id, householdId]), current: null };
+    });
   } catch (err) {
-    if (isFkViolation(err)) {
+    if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) {
       return c.json({
         ok: false,
         error: {
@@ -450,27 +478,47 @@ plantingEventRoutes.patch('/planting-events/:id', ...auth, async (c) => {
     }
     throw err;
   }
-  return c.json({ ok: true, data: { planting_event: merged } });
+  if (!outcome!.row) {
+    if (!outcome!.current) return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
+    if (expected !== null) return versionConflict(c, outcome!.current);
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
+  }
+  setVersionHeader(c, outcome!.row.version);
+  return c.json({ ok: true, data: { planting_event: outcome!.row } });
 });
 
 plantingEventRoutes.delete('/planting-events/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  const result = await dbRun(
-    sql,
-    `UPDATE planting_events SET deleted_at = $1, updated_at = $2
-       WHERE id = $3 AND household_id = $4 AND deleted_at IS NULL`,
-    [now, now, id, householdId],
-  );
-  if (result.meta.changes === 0) {
+  const outcome = await sql.begin(async (tx) => {
+    const current = await dbGet<PlantingEventRow>(tx,
+      `SELECT ${SELECT_COLS} FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [id, householdId]);
+    if (!current) return { row: null, current: null, keys: [] as string[] };
+    const changed = await tx.unsafe<{ version: number }[]>(
+      `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL${expected === null ? '' : ' AND version = $4'} RETURNING version`,
+      expected === null ? [now, id, householdId] : [now, id, householdId, expected]);
+    if (!changed[0]) return { row: null, current, keys: [] as string[] };
+    const entries = await tx.unsafe<{ id: string }[]>(
+      `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, id, householdId]);
+    const entryIds = entries.map((e) => e.id);
+    const photos = await tx.unsafe<{ storage_key: string }[]>(
+      `SELECT storage_key FROM journal_entry_photos WHERE entry_id = ANY($1) AND household_id = $2`, [entryIds, householdId]);
+    await tx.unsafe(`DELETE FROM journal_entry_photos WHERE entry_id = ANY($1) AND household_id = $2`, [entryIds, householdId]);
+    await tx.unsafe(`DELETE FROM journal_checklist_items WHERE entry_id = ANY($1)`, [entryIds]);
+    return { row: { version: changed[0].version }, current: null, keys: photos.map((p) => p.storage_key) };
+  });
+  if (!outcome.row && !outcome.current) return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
+  if (outcome.current) {
+    if (expected !== null) return versionConflict(c, outcome.current);
     return c.json({ ok: false, error: { code: 'not_found', message: 'Event not found' } }, 404);
   }
-  // Cascade soft-delete to journal entries that point at this event.
-  await dbRun(sql,
-    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-       WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId]);
-  return c.json({ ok: true, data: { id, deleted_at: now } });
+  await Promise.allSettled(outcome.keys.map((key) => deletePhoto(c.env, key)));
+  setVersionHeader(c, outcome.row!.version);
+  return c.json({ ok: true, data: { id, deleted_at: now, version: outcome.row!.version } });
 });

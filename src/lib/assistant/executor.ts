@@ -10,7 +10,7 @@
 
 import { nanoid } from 'nanoid';
 import type { getSql } from '../../db/client';
-import { dbGet, dbAll, dbRun } from '../../db/helpers';
+import { dbGet, dbAll, dbRun, type Queryable } from '../../db/helpers';
 import { validateToolArgs, TOOL_REGISTRY, type ToolName } from './tools';
 
 /// Safe JSON.parse for TEXT-stored JSON payloads (pet_personality,
@@ -222,8 +222,8 @@ async function runAutoExecute(
       }
       params.push(args.limit ?? 50);
       const rows = await dbAll(sql,
-        `SELECT id, custom_name, custom_variety, custom_company, state, packet_count,
-                year_packed, source, notes, catalog_id, location_id, created_at, updated_at
+        `SELECT id, custom_name, custom_variety, custom_company, custom_type, state, packet_count,
+                year_packed, source, notes, catalog_id, location_id, created_at, updated_at, version
            FROM seeds WHERE ${wheres.join(' AND ')}
           ORDER BY updated_at DESC LIMIT $${p}`,
         params);
@@ -251,7 +251,7 @@ async function runAutoExecute(
       if (args.active !== false) { wheres.push('deleted_at IS NULL'); }
       params.push(args.limit ?? 50);
       const rows = await dbAll(sql,
-        `SELECT id, name, width_feet, length_feet, sort_order, created_at, updated_at, deleted_at
+        `SELECT id, name, width_feet, length_feet, sort_order, created_at, updated_at, deleted_at, version
            FROM beds WHERE ${wheres.join(' AND ')}
           ORDER BY sort_order ASC LIMIT $${p}`,
         params);
@@ -260,7 +260,7 @@ async function runAutoExecute(
 
     case 'get_bed': {
       const row = await dbGet(sql,
-        `SELECT id, name, width_feet, length_feet, sort_order, created_at, updated_at
+        `SELECT id, name, width_feet, length_feet, sort_order, created_at, updated_at, version
            FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
         [args.id, householdId]);
       if (!row) throw new Error(`bed not found: ${args.id}`);
@@ -279,7 +279,7 @@ async function runAutoExecute(
       params.push(args.limit ?? 100);
       const rows = await dbAll(sql,
         `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
-                completed_at, notes, x_feet, y_feet, created_at, updated_at
+                completed_at, notes, x_feet, y_feet, created_at, updated_at, version
            FROM planting_events WHERE ${wheres.join(' AND ')}
           ORDER BY planned_for DESC, id DESC LIMIT $${p}`,
         params);
@@ -289,7 +289,7 @@ async function runAutoExecute(
     case 'get_planting_event': {
       const row = await dbGet(sql,
         `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
-                completed_at, notes, x_feet, y_feet, created_at, updated_at
+                completed_at, notes, x_feet, y_feet, created_at, updated_at, version
            FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
         [args.id, householdId]);
       if (!row) throw new Error(`planting event not found: ${args.id}`);
@@ -309,7 +309,7 @@ async function runAutoExecute(
       params.push(args.limit ?? 100);
       const rows = await dbAll(sql,
         `SELECT id, occurred_on::text AS occurred_on, body, seed_id, bed_id, planting_event_id,
-                created_at, updated_at
+                created_at, updated_at, version
            FROM journal_entries WHERE ${wheres.join(' AND ')}
           ORDER BY occurred_on DESC, id DESC LIMIT $${p}`,
         params);
@@ -319,19 +319,20 @@ async function runAutoExecute(
     case 'get_journal_entry': {
       const entry = await dbGet(sql,
         `SELECT id, occurred_on::text AS occurred_on, body, seed_id, bed_id, planting_event_id,
-                created_at, updated_at
+                created_at, updated_at, version
            FROM journal_entries
           WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
         [args.id, householdId]);
       if (!entry) throw new Error(`journal entry not found: ${args.id}`);
       const photos = await dbAll(sql,
         `SELECT id, storage_key, sort_order, width, height, created_at
-           FROM journal_entry_photos WHERE entry_id = $1 ORDER BY sort_order ASC`,
-        [args.id]);
+           FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2 ORDER BY sort_order ASC`,
+        [args.id, householdId]);
       const items = await dbAll(sql,
-        `SELECT id, text, completed, sort_order, updated_at
-           FROM journal_checklist_items WHERE entry_id = $1 ORDER BY sort_order ASC`,
-        [args.id]);
+        `SELECT ci.id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
+           FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+          WHERE ci.entry_id = $1 AND je.household_id = $2 ORDER BY ci.sort_order ASC`,
+        [args.id, householdId]);
       return { entry, photos, checklist_items: items };
     }
 
@@ -460,80 +461,68 @@ async function runAutoExecute(
     case 'create_planting_event': {
       const id = nanoid();
       const now = Date.now();
-      await dbRun(sql,
-        `INSERT INTO planting_events
-           (id, household_id, bed_id, seed_id, catalog_seed_id, kind, planned_for,
-            completed_at, notes, x_feet, y_feet, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $11)`,
-        [id, householdId, args.bed_id ?? null,
-          args.seed_id ?? null, args.catalog_seed_id ?? null,
-          args.kind, args.planned_for, args.notes ?? null,
-          args.x_feet ?? null, args.y_feet ?? null, now]);
-      const row = await dbGet(sql,
-        `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
-                notes, x_feet, y_feet, created_at, updated_at
-           FROM planting_events WHERE id = $1`, [id]);
+      const row = await sql.begin(async (tx) => {
+        if (args.bed_id && !await dbGet(tx, `SELECT id FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [args.bed_id, householdId])) throw new Error(`bed not found: ${args.bed_id}`);
+        if (args.seed_id && !await dbGet(tx, `SELECT id FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [args.seed_id, householdId])) throw new Error(`seed not found: ${args.seed_id}`);
+        await dbRun(tx, `INSERT INTO planting_events
+          (id, household_id, bed_id, seed_id, catalog_seed_id, kind, planned_for, completed_at, notes, x_feet, y_feet, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $11)`,
+          [id, householdId, args.bed_id ?? null, args.seed_id ?? null, args.catalog_seed_id ?? null,
+            args.kind, args.planned_for, args.notes ?? null, args.x_feet ?? null, args.y_feet ?? null, now]);
+        return dbGet(tx, `SELECT id, bed_id, seed_id, catalog_seed_id, kind, planned_for::text AS planned_for,
+          notes, x_feet, y_feet, created_at, updated_at, version FROM planting_events WHERE id = $1`, [id]);
+      });
       return { event: row, created_id: id };
     }
 
     case 'create_journal_entry': {
       const id = nanoid();
       const now = Date.now();
-      await dbRun(sql,
-        `INSERT INTO journal_entries
-           (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
-            created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
-        [id, householdId, args.occurred_on, args.body,
-          args.seed_id ?? null, args.bed_id ?? null, args.planting_event_id ?? null, now]);
-      const row = await dbGet(sql,
-        `SELECT id, occurred_on::text AS occurred_on, body, seed_id, bed_id, planting_event_id,
-                created_at, updated_at
-           FROM journal_entries WHERE id = $1`, [id]);
+      const row = await sql.begin(async (tx) => {
+        for (const [table, ref] of [['seeds', args.seed_id], ['beds', args.bed_id], ['planting_events', args.planting_event_id]] as const) {
+          if (ref && !await dbGet(tx, `SELECT id FROM ${table} WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [ref, householdId])) throw new Error(`${table} reference invalid`);
+        }
+        await dbRun(tx, `INSERT INTO journal_entries
+          (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
+          [id, householdId, args.occurred_on, args.body, args.seed_id ?? null, args.bed_id ?? null, args.planting_event_id ?? null, now]);
+        return dbGet(tx, `SELECT id, occurred_on::text AS occurred_on, body, seed_id, bed_id, planting_event_id,
+          created_at, updated_at, version FROM journal_entries WHERE id = $1`, [id]);
+      });
       return { entry: row, created_id: id };
     }
 
     case 'add_checklist_item': {
-      // Verify entry belongs to household
-      const owner = await dbGet(sql,
-        `SELECT id FROM journal_entries
-          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-        [args.entry_id, householdId]);
-      if (!owner) throw new Error(`journal entry not found: ${args.entry_id}`);
       const id = nanoid();
       const now = Date.now();
-      const max = await dbGet<{ max: number | null }>(sql,
-        `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`,
-        [args.entry_id]);
-      const sortOrder = (max?.max ?? -1) + 1;
-      await dbRun(sql,
-        `INSERT INTO journal_checklist_items
-           (id, entry_id, text, completed, sort_order, updated_at)
-         VALUES ($1, $2, $3, FALSE, $4, $5)`,
-        [id, args.entry_id, args.text, sortOrder, now]);
-      await dbRun(sql,
-        `UPDATE journal_entries SET updated_at = $1 WHERE id = $2`, [now, args.entry_id]);
-      const row = await dbGet(sql,
-        `SELECT id, text, completed, sort_order, updated_at
-           FROM journal_checklist_items WHERE id = $1`, [id]);
+      const row = await sql.begin(async (tx) => {
+        const owner = await dbGet(tx, `SELECT id FROM journal_entries
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.entry_id, householdId]);
+        if (!owner) throw new Error(`journal entry not found: ${args.entry_id}`);
+        const max = await dbGet<{ max: number | null }>(tx,
+          `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`, [args.entry_id]);
+        const sortOrder = (max?.max ?? -1) + 1;
+        await dbRun(tx, `INSERT INTO journal_checklist_items
+          (id, entry_id, text, completed, sort_order, updated_at) VALUES ($1, $2, $3, FALSE, $4, $5)`,
+          [id, args.entry_id, args.text, sortOrder, now]);
+        await dbRun(tx, `UPDATE journal_entries SET updated_at = $1, version = version + 1 WHERE id = $2 AND household_id = $3`, [now, args.entry_id, householdId]);
+        return dbGet(tx, `SELECT id, text, completed, sort_order, updated_at, version
+          FROM journal_checklist_items WHERE id = $1`, [id]);
+      });
       return { item: row, created_id: id };
     }
 
     case 'toggle_checklist_item': {
-      // Verify ownership via the parent entry
-      const owner = await dbGet(sql,
-        `SELECT ci.entry_id FROM journal_checklist_items ci
-           JOIN journal_entries je ON je.id = ci.entry_id
-          WHERE ci.id = $1 AND je.household_id = $2 AND je.deleted_at IS NULL LIMIT 1`,
-        [args.item_id, householdId]);
-      if (!owner) throw new Error(`checklist item not found: ${args.item_id}`);
       const now = Date.now();
-      await dbRun(sql,
-        `UPDATE journal_checklist_items SET completed = $1, updated_at = $2 WHERE id = $3`,
-        [args.completed, now, args.item_id]);
-      await dbRun(sql,
-        `UPDATE journal_entries SET updated_at = $1 WHERE id = $2`,
-        [now, (owner as { entry_id: string }).entry_id]);
+      await sql.begin(async (tx) => {
+        const owner = await dbGet<{ entry_id: string }>(tx,
+          `SELECT ci.entry_id FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+            WHERE ci.id = $1 AND je.household_id = $2 AND je.deleted_at IS NULL`, [args.item_id, householdId]);
+        if (!owner) throw new Error(`checklist item not found: ${args.item_id}`);
+        await dbGet(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 FOR UPDATE`, [owner.entry_id, householdId]);
+        await dbRun(tx, `UPDATE journal_checklist_items SET completed = $1, updated_at = $2, version = version + 1 WHERE id = $3`, [args.completed, now, args.item_id]);
+        await dbRun(tx, `UPDATE journal_entries SET updated_at = $1, version = version + 1 WHERE id = $2 AND household_id = $3`, [now, owner.entry_id, householdId]);
+      });
       return { item_id: args.item_id, completed: args.completed };
     }
 
@@ -549,6 +538,12 @@ interface ProposedChange {
   description: string;
   was: unknown;
   becomes: unknown;
+}
+
+async function removeJournalChildren(tx: Queryable, householdId: string, entryIds: string[]): Promise<void> {
+  if (!entryIds.length) return;
+  await dbRun(tx, `DELETE FROM journal_entry_photos WHERE household_id = $1 AND entry_id = ANY($2)`, [householdId, entryIds]);
+  await dbRun(tx, `DELETE FROM journal_checklist_items WHERE entry_id = ANY($1)`, [entryIds]);
 }
 
 async function previewDestructive(
@@ -647,7 +642,7 @@ async function applyDestructive(
 
   switch (name) {
     case 'update_planting_event': {
-      const sets: string[] = ['updated_at = $1'];
+      const sets: string[] = ['updated_at = $1', 'version = version + 1'];
       const params: unknown[] = [now];
       let p = 2;
       for (const key of [
@@ -657,28 +652,36 @@ async function applyDestructive(
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
-      await dbRun(sql,
-        `UPDATE planting_events SET ${sets.join(', ')}
-           WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-        params);
+      await sql.begin(async (tx) => {
+        for (const [table, key] of [['beds', 'bed_id'], ['seeds', 'seed_id']] as const) {
+          if (key in args && args[key] && !await dbGet(tx, `SELECT id FROM ${table} WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [args[key], householdId])) throw new Error(`${table} reference invalid`);
+        }
+        await dbGet(tx, `SELECT id FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        await dbRun(tx, `UPDATE planting_events SET ${sets.join(', ')}
+          WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`, params);
+      });
       return { updated_id: args.id };
     }
     case 'update_journal_entry': {
-      const sets: string[] = ['updated_at = $1'];
+      const sets: string[] = ['updated_at = $1', 'version = version + 1'];
       const params: unknown[] = [now];
       let p = 2;
       for (const key of ['body', 'occurred_on', 'seed_id', 'bed_id', 'planting_event_id']) {
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
-      await dbRun(sql,
-        `UPDATE journal_entries SET ${sets.join(', ')}
-           WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-        params);
+      await sql.begin(async (tx) => {
+        for (const [table, key] of [['seeds', 'seed_id'], ['beds', 'bed_id'], ['planting_events', 'planting_event_id']] as const) {
+          if (key in args && args[key] && !await dbGet(tx, `SELECT id FROM ${table} WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [args[key], householdId])) throw new Error(`${table} reference invalid`);
+        }
+        await dbGet(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        await dbRun(tx, `UPDATE journal_entries SET ${sets.join(', ')}
+          WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`, params);
+      });
       return { updated_id: args.id };
     }
     case 'update_seed': {
-      const sets: string[] = ['updated_at = $1'];
+      const sets: string[] = ['updated_at = $1', 'version = version + 1'];
       const params: unknown[] = [now];
       let p = 2;
       for (const key of [
@@ -689,14 +692,16 @@ async function applyDestructive(
         if (key in args) { sets.push(`${key} = $${p++}`); params.push(args[key]); }
       }
       params.push(args.id, householdId);
-      await dbRun(sql,
-        `UPDATE seeds SET ${sets.join(', ')}
-           WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-        params);
+      await sql.begin(async (tx) => {
+        if ('location_id' in args && args.location_id && !await dbGet(tx, `SELECT id FROM locations WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [args.location_id, householdId])) throw new Error('location reference invalid');
+        await dbGet(tx, `SELECT id FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        await dbRun(tx, `UPDATE seeds SET ${sets.join(', ')}
+          WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`, params);
+      });
       return { updated_id: args.id };
     }
     case 'update_bed': {
-      const sets: string[] = ['updated_at = $1'];
+      const sets: string[] = ['updated_at = $1', 'version = version + 1'];
       const params: unknown[] = [now];
       let p = 2;
       for (const key of ['name', 'width_feet', 'length_feet', 'sort_order']) {
@@ -710,53 +715,60 @@ async function applyDestructive(
       return { updated_id: args.id };
     }
     case 'delete_planting_event': {
-      await dbRun(sql,
-        `UPDATE planting_events SET deleted_at = $1, updated_at = $1
-           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
+      await sql.begin(async (tx) => {
+        const current = await dbGet<{ id: string }>(tx, `SELECT id FROM planting_events
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        if (!current) return;
+        await dbRun(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
+        const rows = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
+        await removeJournalChildren(tx, householdId, rows.map((r) => r.id));
+      });
       return { deleted_id: args.id };
     }
     case 'delete_journal_entry': {
-      await dbRun(sql,
-        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
+      await sql.begin(async (tx) => {
+        const current = await dbGet<{ id: string }>(tx, `SELECT id FROM journal_entries
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        if (!current) return;
+        await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
+        await removeJournalChildren(tx, householdId, [String(args.id)]);
+      });
       return { deleted_id: args.id };
     }
     case 'delete_seed': {
-      // Cascade: child planting_events + journal_entries referencing
-      // this seed lose their parent. Soft-delete them too so iOS sees
-      // matching deletes on the next sync — otherwise child rows leak,
-      // pointing at a gone seed.
-      await dbRun(sql,
-        `UPDATE seeds SET deleted_at = $1, updated_at = $1
-           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
-      await dbRun(sql,
-        `UPDATE planting_events SET deleted_at = $1, updated_at = $1
-           WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
-      await dbRun(sql,
-        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-           WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
+      await sql.begin(async (tx) => {
+        const current = await dbGet<{ id: string }>(tx, `SELECT id FROM seeds
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        if (!current) return;
+        await dbRun(tx, `UPDATE seeds SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
+        const events = await dbAll<{ id: string }>(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
+        const eventIds = events.map((r) => r.id);
+        const entries = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE household_id = $2 AND deleted_at IS NULL AND (seed_id = $3 OR planting_event_id = ANY($4)) RETURNING id`, [now, householdId, args.id, eventIds]);
+        await removeJournalChildren(tx, householdId, entries.map((r) => r.id));
+        await dbRun(tx, `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [args.id, householdId]);
+      });
       return { deleted_id: args.id };
     }
     case 'delete_bed': {
-      // Cascade: child planting_events + journal_entries scoped to
-      // this bed go with the bed.
-      await dbRun(sql,
-        `UPDATE beds SET deleted_at = $1, updated_at = $1
-           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
-      await dbRun(sql,
-        `UPDATE planting_events SET deleted_at = $1, updated_at = $1
-           WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
-      await dbRun(sql,
-        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-           WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-        [now, args.id, householdId]);
+      await sql.begin(async (tx) => {
+        const current = await dbGet<{ id: string }>(tx, `SELECT id FROM beds
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
+        if (!current) return;
+        await dbRun(tx, `UPDATE beds SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
+        const events = await dbAll<{ id: string }>(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
+        const eventIds = events.map((r) => r.id);
+        const entries = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE household_id = $2 AND deleted_at IS NULL AND (bed_id = $3 OR planting_event_id = ANY($4)) RETURNING id`, [now, householdId, args.id, eventIds]);
+        await removeJournalChildren(tx, householdId, entries.map((r) => r.id));
+      });
       return { deleted_id: args.id };
     }
     case 'set_household_location': {

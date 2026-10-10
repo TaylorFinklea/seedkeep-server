@@ -58,6 +58,12 @@ describe('deltaCursorWhere', () => {
 });
 
 describe('buildDeltaPayload — cursor_id', () => {
+  it('preserves version values on versioned garden rows', () => {
+    const query = parseDeltaQuery(qs({ since: '0', limit: '10' }));
+    const payload = buildDeltaPayload([{ id: 'seed-1', updated_at: 12, version: 4 }], query);
+    expect(payload.items[0]).toEqual({ id: 'seed-1', updated_at: 12, version: 4 });
+  });
+
   it("emits the last item's id as cursor_id", () => {
     const query = parseDeltaQuery(qs({ since: '0', limit: '10' }));
     const payload = buildDeltaPayload(
