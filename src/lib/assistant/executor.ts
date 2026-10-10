@@ -719,11 +719,13 @@ async function applyDestructive(
         const current = await dbGet<{ id: string }>(tx, `SELECT id FROM planting_events
           WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
         if (!current) return;
+        const descendants = await dbAll<{ id: string }>(tx, `SELECT id FROM journal_entries WHERE planting_event_id = $1 AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [args.id, householdId]);
+        const entryIds = descendants.map((r) => r.id);
         await dbRun(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
-        const rows = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
-          WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
-        await removeJournalChildren(tx, householdId, rows.map((r) => r.id));
+        await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
+        await removeJournalChildren(tx, householdId, entryIds);
       });
       return { deleted_id: args.id };
     }
@@ -743,15 +745,19 @@ async function applyDestructive(
         const current = await dbGet<{ id: string }>(tx, `SELECT id FROM seeds
           WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
         if (!current) return;
+        const events = await dbAll<{ id: string }>(tx, `SELECT id FROM planting_events WHERE seed_id = $1 AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [args.id, householdId]);
+        const eventIds = events.map((r) => r.id);
+        const entries = await dbAll<{ id: string }>(tx, `SELECT id FROM journal_entries
+          WHERE household_id = $1 AND deleted_at IS NULL AND (seed_id = $2 OR planting_event_id = ANY($3)) ORDER BY id FOR UPDATE`, [householdId, args.id, eventIds]);
+        const entryIds = entries.map((r) => r.id);
         await dbRun(tx, `UPDATE seeds SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
-        const events = await dbAll<{ id: string }>(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
-          WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
-        const eventIds = events.map((r) => r.id);
-        const entries = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
-          WHERE household_id = $2 AND deleted_at IS NULL AND (seed_id = $3 OR planting_event_id = ANY($4)) RETURNING id`, [now, householdId, args.id, eventIds]);
-        await removeJournalChildren(tx, householdId, entries.map((r) => r.id));
+        await dbRun(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, eventIds, householdId]);
+        await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
         await dbRun(tx, `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [args.id, householdId]);
+        await removeJournalChildren(tx, householdId, entryIds);
       });
       return { deleted_id: args.id };
     }
@@ -760,14 +766,18 @@ async function applyDestructive(
         const current = await dbGet<{ id: string }>(tx, `SELECT id FROM beds
           WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [args.id, householdId]);
         if (!current) return;
+        const events = await dbAll<{ id: string }>(tx, `SELECT id FROM planting_events WHERE bed_id = $1 AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [args.id, householdId]);
+        const eventIds = events.map((r) => r.id);
+        const entries = await dbAll<{ id: string }>(tx, `SELECT id FROM journal_entries
+          WHERE household_id = $1 AND deleted_at IS NULL AND (bed_id = $2 OR planting_event_id = ANY($3)) ORDER BY id FOR UPDATE`, [householdId, args.id, eventIds]);
+        const entryIds = entries.map((r) => r.id);
         await dbRun(tx, `UPDATE beds SET deleted_at = $1, updated_at = $1, version = version + 1
           WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`, [now, args.id, householdId]);
-        const events = await dbAll<{ id: string }>(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
-          WHERE bed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, args.id, householdId]);
-        const eventIds = events.map((r) => r.id);
-        const entries = await dbAll<{ id: string }>(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
-          WHERE household_id = $2 AND deleted_at IS NULL AND (bed_id = $3 OR planting_event_id = ANY($4)) RETURNING id`, [now, householdId, args.id, eventIds]);
-        await removeJournalChildren(tx, householdId, entries.map((r) => r.id));
+        await dbRun(tx, `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, eventIds, householdId]);
+        await dbRun(tx, `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
+        await removeJournalChildren(tx, householdId, entryIds);
       });
       return { deleted_id: args.id };
     }

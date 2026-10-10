@@ -503,10 +503,12 @@ plantingEventRoutes.delete('/planting-events/:id', ...auth, async (c) => {
         WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL${expected === null ? '' : ' AND version = $4'} RETURNING version`,
       expected === null ? [now, id, householdId] : [now, id, householdId, expected]);
     if (!changed[0]) return { row: null, current, keys: [] as string[] };
-    const entries = await tx.unsafe<{ id: string }[]>(
+    const entryRows = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM journal_entries WHERE planting_event_id = $1 AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [id, householdId]);
+    const entryIds = entryRows.map((e) => e.id);
+    await tx.unsafe<{ id: string }[]>(
       `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
-        WHERE planting_event_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, id, householdId]);
-    const entryIds = entries.map((e) => e.id);
+        WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`, [now, entryIds, householdId]);
     const photos = await tx.unsafe<{ storage_key: string }[]>(
       `SELECT storage_key FROM journal_entry_photos WHERE entry_id = ANY($1) AND household_id = $2`, [entryIds, householdId]);
     await tx.unsafe(`DELETE FROM journal_entry_photos WHERE entry_id = ANY($1) AND household_id = $2`, [entryIds, householdId]);

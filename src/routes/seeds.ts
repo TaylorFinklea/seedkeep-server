@@ -77,7 +77,11 @@ const createSchema = z.object({
   tag_ids: z.array(z.string()).max(50).refine((ids) => new Set(ids).size === ids.length, 'tag_ids must be unique').optional(),
 });
 
-const updateSchema = createSchema.partial();
+// Defaults belong to creates. PATCH must leave omitted defaulted fields alone.
+const updateSchema = createSchema.extend({
+  packet_count: z.number().int().min(0).max(10_000).optional(),
+  source: z.enum(SOURCES).optional(),
+}).partial();
 
 const listFiltersSchema = z.object({
   state: z.enum(STATES).optional(),
@@ -426,7 +430,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     params.push(expected);
     where += ` AND version = $${params.length}`;
   }
-  let result: { row: SeedListRow | null; current: SeedListRow | null; photos: string[] };
+  let result: { row: SeedListRow | null; current: SeedListRow | null };
   try {
     result = await sql.begin(async (tx) => {
       const desiredLocation = data.location_id !== undefined ? data.location_id ?? null : null;
@@ -442,7 +446,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
                 created_at, updated_at, deleted_at, version
            FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`,
         [id, householdId]);
-      if (!owner) return { row: null, current: null, photos: [] };
+      if (!owner) return { row: null, current: null };
       const updated = await tx.unsafe<{ id: string }[]>(
         `UPDATE seeds SET ${setSql} WHERE ${where} RETURNING *`,
         params as never,
@@ -455,7 +459,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
           WHERE s.id = $1 AND s.household_id = $2 AND s.deleted_at IS NULL`, [id, householdId]);
       if (!updated[0]) {
         const current = await selectCurrent();
-        return { row: null, current, photos: [] };
+        return { row: null, current };
       }
       if (data.tag_ids !== undefined) {
         await dbRun(tx, `DELETE FROM seed_tags WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
@@ -464,9 +468,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
         }
       }
       const row = await selectCurrent();
-      const photos = await dbAll<{ r2_key: string }>(tx,
-        `SELECT r2_key FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
-      return { row, current: null, photos: photos.map((p) => p.r2_key) };
+      return { row, current: null };
     });
   } catch (err) {
     if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) {
@@ -515,13 +517,17 @@ seedRoutes.delete('/seeds/:id', ...auth, async (c) => {
         WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL${expected === null ? '' : ' AND version = $4'} RETURNING version`, params as never);
     if (!changed[0]) return { gone: false as const, current, keys: [] as string[] };
     const events = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM planting_events WHERE seed_id = $1 AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [id, householdId]);
+    const eventIds = events.map((e) => e.id);
+    const entries = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM journal_entries WHERE household_id = $1 AND deleted_at IS NULL AND (seed_id = $2 OR planting_event_id = ANY($3)) ORDER BY id FOR UPDATE`, [householdId, id, eventIds]);
+    await tx.unsafe<{ id: string }[]>(
       `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
         WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, id, householdId]);
-    const eventIds = events.map((e) => e.id);
     await tx.unsafe(
       `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
-        WHERE household_id = $2 AND deleted_at IS NULL AND (seed_id = $3 OR planting_event_id = ANY($4))`,
-      [now, householdId, id, eventIds]);
+        WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`,
+      [now, entries.map((e) => e.id), householdId]);
     const journalPhotos = await tx.unsafe<{ storage_key: string }[]>(
       `SELECT p.storage_key FROM journal_entry_photos p JOIN journal_entries j ON j.id = p.entry_id
         WHERE j.household_id = $1 AND (j.seed_id = $2 OR j.planting_event_id = ANY($3))`, [householdId, id, eventIds]);
