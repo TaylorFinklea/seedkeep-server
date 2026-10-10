@@ -60,6 +60,7 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
     const replay = await dbGet<PhotoRow>(sql,
       `SELECT id, seed_id, household_id, r2_key, role, width, height, byte_size, captured_at FROM seed_photos WHERE id = $1 AND household_id = $2`, [requestedId, householdId]);
     if (replay) {
+      if (replay.seed_id !== seedId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
       const owner = await dbGet<{ version: number }>(sql, `SELECT version FROM seeds WHERE id = $1 AND household_id = $2`, [replay.seed_id, householdId]);
       if (owner) setVersionHeader(c, owner.version);
       return c.json({ ok: true, data: { photo: replay } });
@@ -118,13 +119,15 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
   const now = Date.now();
   let racedReplay: PhotoRow | null = null;
   let parentVersion: number;
+  let uploadAttempted = false;
   try {
   parentVersion = await sql.begin(async (tx) => {
     const parent = await dbGet<{ id: string; version: number }>(tx,
-      `SELECT id, version FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [seedId, householdId]);
+      `SELECT id, version FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [seedId, householdId]);
     if (!parent) throw new Error('SEED_NOT_FOUND');
     const collision = await dbGet<{ id: string; household_id: string }>(tx, `SELECT id, household_id FROM seed_photos WHERE id = $1`, [id]);
     if (collision) throw new Error(collision.household_id === householdId ? 'SEED_PHOTO_REPLAY_RACE' : 'SEED_PHOTO_CONFLICT');
+    uploadAttempted = true;
     await putPhoto(c.env, key, body, mime!);
     await dbRun(tx, `INSERT INTO seed_photos (id, seed_id, household_id, r2_key, role, byte_size, captured_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7)`, [id, seedId, householdId, key, roleParam, body.byteLength, now]);
@@ -133,10 +136,11 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
     return bumped[0]!.version;
   });
   } catch (err) {
+    if (uploadAttempted) await deletePhoto(c.env, key).catch(() => {});
     if (err instanceof Error && err.message === 'SEED_PHOTO_REPLAY_RACE') {
-      await deletePhoto(c.env, key).catch(() => {});
       racedReplay = await dbGet<PhotoRow>(sql, `SELECT id, seed_id, household_id, r2_key, role, width, height, byte_size, captured_at FROM seed_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
       if (racedReplay) {
+        if (racedReplay.seed_id !== seedId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
         const owner = await dbGet<{ version: number }>(sql, `SELECT version FROM seeds WHERE id = $1 AND household_id = $2`, [racedReplay.seed_id, householdId]);
         if (owner) setVersionHeader(c, owner.version);
         return c.json({ ok: true, data: { photo: racedReplay } });
@@ -144,9 +148,9 @@ photoRoutes.post('/seeds/:seedId/photos', ...auth, async (c) => {
       return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
     }
     if (isUniqueViolation(err)) {
-      await deletePhoto(c.env, key).catch(() => {});
       racedReplay = await dbGet<PhotoRow>(sql, `SELECT id, seed_id, household_id, r2_key, role, width, height, byte_size, captured_at FROM seed_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
       if (!racedReplay) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+      if (racedReplay.seed_id !== seedId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
       const owner = await dbGet<{ version: number }>(sql, `SELECT version FROM seeds WHERE id = $1 AND household_id = $2`, [racedReplay.seed_id, householdId]);
       if (owner) setVersionHeader(c, owner.version);
       return c.json({ ok: true, data: { photo: racedReplay } });

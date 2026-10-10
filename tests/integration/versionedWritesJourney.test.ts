@@ -58,11 +58,13 @@ afterAll(async () => {
 
 describe('versioned garden writes', () => {
   it('PATCH is field-selective, honors If-Match and returns current state on conflict', async () => {
-    const fx = await fixture(); const seedId = await makeSeed(fx);
+    const fx = await fixture(); const seedId = uid('vwi-seed');
+    const created = await request(fx, '/seeds', 'POST', { id: seedId, state: 'active', packet_count: 5, source: 'gift' });
+    expect(created.status).toBe(200);
     const first = await request(fx, `/seeds/${seedId}`, 'PATCH', { notes: 'updated' }, { 'If-Match': '"1"' });
     expect(first.status).toBe(200); expect(first.headers.get('ETag')).toBe('"2"');
-    const firstJson = await json<{ data: { seed: { version: number; state: string; custom_type: string } } }>(first);
-    expect(firstJson.data.seed).toMatchObject({ version: 2, state: 'active', custom_type: 'Heritage' });
+    const firstJson = await json<{ data: { seed: { version: number; state: string; packet_count: number; source: string } } }>(first);
+    expect(firstJson.data.seed).toMatchObject({ version: 2, state: 'active', packet_count: 5, source: 'gift' });
     const stale = await request(fx, `/seeds/${seedId}`, 'PATCH', { state: 'wishlist' }, { 'If-Match': '1' });
     expect(stale.status).toBe(409);
     expect((await json<{ data: { current: { version: number; notes: string } } }>(stale)).data.current).toMatchObject({ version: 2, notes: 'updated' });
@@ -77,7 +79,7 @@ describe('versioned garden writes', () => {
     expect(legacy.status).toBe(200);
     const feed = await request(fx, '/seeds?since=0');
     const feedJson = await json<{ data: { items: Array<{ id: string; version: number; custom_type: string }> } }>(feed);
-    expect(feedJson.data.items.find((item) => item.id === seedId)).toMatchObject({ version: 4, custom_type: 'Heritage' });
+    expect(feedJson.data.items.find((item) => item.id === seedId)).toMatchObject({ version: 4, packet_count: 5 });
     const deleted = await request(fx, `/seeds/${seedId}`, 'DELETE', undefined, { 'If-Match': '4' });
     expect(deleted.status).toBe(200);
     const replay = await request(fx, '/seeds', 'POST', { id: seedId, state: 'active', custom_type: 'Heritage' });
@@ -106,6 +108,10 @@ describe('versioned garden writes', () => {
     expect(parent[0]!.version).toBe(4);
     const itemReplay = await request(fx, `/journal/${entryId}/checklist`, 'POST', { id: itemId, text: 'ignored again' });
     expect((await json<{ data: { item: { version: number; text: string } } }>(itemReplay)).data.item).toMatchObject({ version: 2, text: 'Water' });
+    const otherEntryId = uid('vwi-other-entry');
+    expect((await makeJournal(fx, otherEntryId)).status).toBe(200);
+    const wrongParentReplay = await request(fx, `/journal/${otherEntryId}/checklist`, 'POST', { id: itemId, text: 'Water again' });
+    expect(wrongParentReplay.status).toBe(409);
     const checklistFeed = await request(fx, `/journal?since=0`);
     expect((await json<{ data: { items: Array<{ id: string; version: number }> } }>(checklistFeed)).data.items.find((item) => item.id === entryId)?.version).toBe(4);
   });
@@ -123,6 +129,8 @@ describe('versioned garden writes', () => {
 
     const entryId = uid('vwi-photo-entry'); await makeJournal(a, entryId);
     const seedPhotoId = uid('vwi-seed-photo'); const journalPhotoId = uid('vwi-journal-photo'); const now = Date.now();
+    const otherSeedId = await makeSeed(a);
+    const otherEntryId = uid('vwi-other-photo-entry'); await makeJournal(a, otherEntryId);
     await sql.unsafe(`INSERT INTO seed_photos (id,seed_id,household_id,r2_key,role,captured_at) VALUES ($1,$2,$3,'seed-replay-key','extra',$4)`, [seedPhotoId, seedId, a.householdId, now]);
     await sql.unsafe(`INSERT INTO journal_entry_photos (id,entry_id,household_id,storage_key,sort_order,created_at,updated_at) VALUES ($1,$2,$3,'journal-replay-key',0,$4,$4)`, [journalPhotoId, entryId, a.householdId, now]);
     const seedReplay = await request(a, `/seeds/${seedId}/photos?id=${seedPhotoId}`, 'POST');
@@ -131,6 +139,8 @@ describe('versioned garden writes', () => {
     const journalReplay = await request(a, `/journal/${entryId}/photos?id=${journalPhotoId}`, 'POST');
     expect(journalReplay.status).toBe(200);
     expect((await json<{ data: { photo: { id: string; storageKey: string } } }>(journalReplay)).data.photo).toMatchObject({ id: journalPhotoId, storageKey: 'journal-replay-key' });
+    expect((await request(a, `/seeds/${otherSeedId}/photos?id=${seedPhotoId}`, 'POST')).status).toBe(409);
+    expect((await request(a, `/journal/${otherEntryId}/photos?id=${journalPhotoId}`, 'POST')).status).toBe(409);
     expect((await request(b, `/seeds/${seedId}/photos?id=${seedPhotoId}`, 'POST')).status).toBe(409);
   });
 
@@ -181,7 +191,8 @@ describe('versioned garden writes', () => {
     expect(remaining[0]!.n).toBe(0);
     const replay = await makeJournal(fx, entryId);
     expect(replay.status).toBe(200);
-    expect((await json<{ data: { entry: { deletedAt: number | null; version: number } } }>(replay)).data.entry).toMatchObject({ version: 2 });
+    const version = created.status === 200 ? 3 : 2;
+    expect((await json<{ data: { entry: { deletedAt: number | null; version: number } } }>(replay)).data.entry).toMatchObject({ version });
   });
 
   it('rolls back the entire seed cascade when a journal tombstone fails', async () => {

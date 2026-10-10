@@ -440,6 +440,7 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
     const replay = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
       FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [idParam, householdId]);
     if (replay) {
+      if (replay.entry_id !== entryId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
       const parent = await dbGet<{ version: number }>(sql, `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [replay.entry_id, householdId]);
       if (parent) setVersionHeader(c, parent.version);
       return c.json({ ok: true, data: { photo: photoToDto(replay) } });
@@ -481,6 +482,7 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
   const heightHeader = c.req.header('X-Photo-Height');
   const width = widthHeader ? parseInt(widthHeader, 10) || null : null;
   const height = heightHeader ? parseInt(heightHeader, 10) || null : null;
+  let uploadAttempted = false;
 
   const row = await sql.begin(async (tx) => {
     const parent = await dbGet<{ id: string }>(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [entryId, householdId]);
@@ -489,6 +491,7 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
     if (collision) throw new Error(collision.household_id === householdId ? 'JOURNAL_PHOTO_REPLAY_RACE' : 'JOURNAL_PHOTO_CONFLICT');
     const maxRow = await dbGet<{ max: number | null }>(tx, `SELECT MAX(sort_order) AS max FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2`, [entryId, householdId]);
     const sortOrder = (maxRow?.max ?? -1) + 1;
+    uploadAttempted = true;
     await putPhoto(c.env, key, body, mime!);
     await dbRun(tx, `INSERT INTO journal_entry_photos
       (id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at)
@@ -498,21 +501,22 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
     return { photo: await dbGet<PhotoRow>(tx, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
       FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]), version: bumped[0]!.version };
   }).catch(async (err) => {
+    if (uploadAttempted) await deletePhoto(c.env, key).catch(() => {});
     if (err instanceof Error && err.message === 'JOURNAL_PHOTO_REPLAY_RACE') {
-      await deletePhoto(c.env, key).catch(() => {});
       const existing = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
         FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
       if (existing) {
+        if (existing.entry_id !== entryId) return { conflict: true as const };
         const parent = await dbGet<{ version: number }>(sql,
           `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [existing.entry_id, householdId]);
         return { photo: existing, version: parent?.version ?? null };
       }
     }
     if (isUniqueViolation(err)) {
-      await deletePhoto(c.env, key).catch(() => {});
       const existing = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
         FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
       if (existing) {
+        if (existing.entry_id !== entryId) return { conflict: true as const };
         const parent = await dbGet<{ version: number }>(sql,
           `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [existing.entry_id, householdId]);
         return { photo: existing, version: parent?.version ?? null };
@@ -625,12 +629,18 @@ journalRoutes.post('/:id/checklist', ...auth, async (c) => {
          FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
         WHERE ci.id = $1 AND je.household_id = $2`, [id, householdId]);
     if (replay) {
+      if (replay.entry_id !== entryId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
       setVersionHeader(c, replay.version);
       return c.json({ ok: true, data: { item: checklistToDto(replay) } });
     }
     if (await dbGet(sql, `SELECT id FROM journal_checklist_items WHERE id = $1`, [id])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
   }
-  const result = await sql.begin(async (tx) => {
+  let result: {
+    missing: boolean; row: ChecklistRow | null; version: number | null;
+    replay?: boolean; conflict?: boolean;
+  };
+  try {
+  result = await sql.begin(async (tx) => {
     const parent = await dbGet<{ id: string; version: number }>(tx,
       `SELECT id, version FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [entryId, householdId]);
     if (!parent) return { missing: true as const, row: null as ChecklistRow | null, version: null as number | null };
@@ -638,7 +648,10 @@ journalRoutes.post('/:id/checklist', ...auth, async (c) => {
       `SELECT ci.id, ci.entry_id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
          FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
         WHERE ci.id = $1 AND je.household_id = $2`, [id, householdId]);
-    if (replay) return { missing: false as const, row: replay, version: parent.version, replay: true };
+    if (replay) {
+      if (replay.entry_id !== entryId) return { missing: false as const, row: null, version: null, conflict: true as const };
+      return { missing: false as const, row: replay, version: parent.version, replay: true };
+    }
     const globallyTaken = await dbGet<{ id: string }>(tx, `SELECT id FROM journal_checklist_items WHERE id = $1`, [id]);
     if (globallyTaken) return { missing: false as const, row: null, version: null, conflict: true };
     const max = await dbGet<{ max: number | null }>(tx, `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`, [entryId]);
@@ -650,6 +663,15 @@ journalRoutes.post('/:id/checklist', ...auth, async (c) => {
       FROM journal_checklist_items WHERE id = $1`, [id]);
     return { missing: false as const, row, version: bumped[0]!.version, replay: false };
   });
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+    const replay = await dbGet<ChecklistRow>(sql,
+      `SELECT ci.id, ci.entry_id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
+         FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+        WHERE ci.id = $1 AND je.household_id = $2`, [id, householdId]);
+    if (!replay || replay.entry_id !== entryId) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+    result = { missing: false, row: replay, version: replay.version, replay: true };
+  }
   if (result.missing) return c.json({ ok: false, error: { code: 'invalid_reference', message: 'Journal entry does not exist in this household.' } }, 400);
   if ('conflict' in result) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
   if (!result.row) return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
