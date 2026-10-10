@@ -4,11 +4,11 @@ import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
-import { dbAll, dbBatch, dbGet, dbRun, isFkViolation, isUniqueViolation } from '../db/helpers';
+import { dbAll, dbGet, dbRun, isFkViolation, isUniqueViolation, type Queryable } from '../db/helpers';
 import { getSql } from '../db/client';
 import { buildDeltaPayload, parseDeltaQuery } from '../lib/sync';
-import type { Sql } from 'postgres';
 import { deletePhoto } from '../lib/storage';
+import { expectedVersion, invalidIfMatch, setVersionHeader, versionConflict } from '../lib/versioning';
 
 export const seedRoutes = new Hono<AppEnv>();
 
@@ -30,6 +30,8 @@ interface SeedRow {
   custom_variety: string | null;
   custom_company: string | null;
   notes: string | null;
+  custom_type: string | null;
+  version: number;
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
@@ -71,7 +73,8 @@ const createSchema = z.object({
   custom_variety: z.string().trim().max(120).nullish(),
   custom_company: z.string().trim().max(120).nullish(),
   notes: z.string().trim().max(2000).nullish(),
-  tag_ids: z.array(z.string()).max(50).optional(),
+  custom_type: z.string().trim().max(80).nullish(),
+  tag_ids: z.array(z.string()).max(50).refine((ids) => new Set(ids).size === ids.length, 'tag_ids must be unique').optional(),
 });
 
 const updateSchema = createSchema.partial();
@@ -87,6 +90,7 @@ function seedTagStatements(
   householdId: string,
   tagIds: string[],
   now: number,
+  bumpParent = true,
 ): { sql: string; params: unknown[] }[] {
   return [
     {
@@ -97,30 +101,41 @@ function seedTagStatements(
       sql: `INSERT INTO seed_tags (seed_id, tag_id, household_id) VALUES ($1, $2, $3)`,
       params: [seedId, tagId, householdId] as unknown[],
     })),
-    {
-      sql: `UPDATE seeds SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
+    ...(bumpParent ? [{
+      sql: `UPDATE seeds SET updated_at = $1, version = version + 1 WHERE id = $2 AND household_id = $3`,
       params: [now, seedId, householdId],
-    },
+    }] : []),
   ];
-}
-
-async function setSeedTags(
-  sql: Sql,
-  seedId: string,
-  householdId: string,
-  tagIds: string[],
-  now: number,
-): Promise<void> {
-  await dbBatch(sql, seedTagStatements(seedId, householdId, tagIds, now));
 }
 
 // SQL fragment: aggregates a seed's tag_ids into a Postgres TEXT[] (native
 // array). NULL when no tags — `COALESCE` to an empty array. Returns the
 // column as `tag_ids` in the result set.
 const TAG_IDS_AGG = `COALESCE(
-  (SELECT array_agg(tag_id ORDER BY tag_id) FROM seed_tags WHERE seed_id = s.id),
+  (SELECT array_agg(tag_id ORDER BY tag_id) FROM seed_tags WHERE seed_id = s.id AND household_id = s.household_id),
   ARRAY[]::TEXT[]
 ) AS tag_ids`;
+
+async function lockSeedReferences(
+  q: Queryable,
+  householdId: string,
+  locationId: string | null | undefined,
+  tagIds: string[] | undefined,
+): Promise<boolean> {
+  if (locationId) {
+    const row = await dbGet<{ id: string }>(q,
+      `SELECT id FROM locations WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`,
+      [locationId, householdId]);
+    if (!row) return false;
+  }
+  if (tagIds?.length) {
+    const rows = await dbAll<{ id: string }>(q,
+      `SELECT id FROM tags WHERE id = ANY($1) AND household_id = $2 AND deleted_at IS NULL ORDER BY id FOR SHARE`,
+      [tagIds, householdId]);
+    if (new Set(rows.map((r) => r.id)).size !== new Set(tagIds).size) return false;
+  }
+  return true;
+}
 
 /**
  * GET /api/seeds?since=<ms>&limit=<n>&state=<>&location_id=<>&tag_id=<>
@@ -177,7 +192,7 @@ seedRoutes.get('/seeds', ...auth, async (c) => {
   }
   if (filters.data.tag_id) {
     addWhere(
-      'EXISTS (SELECT 1 FROM seed_tags st WHERE st.seed_id = s.id AND st.tag_id = ?)',
+      'EXISTS (SELECT 1 FROM seed_tags st WHERE st.seed_id = s.id AND st.household_id = s.household_id AND st.tag_id = ?)',
       filters.data.tag_id,
     );
   }
@@ -189,7 +204,7 @@ seedRoutes.get('/seeds', ...auth, async (c) => {
     sql,
     `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
             s.location_id, s.year_packed, s.source, s.custom_name,
-            s.custom_variety, s.custom_company, s.notes,
+            s.custom_variety, s.custom_company, s.custom_type, s.notes, s.version,
             s.created_at, s.updated_at, s.deleted_at,
             ${TAG_IDS_AGG}
        FROM seeds s
@@ -217,7 +232,7 @@ seedRoutes.get('/seeds/:id', ...auth, async (c) => {
     sql,
     `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
             s.location_id, s.year_packed, s.source, s.custom_name,
-            s.custom_variety, s.custom_company, s.notes,
+            s.custom_variety, s.custom_company, s.custom_type, s.notes, s.version,
             s.created_at, s.updated_at, s.deleted_at,
             ${TAG_IDS_AGG}
        FROM seeds s
@@ -228,6 +243,7 @@ seedRoutes.get('/seeds/:id', ...auth, async (c) => {
   if (!seed) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
   }
+  setVersionHeader(c, seed.version);
   const photos = await dbAll<SeedPhotoRow>(
     sql,
     `SELECT id, seed_id, household_id, r2_key, role, width, height, byte_size, captured_at
@@ -259,32 +275,56 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
   const id = parsed.data.id ?? nanoid();
   const now = Date.now();
   const data = parsed.data;
+  if (parsed.data.id) {
+    const existing = await dbGet<SeedListRow>(sql,
+      `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count, s.location_id, s.year_packed,
+              s.source, s.custom_name, s.custom_variety, s.custom_company, s.custom_type, s.notes,
+              s.created_at, s.updated_at, s.deleted_at, s.version, ${TAG_IDS_AGG}
+         FROM seeds s WHERE s.id = $1 AND s.household_id = $2 LIMIT 1`, [id, householdId]);
+    if (existing) {
+      const { tag_ids, ...rest } = existing;
+      setVersionHeader(c, existing.version);
+      return c.json({ ok: true, data: { seed: { ...rest, tag_ids: tag_ids ?? [] } } });
+    }
+    if (await dbGet(sql, `SELECT id FROM seeds WHERE id = $1`, [id])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  }
   try {
     // Seed INSERT + tag attachment run in ONE transaction. If a tag FK
     // fails, the seed insert rolls back too — so the 'invalid_reference'
     // retry advice below is actually safe to follow (the retry won't hit
     // a duplicate-id violation from a half-committed first attempt).
-    await dbBatch(sql, [
+    await sql.begin(async (tx) => {
+      if (!await lockSeedReferences(tx, householdId, data.location_id ?? null, data.tag_ids)) {
+        const error = new Error('invalid_reference');
+        (error as Error & { code?: string }).code = 'SEED_INVALID_REFERENCE';
+        throw error;
+      }
+      const statements = [
       {
         sql: `INSERT INTO seeds (
            id, household_id, catalog_id, state, packet_count,
            location_id, year_packed, source, custom_name,
-           custom_variety, custom_company, notes,
+           custom_variety, custom_company, custom_type, notes,
            created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         params: [
           id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
           data.location_id ?? null, data.year_packed ?? null, data.source,
           data.custom_name ?? null, data.custom_variety ?? null,
-          data.custom_company ?? null, data.notes ?? null,
+          data.custom_company ?? null, data.custom_type ?? null, data.notes ?? null,
           now, now,
         ],
       },
       ...(data.tag_ids && data.tag_ids.length > 0
-        ? seedTagStatements(id, householdId, data.tag_ids, now)
+        ? seedTagStatements(id, householdId, data.tag_ids, now, false)
         : []),
-    ]);
+      ];
+      for (const stmt of statements) await dbRun(tx, stmt.sql, stmt.params);
+    });
   } catch (err) {
+    if (err instanceof Error && err.message === 'invalid_reference') {
+      return c.json({ ok: false, error: { code: 'invalid_reference', message: 'A referenced location or tag does not exist in this household.' } }, 400);
+    }
     if (isUniqueViolation(err)) {
       // Retry of a create that already committed (response lost on the
       // wire). Replay the existing row as a success when it belongs to
@@ -293,7 +333,7 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
         sql,
         `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
                 s.location_id, s.year_packed, s.source, s.custom_name,
-                s.custom_variety, s.custom_company, s.notes,
+                s.custom_variety, s.custom_company, s.custom_type, s.notes, s.version,
                 s.created_at, s.updated_at, s.deleted_at,
                 ${TAG_IDS_AGG}
            FROM seeds s
@@ -303,6 +343,7 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
       );
       if (existing) {
         const { tag_ids, ...rest } = existing;
+        setVersionHeader(c, existing.version);
         return c.json({ ok: true, data: { seed: { ...rest, tag_ids: tag_ids ?? [] } } });
       }
       return c.json({
@@ -322,6 +363,7 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
     }
     throw err;
   }
+  setVersionHeader(c, 1);
   return c.json({
     ok: true,
     data: {
@@ -337,7 +379,9 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
         custom_name: data.custom_name ?? null,
         custom_variety: data.custom_variety ?? null,
         custom_company: data.custom_company ?? null,
+        custom_type: data.custom_type ?? null,
         notes: data.notes ?? null,
+        version: 1,
         created_at: now,
         updated_at: now,
         deleted_at: null,
@@ -361,55 +405,71 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: parsed.error.message } }, 400);
   }
 
-  const existing = await dbGet<SeedRow>(
-    sql,
-    `SELECT id, household_id, catalog_id, state, packet_count, location_id,
-            year_packed, source, custom_name, custom_variety, custom_company,
-            notes, created_at, updated_at, deleted_at
-       FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
-  }
-
   const data = parsed.data;
-  const merged: SeedRow = {
-    ...existing,
-    catalog_id: data.catalog_id !== undefined ? data.catalog_id ?? null : existing.catalog_id,
-    state: data.state ?? existing.state,
-    packet_count: data.packet_count ?? existing.packet_count,
-    location_id: data.location_id !== undefined ? data.location_id ?? null : existing.location_id,
-    year_packed: data.year_packed !== undefined ? data.year_packed ?? null : existing.year_packed,
-    source: data.source ?? existing.source,
-    custom_name: data.custom_name !== undefined ? data.custom_name ?? null : existing.custom_name,
-    custom_variety: data.custom_variety !== undefined ? data.custom_variety ?? null : existing.custom_variety,
-    custom_company: data.custom_company !== undefined ? data.custom_company ?? null : existing.custom_company,
-    notes: data.notes !== undefined ? data.notes ?? null : existing.notes,
-    updated_at: Date.now(),
-  };
-
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
+  const now = Date.now();
+  const columns: Record<string, unknown> = {};
+  for (const key of [
+    'catalog_id', 'state', 'packet_count', 'location_id', 'year_packed', 'source',
+    'custom_name', 'custom_variety', 'custom_company', 'custom_type', 'notes',
+  ] as const) {
+    if (data[key] !== undefined) columns[key] = data[key] ?? null;
+  }
+  const names = Object.keys(columns);
+  const setSql = names.map((name, i) => `${name} = $${i + 1}`).concat(
+    [`updated_at = $${names.length + 1}`, `version = version + 1`],
+  ).join(', ');
+  const params = [...names.map((name) => columns[name]), now, id, householdId];
+  let where = `id = $${names.length + 2} AND household_id = $${names.length + 3} AND deleted_at IS NULL`;
+  if (expected !== null) {
+    params.push(expected);
+    where += ` AND version = $${params.length}`;
+  }
+  let result: { row: SeedListRow | null; current: SeedListRow | null; photos: string[] };
   try {
-    await dbRun(
-      sql,
-      `UPDATE seeds SET
-         catalog_id = $1, state = $2, packet_count = $3, location_id = $4,
-         year_packed = $5, source = $6, custom_name = $7, custom_variety = $8,
-         custom_company = $9, notes = $10, updated_at = $11
-       WHERE id = $12 AND household_id = $13`,
-      [
-        merged.catalog_id, merged.state, merged.packet_count, merged.location_id,
-        merged.year_packed, merged.source, merged.custom_name, merged.custom_variety,
-        merged.custom_company, merged.notes, merged.updated_at,
-        id, householdId,
-      ],
-    );
-
-    if (data.tag_ids !== undefined) {
-      await setSeedTags(sql, id, householdId, data.tag_ids, merged.updated_at);
-    }
+    result = await sql.begin(async (tx) => {
+      const desiredLocation = data.location_id !== undefined ? data.location_id ?? null : null;
+      if (desiredLocation && !await lockSeedReferences(tx, householdId, desiredLocation, undefined)) {
+        throw Object.assign(new Error('invalid_reference'), { code: 'SEED_INVALID_REFERENCE' });
+      }
+      if (data.tag_ids !== undefined && !await lockSeedReferences(tx, householdId, null, data.tag_ids)) {
+        throw Object.assign(new Error('invalid_reference'), { code: 'SEED_INVALID_REFERENCE' });
+      }
+      const owner = await dbGet<SeedRow>(tx,
+        `SELECT id, household_id, catalog_id, state, packet_count, location_id, year_packed,
+                source, custom_name, custom_variety, custom_company, custom_type, notes,
+                created_at, updated_at, deleted_at, version
+           FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+        [id, householdId]);
+      if (!owner) return { row: null, current: null, photos: [] };
+      const updated = await tx.unsafe<{ id: string }[]>(
+        `UPDATE seeds SET ${setSql} WHERE ${where} RETURNING *`,
+        params as never,
+      );
+      const selectCurrent = async () => dbGet<SeedListRow>(tx,
+        `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count, s.location_id,
+                s.year_packed, s.source, s.custom_name, s.custom_variety, s.custom_company,
+                s.custom_type, s.notes, s.created_at, s.updated_at, s.deleted_at, s.version,
+                ${TAG_IDS_AGG} FROM seeds s
+          WHERE s.id = $1 AND s.household_id = $2 AND s.deleted_at IS NULL`, [id, householdId]);
+      if (!updated[0]) {
+        const current = await selectCurrent();
+        return { row: null, current, photos: [] };
+      }
+      if (data.tag_ids !== undefined) {
+        await dbRun(tx, `DELETE FROM seed_tags WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
+        for (const tagId of data.tag_ids) {
+          await dbRun(tx, `INSERT INTO seed_tags (seed_id, tag_id, household_id) VALUES ($1, $2, $3)`, [id, tagId, householdId]);
+        }
+      }
+      const row = await selectCurrent();
+      const photos = await dbAll<{ r2_key: string }>(tx,
+        `SELECT r2_key FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
+      return { row, current: null, photos: photos.map((p) => p.r2_key) };
+    });
   } catch (err) {
-    if (isFkViolation(err)) {
+    if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) {
       return c.json({
         ok: false,
         error: {
@@ -421,21 +481,17 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     }
     throw err;
   }
-
-  // Re-read tag_ids to return the current set.
-  const tagRow = await dbGet<{ tag_ids: string[] | null }>(
-    sql,
-    `SELECT COALESCE(
-              (SELECT array_agg(tag_id ORDER BY tag_id) FROM seed_tags WHERE seed_id = $1),
-              ARRAY[]::TEXT[]
-            ) AS tag_ids`,
-    [id],
-  );
+  if (!result!.row) {
+    if (!result!.current) return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
+    const { tag_ids, ...current } = result!.current;
+    if (expected !== null) return versionConflict(c, { ...current, tag_ids: tag_ids ?? [] });
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
+  }
+  const { tag_ids, ...row } = result!.row;
+  setVersionHeader(c, row.version);
   return c.json({
     ok: true,
-    data: {
-      seed: { ...merged, tag_ids: tagRow?.tag_ids ?? [] },
-    },
+    data: { seed: { ...row, tag_ids: tag_ids ?? [] } },
   });
 });
 
@@ -443,38 +499,47 @@ seedRoutes.delete('/seeds/:id', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const id = c.req.param('id');
   const sql = getSql(c.env);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  const result = await dbRun(
-    sql,
-    `UPDATE seeds SET deleted_at = $1, updated_at = $2
-       WHERE id = $3 AND household_id = $4 AND deleted_at IS NULL`,
-    [now, now, id, householdId],
-  );
-  if (result.meta.changes === 0) {
+  const result = await sql.begin(async (tx) => {
+    const current = await dbGet<SeedListRow>(tx,
+      `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count, s.location_id, s.year_packed,
+              s.source, s.custom_name, s.custom_variety, s.custom_company, s.custom_type, s.notes,
+              s.created_at, s.updated_at, s.deleted_at, s.version, ${TAG_IDS_AGG}
+         FROM seeds s WHERE s.id = $1 AND s.household_id = $2 AND s.deleted_at IS NULL FOR UPDATE`, [id, householdId]);
+    if (!current) return { gone: true as const, current: null, keys: [] as string[] };
+    const params = expected === null ? [now, id, householdId] : [now, id, householdId, expected];
+    const changed = await tx.unsafe<{ version: number }[]>(
+      `UPDATE seeds SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL${expected === null ? '' : ' AND version = $4'} RETURNING version`, params as never);
+    if (!changed[0]) return { gone: false as const, current, keys: [] as string[] };
+    const events = await tx.unsafe<{ id: string }[]>(
+      `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL RETURNING id`, [now, id, householdId]);
+    const eventIds = events.map((e) => e.id);
+    await tx.unsafe(
+      `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE household_id = $2 AND deleted_at IS NULL AND (seed_id = $3 OR planting_event_id = ANY($4))`,
+      [now, householdId, id, eventIds]);
+    const journalPhotos = await tx.unsafe<{ storage_key: string }[]>(
+      `SELECT p.storage_key FROM journal_entry_photos p JOIN journal_entries j ON j.id = p.entry_id
+        WHERE j.household_id = $1 AND (j.seed_id = $2 OR j.planting_event_id = ANY($3))`, [householdId, id, eventIds]);
+    await tx.unsafe(`DELETE FROM journal_entry_photos p USING journal_entries j
+      WHERE p.entry_id = j.id AND j.household_id = $1 AND (j.seed_id = $2 OR j.planting_event_id = ANY($3))`, [householdId, id, eventIds]);
+    await tx.unsafe(`DELETE FROM journal_checklist_items ci USING journal_entries j
+      WHERE ci.entry_id = j.id AND j.household_id = $1 AND (j.seed_id = $2 OR j.planting_event_id = ANY($3))`, [householdId, id, eventIds]);
+    const seedPhotos = await tx.unsafe<{ r2_key: string }[]>(
+      `SELECT r2_key FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
+    await tx.unsafe(`DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`, [id, householdId]);
+    return { gone: false as const, current: null, keys: [...seedPhotos.map((p) => p.r2_key), ...journalPhotos.map((p) => p.storage_key)], version: changed[0].version };
+  });
+  if (result.gone) return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
+  if (result.current) {
+    if (expected !== null) return versionConflict(c, { ...result.current, tag_ids: result.current.tag_ids ?? [] });
     return c.json({ ok: false, error: { code: 'not_found', message: 'Seed not found' } }, 404);
   }
-  // Cascade soft-delete to children so iOS sees matching tombstones on
-  // the next pull. Without this, planting_events + journal_entries
-  // keep referencing the (now-deleted) seed forever.
-  await dbRun(sql,
-    `UPDATE planting_events SET deleted_at = $1, updated_at = $1
-       WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId]);
-  await dbRun(sql,
-    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-       WHERE seed_id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId]);
-  // Delete S3 objects for all photos belonging to this seed, then delete
-  // the photo rows. Best-effort on S3 — row deletion still runs even if
-  // storage is unavailable to avoid leaving orphaned DB rows.
-  const photos = await dbAll<{ r2_key: string }>(
-    sql,
-    `SELECT r2_key FROM seed_photos WHERE seed_id = $1 AND household_id = $2`,
-    [id, householdId],
-  );
-  await Promise.allSettled(photos.map((p) => deletePhoto(c.env, p.r2_key)));
-  await dbRun(sql,
-    `DELETE FROM seed_photos WHERE seed_id = $1 AND household_id = $2`,
-    [id, householdId]);
-  return c.json({ ok: true, data: { id, deleted_at: now } });
+  await Promise.allSettled(result.keys.map((key) => deletePhoto(c.env, key)));
+  setVersionHeader(c, result.version!);
+  return c.json({ ok: true, data: { id, deleted_at: now, version: result.version } });
 });

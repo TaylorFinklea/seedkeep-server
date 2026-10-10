@@ -2,13 +2,14 @@ import { Hono } from 'hono';
 import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { getSql } from '../db/client';
-import { dbGet, dbAll, dbRun, isFkViolation } from '../db/helpers';
+import { dbGet, dbAll, dbRun, isFkViolation, isUniqueViolation, type Queryable } from '../db/helpers';
 import { requireAuth } from '../middleware/auth';
 import { requireHousehold } from '../middleware/household';
 import { validateAtMostOneAttach } from '../lib/journal/validation';
 import { retrospectiveMmDdWindow, validateMmDd } from '../lib/journal/retrospective';
 import { deletePhoto, getPhoto, isAllowedMime, newPhotoKey, putPhoto } from '../lib/storage';
 import { parseDeltaQuery, buildDeltaPayload, deltaCursorWhere } from '../lib/sync';
+import { expectedVersion, invalidIfMatch, setVersionHeader, versionConflict } from '../lib/versioning';
 
 const auth = [requireAuth(), requireHousehold()] as const;
 
@@ -23,6 +24,7 @@ interface EntryRow {
   created_at: number;
   updated_at: number;
   deleted_at: number | null;
+  version: number;
 }
 
 function rowToDto(r: EntryRow) {
@@ -37,10 +39,21 @@ function rowToDto(r: EntryRow) {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     deletedAt: r.deleted_at,
+    version: r.version,
   };
 }
 
 export const journalRoutes = new Hono<AppEnv>();
+
+async function lockJournalParents(q: Queryable, householdId: string, seedId: string | null, bedId: string | null, eventId: string | null): Promise<boolean> {
+  for (const [table, id] of [['seeds', seedId], ['beds', bedId], ['planting_events', eventId]] as const) {
+    if (!id) continue;
+    const row = await dbGet<{ id: string }>(q,
+      `SELECT id FROM ${table} WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [id, householdId]);
+    if (!row) return false;
+  }
+  return true;
+}
 
 // GET /api/journal?since=<ms>&limit=<n>&seed_id=&bed_id=&planting_event_id=&from_date=&to_date=
 //
@@ -77,7 +90,7 @@ journalRoutes.get('/', ...auth, async (c) => {
   const rows = await dbAll<EntryRow>(
     sql,
     `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
-            planting_event_id, created_at, updated_at, deleted_at
+            planting_event_id, created_at, updated_at, deleted_at, version
        FROM journal_entries
       WHERE ${wheres.join(' AND ')}
       ORDER BY updated_at ASC, id ASC
@@ -112,7 +125,7 @@ journalRoutes.get('/retrospective', ...auth, async (c) => {
   const rows = await dbAll<EntryRow>(
     sql,
     `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
-            planting_event_id, created_at, updated_at, deleted_at
+            planting_event_id, created_at, updated_at, deleted_at, version
        FROM journal_entries
       WHERE household_id = $1
         AND deleted_at IS NULL
@@ -159,8 +172,8 @@ journalRoutes.get('/:id/photos', ...auth, async (c) => {
   const photos = await dbAll<PhotoRow>(
     sql,
     `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
-       FROM journal_entry_photos WHERE entry_id = $1 ORDER BY sort_order ASC, created_at ASC`,
-    [entryId],
+       FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2 ORDER BY sort_order ASC, created_at ASC`,
+    [entryId, householdId],
   );
   return c.json({ ok: true, data: { photos: photos.map(photoToDto) } });
 });
@@ -180,9 +193,10 @@ journalRoutes.get('/:id/checklist', ...auth, async (c) => {
   }
   const items = await dbAll<ChecklistRow>(
     sql,
-    `SELECT id, entry_id, text, completed, sort_order, updated_at
-       FROM journal_checklist_items WHERE entry_id = $1 ORDER BY sort_order ASC`,
-    [entryId],
+    `SELECT ci.id, ci.entry_id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
+       FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+      WHERE ci.entry_id = $1 AND je.household_id = $2 ORDER BY sort_order ASC`,
+    [entryId, householdId],
   );
   return c.json({ ok: true, data: { items: items.map(checklistToDto) } });
 });
@@ -204,23 +218,42 @@ journalRoutes.post('/', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'occurred_on must be YYYY-MM-DD' } }, 400);
   }
 
-  const id = nanoid();
+  if ('id' in body && (typeof body.id !== 'string' || body.id.length < 1 || body.id.length > 80)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'id must be 1 to 80 characters' } }, 400);
+  }
+  const id = typeof body.id === 'string' ? body.id : nanoid();
   const now = Date.now();
+  if (typeof body.id === 'string') {
+    const existing = await dbGet<EntryRow>(sql,
+      `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+              created_at, updated_at, deleted_at, version FROM journal_entries WHERE id = $1 AND household_id = $2`, [id, householdId]);
+    if (existing) {
+      setVersionHeader(c, existing.version);
+      return c.json({ ok: true, data: { entry: rowToDto(existing) } });
+    }
+    if (await dbGet(sql, `SELECT id FROM journal_entries WHERE id = $1`, [id])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  }
   try {
-    await dbRun(
-      sql,
-      `INSERT INTO journal_entries
-         (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
-          created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
-      [
-        id, householdId, occurredOn, body.body ?? '',
-        body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null,
-        now,
-      ],
-    );
+    await sql.begin(async (tx) => {
+      if (!await lockJournalParents(tx, householdId, body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null)) throw new Error('invalid_reference');
+      await dbRun(tx,
+        `INSERT INTO journal_entries
+           (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+        [id, householdId, occurredOn, body.body ?? '', body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null, now]);
+    });
   } catch (err) {
-    if (isFkViolation(err)) {
+    if (isUniqueViolation(err)) {
+      const existing = await dbGet<EntryRow>(sql,
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+                created_at, updated_at, deleted_at, version FROM journal_entries WHERE id = $1 AND household_id = $2`, [id, householdId]);
+      if (existing) {
+        setVersionHeader(c, existing.version);
+        return c.json({ ok: true, data: { entry: rowToDto(existing) } });
+      }
+      return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+    }
+    if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) {
       return c.json({
         ok: false,
         error: {
@@ -236,10 +269,11 @@ journalRoutes.post('/', ...auth, async (c) => {
   const row = await dbGet<EntryRow>(
     sql,
     `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
-            planting_event_id, created_at, updated_at, deleted_at
+            planting_event_id, created_at, updated_at, deleted_at, version
        FROM journal_entries WHERE id = $1`,
     [id],
   );
+  setVersionHeader(c, row!.version);
   return c.json({ ok: true, data: { entry: rowToDto(row!) } });
 });
 
@@ -261,71 +295,67 @@ journalRoutes.patch('/:id', ...auth, async (c) => {
     }
   }
 
-  // Validate at-most-one-attach against the MERGED row state, not just the
-  // request payload — switching an attachment without nulling the other one
-  // would otherwise pass the payload check but hit the DB CHECK as a 500.
-  const existing = await dbGet<Pick<EntryRow, 'seed_id' | 'bed_id' | 'planting_event_id'>>(
-    sql,
-    `SELECT seed_id, bed_id, planting_event_id
-       FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
-  }
-  const mergedSeedId = 'seed_id' in body ? (body.seed_id ?? null) : existing.seed_id;
-  const mergedBedId = 'bed_id' in body ? (body.bed_id ?? null) : existing.bed_id;
-  const mergedEventId = 'planting_event_id' in body ? (body.planting_event_id ?? null) : existing.planting_event_id;
-  const v = validateAtMostOneAttach({
-    seed_id: mergedSeedId, bed_id: mergedBedId, planting_event_id: mergedEventId,
-  });
-  if (!v.ok) {
-    return c.json({ ok: false, error: { code: 'bad_request', message: v.reason } }, 400);
-  }
-
-  const sets: string[] = ['updated_at = $1'];
-  const params: unknown[] = [Date.now()];
-  let p = 2;
-
-  if ('body' in body) { sets.push(`body = $${p++}`); params.push(body.body ?? ''); }
-  if ('occurred_on' in body) { sets.push(`occurred_on = $${p++}`); params.push(body.occurred_on); }
-  if ('seed_id' in body) { sets.push(`seed_id = $${p++}`); params.push(body.seed_id ?? null); }
-  if ('bed_id' in body) { sets.push(`bed_id = $${p++}`); params.push(body.bed_id ?? null); }
-  if ('planting_event_id' in body) { sets.push(`planting_event_id = $${p++}`); params.push(body.planting_event_id ?? null); }
-
-  params.push(id, householdId);
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
+  const now = Date.now();
+  const names = ['body', 'occurred_on', 'seed_id', 'bed_id', 'planting_event_id'].filter((k) => k in body);
+  const vals = names.map((k) => k === 'body' ? (body[k] ?? '') : (body[k] ?? null));
+  const sets = names.map((k, i) => `${k} = $${i + 1}`);
+  sets.push(`updated_at = $${names.length + 1}`, 'version = version + 1');
+  const params: unknown[] = [...vals, now, id, householdId];
+  let where = `id = $${names.length + 2} AND household_id = $${names.length + 3} AND deleted_at IS NULL`;
+  if (expected !== null) { params.push(expected); where += ` AND version = $${params.length}`; }
+  let outcome: { row: EntryRow | null; current: EntryRow | null };
   try {
-    await dbRun(
-      sql,
-      `UPDATE journal_entries SET ${sets.join(', ')}
-         WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-      params,
-    );
+    outcome = await sql.begin(async (tx) => {
+      const snapshot = await dbGet<EntryRow>(tx,
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+                created_at, updated_at, deleted_at, version FROM journal_entries
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`, [id, householdId]);
+      if (!snapshot) return { row: null, current: null };
+      const snapshotRefs = {
+        seed_id: 'seed_id' in body ? body.seed_id ?? null : snapshot.seed_id,
+        bed_id: 'bed_id' in body ? body.bed_id ?? null : snapshot.bed_id,
+        planting_event_id: 'planting_event_id' in body ? body.planting_event_id ?? null : snapshot.planting_event_id,
+      };
+      const snapshotCheck = validateAtMostOneAttach(snapshotRefs);
+      if (!snapshotCheck.ok) throw Object.assign(new Error(snapshotCheck.reason), { code: 'JOURNAL_ATTACH_INVALID' });
+      if (!await lockJournalParents(tx, householdId,
+        'seed_id' in body ? snapshotRefs.seed_id : null,
+        'bed_id' in body ? snapshotRefs.bed_id : null,
+        'planting_event_id' in body ? snapshotRefs.planting_event_id : null)) throw new Error('invalid_reference');
+      const existing = await dbGet<EntryRow>(tx,
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+                created_at, updated_at, deleted_at, version FROM journal_entries
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [id, householdId]);
+      if (!existing) return { row: null, current: null };
+      const merged = {
+        seed_id: 'seed_id' in body ? body.seed_id ?? null : existing.seed_id,
+        bed_id: 'bed_id' in body ? body.bed_id ?? null : existing.bed_id,
+        planting_event_id: 'planting_event_id' in body ? body.planting_event_id ?? null : existing.planting_event_id,
+      };
+      const v = validateAtMostOneAttach(merged);
+      if (!v.ok) throw Object.assign(new Error(v.reason), { code: 'JOURNAL_ATTACH_INVALID' });
+      const changed = await tx.unsafe<{ id: string }[]>(
+        `UPDATE journal_entries SET ${sets.join(', ')} WHERE ${where} RETURNING *`, params as never);
+      const load = () => dbGet<EntryRow>(tx,
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+                created_at, updated_at, deleted_at, version FROM journal_entries
+          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`, [id, householdId]);
+      return changed[0] ? { row: await load(), current: null } : { row: null, current: await load() };
+    });
   } catch (err) {
-    if (isFkViolation(err)) {
-      return c.json({
-        ok: false,
-        error: {
-          code: 'invalid_reference',
-          message:
-            'A referenced seed, bed, or planting event does not exist on the server. Sync the parent records first, then retry this update.',
-        },
-      }, 400);
-    }
+    if (isFkViolation(err) || (err instanceof Error && err.message === 'invalid_reference')) return c.json({ ok: false, error: { code: 'invalid_reference', message: 'A referenced seed, bed, or planting event does not exist in this household.' } }, 400);
+    if (err instanceof Error && 'code' in err && err.code === 'JOURNAL_ATTACH_INVALID') return c.json({ ok: false, error: { code: 'bad_request', message: err.message } }, 400);
     throw err;
   }
-
-  const row = await dbGet<EntryRow>(
-    sql,
-    `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
-            planting_event_id, created_at, updated_at, deleted_at
-       FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
-    [id, householdId],
-  );
-  if (!row) {
+  if (!outcome!.row) {
+    if (!outcome!.current) return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+    if (expected !== null) return versionConflict(c, rowToDto(outcome!.current));
     return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
   }
-  return c.json({ ok: true, data: { entry: rowToDto(row) } });
+  setVersionHeader(c, outcome!.row.version);
+  return c.json({ ok: true, data: { entry: rowToDto(outcome!.row) } });
 });
 
 // DELETE /api/journal/:id — soft-delete
@@ -333,14 +363,34 @@ journalRoutes.delete('/:id', ...auth, async (c) => {
   const sql = getSql(c.env);
   const householdId = c.get('householdId') as string;
   const id = c.req.param('id');
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
   const now = Date.now();
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET deleted_at = $1, updated_at = $1
-       WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL`,
-    [now, id, householdId],
-  );
-  return c.json({ ok: true, data: { id } });
+  const result = await sql.begin(async (tx) => {
+    const current = await dbGet<EntryRow>(tx,
+      `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id, planting_event_id,
+              created_at, updated_at, deleted_at, version FROM journal_entries
+        WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [id, householdId]);
+    if (!current) return { current: null, version: null, keys: [] as string[] };
+    const changed = await tx.unsafe<{ version: number }[]>(
+      `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE id = $2 AND household_id = $3 AND deleted_at IS NULL${expected === null ? '' : ' AND version = $4'} RETURNING version`,
+      expected === null ? [now, id, householdId] : [now, id, householdId, expected]);
+    if (!changed[0]) return { current, version: null, keys: [] as string[] };
+    const photos = await tx.unsafe<{ storage_key: string }[]>(
+      `SELECT storage_key FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2`, [id, householdId]);
+    await tx.unsafe(`DELETE FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2`, [id, householdId]);
+    await tx.unsafe(`DELETE FROM journal_checklist_items WHERE entry_id = $1`, [id]);
+    return { current: null, version: changed[0].version, keys: photos.map((p) => p.storage_key) };
+  });
+  if (result.current) {
+    if (expected !== null) return versionConflict(c, rowToDto(result.current));
+    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  }
+  if (result.version === null) return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  await Promise.allSettled(result.keys.map((key) => deletePhoto(c.env, key)));
+  setVersionHeader(c, result.version);
+  return c.json({ ok: true, data: { id, deleted_at: now, version: result.version } });
 });
 
 // ---------------------------------------------------------------------------
@@ -384,14 +434,17 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
   const householdId = c.get('householdId') as string;
   const entryId = c.req.param('id');
 
-  const owner = await dbGet<{ id: string }>(
-    sql,
-    `SELECT id FROM journal_entries
-      WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
-    [entryId, householdId],
-  );
-  if (!owner) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  const idParam = c.req.query('id');
+  if (idParam !== undefined && (idParam.length < 1 || idParam.length > 80)) return c.json({ ok: false, error: { code: 'bad_request', message: 'id must be 1 to 80 characters' } }, 400);
+  if (idParam) {
+    const replay = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
+      FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [idParam, householdId]);
+    if (replay) {
+      const parent = await dbGet<{ version: number }>(sql, `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [replay.entry_id, householdId]);
+      if (parent) setVersionHeader(c, parent.version);
+      return c.json({ ok: true, data: { photo: photoToDto(replay) } });
+    }
+    if (await dbGet(sql, `SELECT id FROM journal_entry_photos WHERE id = $1`, [idParam])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
   }
 
   const mime = c.req.header('Content-Type');
@@ -416,51 +469,65 @@ journalRoutes.post('/:id/photos', ...auth, async (c) => {
       message: `Photo too large (${body.byteLength} bytes). Max ${MAX_PHOTO_BYTES}.` } }, 413);
   }
 
+  const id = idParam ?? nanoid();
+  const now = Date.now();
   const key = newPhotoKey({
     householdId,
     scope: 'journal',
     ownerId: entryId,
     role: 'photo',
   });
-  await putPhoto(c.env, key, body, mime!);
-
-  // sort_order = max(existing) + 1 so new photos append in upload order.
-  const maxRow = await dbGet<{ max: number | null }>(
-    sql,
-    `SELECT MAX(sort_order) AS max FROM journal_entry_photos WHERE entry_id = $1`,
-    [entryId],
-  );
-  const sortOrder = (maxRow?.max ?? -1) + 1;
-
   const widthHeader = c.req.header('X-Photo-Width');
   const heightHeader = c.req.header('X-Photo-Height');
   const width = widthHeader ? parseInt(widthHeader, 10) || null : null;
   const height = heightHeader ? parseInt(heightHeader, 10) || null : null;
 
-  const id = nanoid();
-  const now = Date.now();
-  await dbRun(
-    sql,
-    `INSERT INTO journal_entry_photos
-       (id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
-    [id, entryId, householdId, key, sortOrder, width, height, now],
-  );
-
-  // Bump the parent entry so delta-syncing clients pick up the photo.
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
-    [now, entryId, householdId],
-  );
-
-  const row = await dbGet<PhotoRow>(
-    sql,
-    `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
-       FROM journal_entry_photos WHERE id = $1`,
-    [id],
-  );
-  return c.json({ ok: true, data: { photo: photoToDto(row!) } });
+  const row = await sql.begin(async (tx) => {
+    const parent = await dbGet<{ id: string }>(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [entryId, householdId]);
+    if (!parent) throw new Error('JOURNAL_ENTRY_NOT_FOUND');
+    const collision = await dbGet<{ household_id: string }>(tx, `SELECT household_id FROM journal_entry_photos WHERE id = $1`, [id]);
+    if (collision) throw new Error(collision.household_id === householdId ? 'JOURNAL_PHOTO_REPLAY_RACE' : 'JOURNAL_PHOTO_CONFLICT');
+    const maxRow = await dbGet<{ max: number | null }>(tx, `SELECT MAX(sort_order) AS max FROM journal_entry_photos WHERE entry_id = $1 AND household_id = $2`, [entryId, householdId]);
+    const sortOrder = (maxRow?.max ?? -1) + 1;
+    await putPhoto(c.env, key, body, mime!);
+    await dbRun(tx, `INSERT INTO journal_entry_photos
+      (id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`, [id, entryId, householdId, key, sortOrder, width, height, now]);
+    const bumped = await tx.unsafe<{ version: number }[]>(`UPDATE journal_entries SET updated_at = $1, version = version + 1
+      WHERE id = $2 AND household_id = $3 RETURNING version`, [now, entryId, householdId]);
+    return { photo: await dbGet<PhotoRow>(tx, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
+      FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]), version: bumped[0]!.version };
+  }).catch(async (err) => {
+    if (err instanceof Error && err.message === 'JOURNAL_PHOTO_REPLAY_RACE') {
+      await deletePhoto(c.env, key).catch(() => {});
+      const existing = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
+        FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
+      if (existing) {
+        const parent = await dbGet<{ version: number }>(sql,
+          `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [existing.entry_id, householdId]);
+        return { photo: existing, version: parent?.version ?? null };
+      }
+    }
+    if (isUniqueViolation(err)) {
+      await deletePhoto(c.env, key).catch(() => {});
+      const existing = await dbGet<PhotoRow>(sql, `SELECT id, entry_id, household_id, storage_key, sort_order, width, height, created_at, updated_at
+        FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [id, householdId]);
+      if (existing) {
+        const parent = await dbGet<{ version: number }>(sql,
+          `SELECT version FROM journal_entries WHERE id = $1 AND household_id = $2`, [existing.entry_id, householdId]);
+        return { photo: existing, version: parent?.version ?? null };
+      }
+      return { conflict: true as const };
+    }
+    if (err instanceof Error && err.message === 'JOURNAL_PHOTO_CONFLICT') return { conflict: true as const };
+    if (err instanceof Error && err.message === 'JOURNAL_ENTRY_NOT_FOUND') return { missing: true as const };
+    throw err;
+  });
+  if ('conflict' in row) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  if ('missing' in row) return c.json({ ok: false, error: { code: 'invalid_reference', message: 'Journal entry does not exist in this household.' } }, 400);
+  if (!row.photo) return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  if (row.version !== null) setVersionHeader(c, row.version);
+  return c.json({ ok: true, data: { photo: photoToDto(row.photo) } });
 });
 
 // GET /api/journal/photos/:photoId — fetch the photo binary. Mirrors
@@ -499,23 +566,24 @@ journalRoutes.delete('/photos/:photoId', ...auth, async (c) => {
   const householdId = c.get('householdId') as string;
   const photoId = c.req.param('photoId');
 
-  const photo = await dbGet<{ storage_key: string; entry_id: string }>(
-    sql,
-    `SELECT storage_key, entry_id FROM journal_entry_photos
-      WHERE id = $1 AND household_id = $2`,
-    [photoId, householdId],
-  );
-  if (!photo) {
+  const result = await sql.begin(async (tx) => {
+    const snapshot = await dbGet<{ entry_id: string }>(tx,
+      `SELECT entry_id FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [photoId, householdId]);
+    if (!snapshot) return null;
+    await dbGet(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 FOR UPDATE`, [snapshot.entry_id, householdId]);
+    const photo = await dbGet<{ storage_key: string; entry_id: string }>(tx,
+      `SELECT storage_key, entry_id FROM journal_entry_photos WHERE id = $1 AND household_id = $2 FOR UPDATE`, [photoId, householdId]);
+    if (!photo) return null;
+    await dbRun(tx, `DELETE FROM journal_entry_photos WHERE id = $1 AND household_id = $2`, [photoId, householdId]);
+    const bumped = await tx.unsafe<{ version: number }[]>(`UPDATE journal_entries SET updated_at = $1, version = version + 1
+      WHERE id = $2 AND household_id = $3 RETURNING version`, [Date.now(), photo.entry_id, householdId]);
+    return { photo, version: bumped[0]?.version ?? null };
+  });
+  if (!result) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'photo not found' } }, 404);
   }
-
-  await deletePhoto(c.env, photo.storage_key).catch(() => { /* best-effort */ });
-  await dbRun(sql, `DELETE FROM journal_entry_photos WHERE id = $1`, [photoId]);
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
-    [Date.now(), photo.entry_id, householdId],
-  );
+  await deletePhoto(c.env, result.photo.storage_key).catch(() => { /* best-effort */ });
+  if (result.version !== null) setVersionHeader(c, result.version);
   return c.json({ ok: true, data: { id: photoId } });
 });
 
@@ -526,12 +594,13 @@ interface ChecklistRow {
   completed: boolean;
   sort_order: number;
   updated_at: number;
+  version: number;
 }
 
 function checklistToDto(c: ChecklistRow) {
   return {
     id: c.id, entryId: c.entry_id, text: c.text, completed: c.completed,
-    sortOrder: c.sort_order, updatedAt: c.updated_at,
+    sortOrder: c.sort_order, updatedAt: c.updated_at, version: c.version,
   };
 }
 
@@ -545,45 +614,47 @@ journalRoutes.post('/:id/checklist', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'text required' } }, 400);
   }
 
-  const owner = await dbGet<{ id: string }>(
-    sql,
-    `SELECT id FROM journal_entries
-      WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
-    [entryId, householdId],
-  );
-  if (!owner) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  if ('id' in body && (typeof body.id !== 'string' || body.id.length < 1 || body.id.length > 80)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'id must be 1 to 80 characters' } }, 400);
   }
-
-  const maxRow = await dbGet<{ max: number | null }>(
-    sql,
-    `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`,
-    [entryId],
-  );
-  const sortOrder = (maxRow?.max ?? -1) + 1;
-  const id = nanoid();
+  const id = typeof body.id === 'string' ? body.id : nanoid();
   const now = Date.now();
-
-  await dbRun(
-    sql,
-    `INSERT INTO journal_checklist_items
-       (id, entry_id, text, completed, sort_order, updated_at)
-     VALUES ($1,$2,$3,FALSE,$4,$5)`,
-    [id, entryId, body.text.trim(), sortOrder, now],
-  );
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
-    [now, entryId, householdId],
-  );
-
-  const row = await dbGet<ChecklistRow>(
-    sql,
-    `SELECT id, entry_id, text, completed, sort_order, updated_at
-       FROM journal_checklist_items WHERE id = $1`,
-    [id],
-  );
-  return c.json({ ok: true, data: { item: checklistToDto(row!) } });
+  if (typeof body.id === 'string') {
+    const replay = await dbGet<ChecklistRow>(sql,
+      `SELECT ci.id, ci.entry_id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
+         FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+        WHERE ci.id = $1 AND je.household_id = $2`, [id, householdId]);
+    if (replay) {
+      setVersionHeader(c, replay.version);
+      return c.json({ ok: true, data: { item: checklistToDto(replay) } });
+    }
+    if (await dbGet(sql, `SELECT id FROM journal_checklist_items WHERE id = $1`, [id])) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  }
+  const result = await sql.begin(async (tx) => {
+    const parent = await dbGet<{ id: string; version: number }>(tx,
+      `SELECT id, version FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR UPDATE`, [entryId, householdId]);
+    if (!parent) return { missing: true as const, row: null as ChecklistRow | null, version: null as number | null };
+    const replay = await dbGet<ChecklistRow>(tx,
+      `SELECT ci.id, ci.entry_id, ci.text, ci.completed, ci.sort_order, ci.updated_at, ci.version
+         FROM journal_checklist_items ci JOIN journal_entries je ON je.id = ci.entry_id
+        WHERE ci.id = $1 AND je.household_id = $2`, [id, householdId]);
+    if (replay) return { missing: false as const, row: replay, version: parent.version, replay: true };
+    const globallyTaken = await dbGet<{ id: string }>(tx, `SELECT id FROM journal_checklist_items WHERE id = $1`, [id]);
+    if (globallyTaken) return { missing: false as const, row: null, version: null, conflict: true };
+    const max = await dbGet<{ max: number | null }>(tx, `SELECT MAX(sort_order) AS max FROM journal_checklist_items WHERE entry_id = $1`, [entryId]);
+    await dbRun(tx, `INSERT INTO journal_checklist_items (id, entry_id, text, completed, sort_order, updated_at)
+      VALUES ($1,$2,$3,FALSE,$4,$5)`, [id, entryId, body.text.trim(), (max?.max ?? -1) + 1, now]);
+    const bumped = await tx.unsafe<{ version: number }[]>(`UPDATE journal_entries SET updated_at = $1, version = version + 1
+      WHERE id = $2 AND household_id = $3 RETURNING version`, [now, entryId, householdId]);
+    const row = await dbGet<ChecklistRow>(tx, `SELECT id, entry_id, text, completed, sort_order, updated_at, version
+      FROM journal_checklist_items WHERE id = $1`, [id]);
+    return { missing: false as const, row, version: bumped[0]!.version, replay: false };
+  });
+  if (result.missing) return c.json({ ok: false, error: { code: 'invalid_reference', message: 'Journal entry does not exist in this household.' } }, 400);
+  if ('conflict' in result) return c.json({ ok: false, error: { code: 'conflict', message: 'A record with this id already exists.' } }, 409);
+  if (!result.row) return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
+  setVersionHeader(c, result.row.version);
+  return c.json({ ok: true, data: { item: checklistToDto(result.row) } });
 });
 
 // PATCH /api/journal/checklist/:itemId — toggle completed or edit text
@@ -596,49 +667,39 @@ journalRoutes.patch('/checklist/:itemId', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'JSON body required' } }, 400);
   }
 
-  // Confirm the item belongs to a household-owned, non-deleted entry.
-  const owner = await dbGet<{ entry_id: string }>(
-    sql,
-    `SELECT ci.entry_id FROM journal_checklist_items ci
-       JOIN journal_entries je ON je.id = ci.entry_id
-      WHERE ci.id = $1 AND je.household_id = $2 AND je.deleted_at IS NULL`,
-    [itemId, householdId],
-  );
-  if (!owner) {
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
+  const now = Date.now();
+  const columns: Record<string, unknown> = {};
+  if ('text' in body && typeof body.text === 'string' && body.text.trim()) columns.text = body.text.trim();
+  if ('completed' in body && typeof body.completed === 'boolean') columns.completed = body.completed;
+  if ('sort_order' in body && typeof body.sort_order === 'number') columns.sort_order = body.sort_order;
+  const names = Object.keys(columns);
+  const sets = names.map((key, i) => `${key} = $${i + 1}`);
+  sets.push(`updated_at = $${names.length + 1}`, 'version = version + 1');
+  const params: unknown[] = [...names.map((key) => columns[key]), now, itemId, householdId];
+  let where = `ci.id = $${names.length + 2} AND EXISTS (SELECT 1 FROM journal_entries je WHERE je.id = ci.entry_id AND je.household_id = $${names.length + 3} AND je.deleted_at IS NULL)`;
+  if (expected !== null) { params.push(expected); where += ` AND version = $${params.length}`; }
+  const result = await sql.begin(async (tx) => {
+    const link = await dbGet<{ entry_id: string }>(tx, `SELECT ci.entry_id FROM journal_checklist_items ci
+      JOIN journal_entries je ON je.id = ci.entry_id WHERE ci.id = $1 AND je.household_id = $2 AND je.deleted_at IS NULL`, [itemId, householdId]);
+    if (!link) return { missing: true as const, row: null as ChecklistRow | null, current: null as ChecklistRow | null };
+    await dbGet(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 FOR UPDATE`, [link.entry_id, householdId]);
+    await dbGet(tx, `SELECT id FROM journal_checklist_items WHERE id = $1 FOR UPDATE`, [itemId]);
+    const changed = await tx.unsafe<{ id: string }[]>(`UPDATE journal_checklist_items AS ci SET ${sets.join(', ')} WHERE ${where} RETURNING *`, params as never);
+    const load = () => dbGet<ChecklistRow>(tx, `SELECT id, entry_id, text, completed, sort_order, updated_at, version
+      FROM journal_checklist_items WHERE id = $1`, [itemId]);
+    if (!changed[0]) return { missing: false as const, row: null, current: await load() };
+    await dbRun(tx, `UPDATE journal_entries SET updated_at = $1, version = version + 1 WHERE id = $2 AND household_id = $3`, [now, link.entry_id, householdId]);
+    return { missing: false as const, row: await load(), current: null };
+  });
+  if (result.missing) return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
+  if (!result.row) {
+    if (result.current && expected !== null) return versionConflict(c, checklistToDto(result.current));
     return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
   }
-
-  const sets: string[] = ['updated_at = $1'];
-  const params: unknown[] = [Date.now()];
-  let p = 2;
-  if ('text' in body && typeof body.text === 'string' && body.text.trim()) {
-    sets.push(`text = $${p++}`); params.push(body.text.trim());
-  }
-  if ('completed' in body && typeof body.completed === 'boolean') {
-    sets.push(`completed = $${p++}`); params.push(body.completed);
-  }
-  if ('sort_order' in body && typeof body.sort_order === 'number') {
-    sets.push(`sort_order = $${p++}`); params.push(body.sort_order);
-  }
-  params.push(itemId);
-  await dbRun(
-    sql,
-    `UPDATE journal_checklist_items SET ${sets.join(', ')} WHERE id = $${p}`,
-    params,
-  );
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
-    [Date.now(), owner.entry_id, householdId],
-  );
-
-  const row = await dbGet<ChecklistRow>(
-    sql,
-    `SELECT id, entry_id, text, completed, sort_order, updated_at
-       FROM journal_checklist_items WHERE id = $1`,
-    [itemId],
-  );
-  return c.json({ ok: true, data: { item: checklistToDto(row!) } });
+  setVersionHeader(c, result.row.version);
+  return c.json({ ok: true, data: { item: checklistToDto(result.row) } });
 });
 
 // DELETE /api/journal/checklist/:itemId
@@ -647,21 +708,26 @@ journalRoutes.delete('/checklist/:itemId', ...auth, async (c) => {
   const householdId = c.get('householdId') as string;
   const itemId = c.req.param('itemId');
 
-  const owner = await dbGet<{ entry_id: string }>(
-    sql,
-    `SELECT ci.entry_id FROM journal_checklist_items ci
-       JOIN journal_entries je ON je.id = ci.entry_id
-      WHERE ci.id = $1 AND je.household_id = $2`,
-    [itemId, householdId],
-  );
-  if (!owner) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
-  }
-  await dbRun(sql, `DELETE FROM journal_checklist_items WHERE id = $1`, [itemId]);
-  await dbRun(
-    sql,
-    `UPDATE journal_entries SET updated_at = $1 WHERE id = $2 AND household_id = $3`,
-    [Date.now(), owner.entry_id, householdId],
-  );
-  return c.json({ ok: true, data: { id: itemId } });
+  const expected = expectedVersion(c);
+  if (expected === 'invalid') return invalidIfMatch(c);
+  const now = Date.now();
+  const result = await sql.begin(async (tx) => {
+    const owner = await dbGet<{ entry_id: string }>(tx, `SELECT ci.entry_id FROM journal_checklist_items ci
+      JOIN journal_entries je ON je.id = ci.entry_id WHERE ci.id = $1 AND je.household_id = $2`, [itemId, householdId]);
+    if (!owner) return { missing: true as const, current: null as ChecklistRow | null, deleted: false };
+    await dbGet(tx, `SELECT id FROM journal_entries WHERE id = $1 AND household_id = $2 FOR UPDATE`, [owner.entry_id, householdId]);
+    const current = await dbGet<ChecklistRow>(tx, `SELECT id, entry_id, text, completed, sort_order, updated_at, version
+      FROM journal_checklist_items WHERE id = $1 FOR UPDATE`, [itemId]);
+    if (!current) return { missing: true as const, current: null, deleted: false };
+    if (expected !== null && current.version !== expected) return { missing: false as const, current, deleted: false };
+    await dbRun(tx, `DELETE FROM journal_checklist_items WHERE id = $1`, [itemId]);
+    const parent = await tx.unsafe<{ version: number }[]>(`UPDATE journal_entries SET updated_at = $1, version = version + 1
+      WHERE id = $2 AND household_id = $3 RETURNING version`, [now, owner.entry_id, householdId]);
+    return { missing: false as const, current: null, deleted: true, parentVersion: parent[0]!.version };
+  });
+  if (result.missing) return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
+  if (result.current) return versionConflict(c, checklistToDto(result.current));
+  if (!result.deleted) return c.json({ ok: false, error: { code: 'not_found', message: 'item not found' } }, 404);
+  setVersionHeader(c, result.parentVersion!);
+  return c.json({ ok: true, data: { id: itemId, deleted: true } });
 });
