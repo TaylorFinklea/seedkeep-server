@@ -10,6 +10,12 @@
 --    household_id is never nulled (PostgreSQL 15+).
 --
 -- Re-runnable: ADD COLUMN IF NOT EXISTS and constraint-existence checks.
+--
+-- Locking: garden tables are small (internal testers only), so the runner's
+-- single transaction is acceptable; lock_timeout makes the migration fail
+-- fast instead of queueing behind live traffic. Retry the deploy if it hits.
+
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE seeds                   ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE locations               ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
@@ -58,5 +64,33 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = spec[1]) THEN
       EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I %s', spec[2], spec[1], spec[3]);
     END IF;
+  END LOOP;
+END $$;
+
+-- Validate the composite foreign keys when legacy data is already consistent.
+-- A violating legacy row leaves that constraint NOT VALID (still enforced for
+-- new writes) and raises a NOTICE for follow-up remediation.
+DO $$
+DECLARE
+  fk TEXT[];
+  fks TEXT[][] := ARRAY[
+    ARRAY['seeds', 'seeds_location_household_fk'],
+    ARRAY['seed_tags', 'seed_tags_tag_household_fk'],
+    ARRAY['seed_tags', 'seed_tags_seed_household_fk'],
+    ARRAY['planting_events', 'planting_events_bed_household_fk'],
+    ARRAY['planting_events', 'planting_events_seed_household_fk'],
+    ARRAY['journal_entries', 'journal_entries_seed_household_fk'],
+    ARRAY['journal_entries', 'journal_entries_bed_household_fk'],
+    ARRAY['journal_entries', 'journal_entries_event_household_fk'],
+    ARRAY['journal_entry_photos', 'journal_entry_photos_entry_household_fk'],
+    ARRAY['seed_photos', 'seed_photos_seed_household_fk']
+  ];
+BEGIN
+  FOREACH fk SLICE 1 IN ARRAY fks LOOP
+    BEGIN
+      EXECUTE format('ALTER TABLE %I VALIDATE CONSTRAINT %I', fk[1], fk[2]);
+    EXCEPTION WHEN foreign_key_violation THEN
+      RAISE NOTICE 'web_integrity: % on % left NOT VALID (legacy cross-household rows)', fk[2], fk[1];
+    END;
   END LOOP;
 END $$;

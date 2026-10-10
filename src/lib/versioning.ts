@@ -10,9 +10,11 @@ import type { AppEnv } from '../index';
 export function expectedVersion(c: Context<AppEnv>): number | null | 'invalid' {
   const raw = c.req.header('If-Match');
   if (raw === undefined) return null;
-  const match = /^\s*(?:W\/)?"?(\d{1,15})"?\s*$/.exec(raw);
+  // Strong validators only: `"<n>"` or bare `<n>`. Weak tags (W/) and
+  // unmatched quotes are rejected.
+  const match = /^\s*(?:"(\d{1,16})"|(\d{1,16}))\s*$/.exec(raw);
   if (!match) return 'invalid';
-  const n = Number(match[1]);
+  const n = Number(match[1] ?? match[2]);
   return Number.isSafeInteger(n) && n >= 1 ? n : 'invalid';
 }
 

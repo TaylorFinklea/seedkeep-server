@@ -91,13 +91,57 @@ foreign keys).
 - **`custom_type`:** accepted on seed create and PATCH, and returned
   everywhere.
 
+## Concurrency, cascades and scope (added after the Sol contract review)
+
+- **Parent locking.** A write that creates or re-points a child row locks
+  every referenced active parent with `SELECT … FOR SHARE` in the same
+  transaction, and fails 400 `invalid_reference` if the parent is missing,
+  deleted, or in another household. A parent DELETE locks its own row
+  `FOR UPDATE` first. Lock order is always parent before child, so a
+  concurrent soft delete and a child create serialize.
+- **Cascade closure, all in one transaction, each affected row gets
+  `version + 1`, `updated_at = now`, `deleted_at = now`:**
+  - **seed** → its planting events → journal entries attached to those
+    events; plus journal entries attached directly to the seed.
+  - **bed** → its planting events → their journal entries; plus journal
+    entries attached directly to the bed.
+  - **planting event** → its journal entries.
+  - **journal entry** → its checklist items are hard-deleted and its photo
+    rows are hard-deleted (objects removed best-effort after commit). The
+    entry's own tombstone version is the change signal.
+  - **location delete** clears `location_id` on its seeds (bump each seed).
+    **Tag delete** removes the `seed_tags` rows (bump each affected seed).
+- **Every persisted mutation bumps versions**, including writes made by the
+  assistant tool executor (`src/lib/assistant/**`) to these tables. Luna
+  owns executor compatibility.
+- **Household-scoped reads.** `TAG_IDS_AGG` and the journal photo and
+  checklist listings filter by `household_id`.
+- **Photos are immutable.** They have no version column. Create and delete
+  bump the parent once, and a replay of an existing client id returns the
+  stored row without another bump. Raw-byte uploads take the client id from
+  the `?id=<1–80 chars>` query parameter. Photo DELETE ignores If-Match.
+- **Planting-event create side effects.** Creating an event also creates its
+  journal entry and checklist rows. Those rows start at version 1. Replaying
+  the create (same client id) must not create a second journal or checklist
+  pair.
+- **Helpers.** `dbGet`, `dbAll` and `dbRun` accept `Queryable`
+  (`Sql | TransactionSql`). Use `sql.begin(async (tx) => …)` callbacks and
+  throw to roll back. Don't use `dbBatch` for conditional cascades.
+- **Delta feeds are out of scope.** The cursor ordering (`updated_at`,
+  `since_id`) can miss same-millisecond or late-committed rows. This is a
+  pre-existing limitation, and the web client does not rely on deltas: it
+  refetches the baseline (`since=0`) on load, on focus and on an interval,
+  and uses versions only for writes. Feeds still include `version`.
+  Documented; no change.
+
 ## File ownership
 
 | Files | Owner |
 |---|---|
 | migration 0030, `src/lib/versioning.ts`, this doc | Parent |
-| `src/routes/seeds.ts`, `src/routes/planting-events.ts`, `src/routes/journal.ts`, `src/routes/photos.ts`, `src/lib/sync.ts` (if feeds need `version`), unit tests for these, `tests/integration/versionedWritesJourney.test.ts` (seeds, events, journal, checklist, photos) | **Luna** |
-| `src/routes/locations.ts`, `src/routes/tags.ts`, `src/routes/beds.ts`, unit tests for these, `tests/integration/versionedSimpleRoutes.test.ts` (locations, tags, beds, cross-household references, delete cascade bed → events through the API) | **Haiku** |
+| `src/routes/seeds.ts`, `src/routes/planting-events.ts`, `src/routes/journal.ts`, `src/routes/photos.ts`, `src/lib/sync.ts` (if feeds need `version`), `src/lib/assistant/**` (version bumps on garden writes only), unit tests for these, `tests/integration/versionedWritesJourney.test.ts` (seeds, events, journal, checklist, photos, cascades from seeds and events, create-versus-delete races, replay after update and after delete, event-create replay producing exactly one journal and checklist pair, photo client ids) | **Luna** |
+| `src/routes/locations.ts`, `src/routes/tags.ts`, `src/routes/beds.ts` (including the full bed cascade, and the seed version bumps caused by location and tag deletes), unit tests for these, `tests/integration/versionedSimpleRoutes.test.ts` (locations, tags, beds, cross-household references, bed → events → journal cascade, location and tag deletes bumping seeds) | **Haiku** |
+| `migrations/0030_web_integrity.sql` test: `tests/integration/migration0030.test.ts` (re-runnable; validates on clean data; leaves NOT VALID with legacy violators) | **Haiku** |
 
 ## Tests
 

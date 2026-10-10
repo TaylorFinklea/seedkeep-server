@@ -1,4 +1,7 @@
-import type { Sql } from 'postgres';
+import type { Sql, TransactionSql } from 'postgres';
+
+/** A pool or an open transaction (sql.begin callback argument). */
+export type Queryable = Sql | TransactionSql;
 
 /**
  * Thin wrappers around `postgres.js`. The shape mirrors the helpers from
@@ -18,7 +21,7 @@ import type { Sql } from 'postgres';
 type AnyParams = readonly unknown[];
 
 export async function dbGet<T>(
-  sql: Sql,
+  sql: Queryable,
   query: string,
   params: AnyParams = []
 ): Promise<T | null> {
@@ -27,7 +30,7 @@ export async function dbGet<T>(
 }
 
 export async function dbAll<T>(
-  sql: Sql,
+  sql: Queryable,
   query: string,
   params: AnyParams = []
 ): Promise<T[]> {
@@ -42,7 +45,7 @@ export async function dbAll<T>(
  * verbatim.
  */
 export async function dbRun(
-  sql: Sql,
+  sql: Queryable,
   query: string,
   params: AnyParams = []
 ): Promise<{ meta: { changes: number } }> {
