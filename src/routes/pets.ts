@@ -316,8 +316,9 @@ petRoutes.post('/pets/:planting_event_id/depart', ...auth, async (c) => {
     // depart via the existing /planting-events delta-sync feed. The
     // dedicated /pets/departures feed (Phase 5.1.4) will also carry it.
     await tx.unsafe(
-      `UPDATE planting_events SET updated_at = $1 WHERE id = $2`,
-      [now, plantingEventId],
+      `UPDATE planting_events SET updated_at = $1, version = version + 1
+         WHERE id = $2 AND household_id = $3`,
+      [now, plantingEventId, householdId],
     );
     row.updated_at = now;
 
