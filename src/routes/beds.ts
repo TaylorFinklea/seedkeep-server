@@ -196,33 +196,35 @@ bedRoutes.patch('/beds/:id', ...auth, async (c) => {
   set('updated_at', Date.now());
   sets.push('version = version + 1');
   params.push(id, householdId);
-  let where = `id = $${params.length - 1} AND household_id = $${params.length} AND deleted_at IS NULL`;
-  if (expected !== null) {
-    params.push(expected);
-    where += ` AND version = $${params.length}`;
-  }
+  const where = `id = $${params.length - 1} AND household_id = $${params.length}`;
 
-  const updated = await dbGet<BedRow>(
-    sql,
-    `UPDATE beds SET ${sets.join(', ')} WHERE ${where} RETURNING ${SELECT_COLS}`,
-    params,
-  );
-  if (!updated) {
-    // Nothing matched. Missing or deleted is 404; a stale version is 409
-    // with the current row so the client can merge and retry.
-    const current = expected === null ? null : await dbGet<BedRow>(
-      sql,
-      `SELECT ${SELECT_COLS} FROM beds WHERE id = $1 AND household_id = $2 LIMIT 1`,
+  // Lock, compare and update in one transaction. The 404-vs-409 decision
+  // is made on the locked row, so no separate read follows the UPDATE.
+  const outcome = await sql.begin(async (tx) => {
+    const current = await dbGet<BedRow>(
+      tx,
+      `SELECT ${SELECT_COLS} FROM beds WHERE id = $1 AND household_id = $2 FOR UPDATE`,
       [id, householdId],
     );
-    if (!current || current.deleted_at !== null) {
-      return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
+    if (!current || current.deleted_at !== null) return { kind: 'not_found' as const };
+    if (expected !== null && Number(current.version) !== expected) {
+      return { kind: 'conflict' as const, current: rowToDTO(current) };
     }
-    return versionConflict(c, rowToDTO(current));
+    const updated = await dbGet<BedRow>(
+      tx,
+      `UPDATE beds SET ${sets.join(', ')} WHERE ${where} RETURNING ${SELECT_COLS}`,
+      params,
+    );
+    return { kind: 'ok' as const, updated: rowToDTO(updated!) };
+  });
+  if (outcome.kind === 'not_found') {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Bed not found' } }, 404);
   }
-  const dto = rowToDTO(updated);
-  setVersionHeader(c, dto.version);
-  return c.json({ ok: true, data: { bed: dto } });
+  if (outcome.kind === 'conflict') {
+    return versionConflict(c, outcome.current);
+  }
+  setVersionHeader(c, outcome.updated.version);
+  return c.json({ ok: true, data: { bed: outcome.updated } });
 });
 
 bedRoutes.delete('/beds/:id', ...auth, async (c) => {
@@ -252,28 +254,52 @@ bedRoutes.delete('/beds/:id', ...auth, async (c) => {
       return { kind: 'conflict' as const, current: rowToDTO(bed) };
     }
 
-    await dbRun(
-      tx,
-      `UPDATE beds SET deleted_at = $1, updated_at = $2, version = version + 1
-        WHERE id = $3 AND household_id = $4`,
-      [now, now, id, householdId],
-    );
+    // Fixed lock order for every cascade: bed → planting events → journal
+    // entries → their children. Each set is locked ORDER BY id so concurrent
+    // cascades acquire rows in the same sequence and cannot deadlock.
 
-    // Journal entries under this bed: attached to one of its planting events
-    // (active or already tombstoned, so the closure is complete) or directly
-    // to the bed.
+    // 1. Planting events of this bed (tombstoned ones included, so their
+    //    journal entries are still in the closure).
+    const eventIds = (await dbAll<{ id: string }>(
+      tx,
+      `SELECT id FROM planting_events
+        WHERE bed_id = $1 AND household_id = $2
+        ORDER BY id FOR UPDATE`,
+      [id, householdId],
+    )).map((row) => row.id);
+    if (eventIds.length > 0) {
+      await dbRun(
+        tx,
+        `UPDATE planting_events SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`,
+        [now, eventIds, householdId],
+      );
+    }
+
+    // 2. Journal entries: attached to one of those events, or directly to the
+    //    bed. Locked in id order, then tombstoned.
     const entryIds = (await dbAll<{ id: string }>(
       tx,
-      `UPDATE journal_entries SET deleted_at = $1, updated_at = $2, version = version + 1
-        WHERE household_id = $3 AND deleted_at IS NULL
-          AND (bed_id = $4
+      `SELECT id FROM journal_entries
+        WHERE household_id = $1 AND deleted_at IS NULL
+          AND (bed_id = $2
                OR planting_event_id IN (
                  SELECT pe.id FROM planting_events pe
-                  WHERE pe.bed_id = $4 AND pe.household_id = $3))
-        RETURNING id`,
-      [now, now, householdId, id],
+                  WHERE pe.bed_id = $2 AND pe.household_id = $1))
+        ORDER BY id FOR UPDATE`,
+      [householdId, id],
     )).map((row) => row.id);
+    if (entryIds.length > 0) {
+      await dbRun(
+        tx,
+        `UPDATE journal_entries SET deleted_at = $1, updated_at = $1, version = version + 1
+          WHERE id = ANY($2) AND household_id = $3 AND deleted_at IS NULL`,
+        [now, entryIds, householdId],
+      );
+    }
 
+    // 3. Children of those entries are hard-deleted. Photo storage keys are
+    //    returned so the objects can be removed after commit.
     let photoKeys: string[] = [];
     if (entryIds.length > 0) {
       await dbRun(
@@ -288,14 +314,15 @@ bedRoutes.delete('/beds/:id', ...auth, async (c) => {
       )).map((row) => row.storage_key);
     }
 
-    await dbRun(
+    // 4. The bed itself, last.
+    const tombstoned = await dbGet<{ version: number }>(
       tx,
-      `UPDATE planting_events SET deleted_at = $1, updated_at = $2, version = version + 1
-        WHERE bed_id = $3 AND household_id = $4 AND deleted_at IS NULL`,
-      [now, now, id, householdId],
+      `UPDATE beds SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE id = $2 AND household_id = $3 RETURNING version`,
+      [now, id, householdId],
     );
 
-    return { kind: 'ok' as const, photoKeys };
+    return { kind: 'ok' as const, photoKeys, version: Number(tombstoned!.version) };
   });
 
   if (outcome.kind === 'not_found') {
@@ -315,5 +342,6 @@ bedRoutes.delete('/beds/:id', ...auth, async (c) => {
       console.warn('bed cascade: photo object delete failed', result.reason);
     }
   }
-  return c.json({ ok: true, data: { id, deleted_at: now } });
+  setVersionHeader(c, outcome.version);
+  return c.json({ ok: true, data: { id, deleted_at: now, version: outcome.version } });
 });

@@ -151,32 +151,35 @@ locationRoutes.patch('/locations/:id', ...auth, async (c) => {
   set('updated_at', Date.now());
   sets.push('version = version + 1');
   params.push(id, householdId);
-  let where = `id = $${params.length - 1} AND household_id = $${params.length} AND deleted_at IS NULL`;
-  if (expected !== null) {
-    params.push(expected);
-    where += ` AND version = $${params.length}`;
-  }
+  const where = `id = $${params.length - 1} AND household_id = $${params.length}`;
 
-  const updated = await dbGet<LocationRow>(
-    sql,
-    `UPDATE locations SET ${sets.join(', ')} WHERE ${where} RETURNING ${LOCATION_COLS}`,
-    params,
-  );
-  if (!updated) {
-    // Nothing matched. Missing or deleted is 404; a stale version is 409
-    // with the current row so the client can merge and retry.
-    const current = expected === null ? null : await dbGet<LocationRow>(
-      sql,
-      `SELECT ${LOCATION_COLS} FROM locations WHERE id = $1 AND household_id = $2 LIMIT 1`,
+  // Lock, compare and update in one transaction. The 404-vs-409 decision
+  // is made on the locked row, so no separate read follows the UPDATE.
+  const outcome = await sql.begin(async (tx) => {
+    const current = await dbGet<LocationRow>(
+      tx,
+      `SELECT ${LOCATION_COLS} FROM locations WHERE id = $1 AND household_id = $2 FOR UPDATE`,
       [id, householdId],
     );
-    if (!current || current.deleted_at !== null) {
-      return c.json({ ok: false, error: { code: 'not_found', message: 'Location not found' } }, 404);
+    if (!current || current.deleted_at !== null) return { kind: 'not_found' as const };
+    if (expected !== null && Number(current.version) !== expected) {
+      return { kind: 'conflict' as const, current };
     }
-    return versionConflict(c, current);
+    const updated = await dbGet<LocationRow>(
+      tx,
+      `UPDATE locations SET ${sets.join(', ')} WHERE ${where} RETURNING ${LOCATION_COLS}`,
+      params,
+    );
+    return { kind: 'ok' as const, updated: updated! };
+  });
+  if (outcome.kind === 'not_found') {
+    return c.json({ ok: false, error: { code: 'not_found', message: 'Location not found' } }, 404);
   }
-  setVersionHeader(c, updated.version);
-  return c.json({ ok: true, data: { location: updated } });
+  if (outcome.kind === 'conflict') {
+    return versionConflict(c, outcome.current);
+  }
+  setVersionHeader(c, outcome.updated.version);
+  return c.json({ ok: true, data: { location: outcome.updated } });
 });
 
 locationRoutes.delete('/locations/:id', ...auth, async (c) => {
@@ -200,21 +203,29 @@ locationRoutes.delete('/locations/:id', ...auth, async (c) => {
     if (expected !== null && Number(row.version) !== expected) {
       return { kind: 'conflict' as const, current: row };
     }
-    await dbRun(
+    // Lock the affected seeds in a deterministic order (id), then update them.
+    const seedIds = (await dbAll<{ id: string }>(
       tx,
-      `UPDATE locations SET deleted_at = $1, updated_at = $2, version = version + 1
-        WHERE id = $3 AND household_id = $4`,
-      [now, now, id, householdId],
-    );
-    // Clear location_id on seeds that still reference this location and bump
-    // each seed so delta-syncing clients pull the cleared field.
-    await dbRun(
+      `SELECT id FROM seeds
+        WHERE household_id = $1 AND location_id = $2 AND deleted_at IS NULL
+        ORDER BY id FOR UPDATE`,
+      [householdId, id],
+    )).map((r) => r.id);
+    if (seedIds.length > 0) {
+      await dbRun(
+        tx,
+        `UPDATE seeds SET location_id = NULL, updated_at = $1, version = version + 1
+          WHERE household_id = $2 AND id = ANY($3)`,
+        [now, householdId, seedIds],
+      );
+    }
+    const tombstoned = await dbGet<{ version: number }>(
       tx,
-      `UPDATE seeds SET location_id = NULL, updated_at = $1, version = version + 1
-        WHERE household_id = $2 AND location_id = $3 AND deleted_at IS NULL`,
-      [now, householdId, id],
+      `UPDATE locations SET deleted_at = $1, updated_at = $1, version = version + 1
+        WHERE id = $2 AND household_id = $3 RETURNING version`,
+      [now, id, householdId],
     );
-    return { kind: 'ok' as const };
+    return { kind: 'ok' as const, version: Number(tombstoned!.version) };
   });
 
   if (outcome.kind === 'not_found') {
@@ -223,5 +234,6 @@ locationRoutes.delete('/locations/:id', ...auth, async (c) => {
   if (outcome.kind === 'conflict') {
     return versionConflict(c, outcome.current);
   }
-  return c.json({ ok: true, data: { id, deleted_at: now } });
+  setVersionHeader(c, outcome.version);
+  return c.json({ ok: true, data: { id, deleted_at: now, version: outcome.version } });
 });
