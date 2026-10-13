@@ -142,14 +142,32 @@ householdRoutes.post('/households', authOnly, async (c) => {
 householdRoutes.get('/households/me', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
-  const household = await dbGet<HouseholdRow>(
+  const row = await dbGet<HouseholdRow & {
+    home_zip: string | null; latitude: string | number | null; longitude: string | number | null;
+    usda_zone: string | null; avg_last_frost: string | null; avg_first_frost: string | null;
+  }>(
     sql,
-    `SELECT id, name, created_at, updated_at FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+    `SELECT id, name, created_at, updated_at,
+            home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost
+       FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
     [householdId],
   );
-  if (!household) {
+  if (!row) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Household missing' } }, 404);
   }
+  const { home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, ...household } = row;
+  // Web clients need the stored home location (ZIP, zone, MM-DD frost
+  // averages, coordinates for daylight). NUMERIC arrives as a string.
+  const location = home_zip
+    ? {
+        zip: home_zip,
+        latitude: latitude == null ? null : Number(latitude),
+        longitude: longitude == null ? null : Number(longitude),
+        usdaZone: usda_zone,
+        avgLastFrost: avg_last_frost,
+        avgFirstFrost: avg_first_frost,
+      }
+    : null;
   const members = await dbAll<{
     user_id: string; role: string; joined_at: number;
     name: string | null; email: string | null;
@@ -162,7 +180,7 @@ householdRoutes.get('/households/me', ...auth, async (c) => {
       ORDER BY m.joined_at ASC`,
     [householdId],
   );
-  return c.json({ ok: true, data: { household, members } });
+  return c.json({ ok: true, data: { household: { ...household, location }, members } });
 });
 
 /**
@@ -477,13 +495,31 @@ householdRoutes.get('/households/:id', authOnly, async (c) => {
       403,
     );
   }
-  const household = await dbGet<HouseholdRow>(
+  const row = await dbGet<HouseholdRow & {
+    home_zip: string | null; latitude: string | number | null; longitude: string | number | null;
+    usda_zone: string | null; avg_last_frost: string | null; avg_first_frost: string | null;
+  }>(
     sql,
-    `SELECT id, name, created_at, updated_at FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+    `SELECT id, name, created_at, updated_at,
+            home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost
+       FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
     [householdId],
   );
-  if (!household) {
+  if (!row) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Household missing' } }, 404);
   }
+  const { home_zip, latitude, longitude, usda_zone, avg_last_frost, avg_first_frost, ...household } = row;
+  // Web clients need the stored home location (ZIP, zone, MM-DD frost
+  // averages, coordinates for daylight). NUMERIC arrives as a string.
+  const location = home_zip
+    ? {
+        zip: home_zip,
+        latitude: latitude == null ? null : Number(latitude),
+        longitude: longitude == null ? null : Number(longitude),
+        usdaZone: usda_zone,
+        avgLastFrost: avg_last_frost,
+        avgFirstFrost: avg_first_frost,
+      }
+    : null;
   return c.json({ ok: true, data: { household, role: membership.role } });
 });
