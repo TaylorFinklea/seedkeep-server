@@ -11,6 +11,10 @@ const schema = z.object({
   // Server
   PORT: z.coerce.number().int().min(1).max(65535).default(8787),
   APP_ENV: z.enum(['development', 'staging', 'production']).default('development'),
+  // Public Better Auth URL; defaults preserve the existing Fly/local URL.
+  AUTH_BASE_URL: z.url().optional(),
+  // Comma-separated exact browser origins; unset means localhost defaults in development only.
+  WEB_ORIGINS: z.string().optional(),
 
   // Database
   DATABASE_URL: z.url(),
@@ -28,10 +32,20 @@ const schema = z.object({
     .default(false)
     .transform((v) => v === true || v === 'true'),
 
+  // Optional generic SMTP transport for browser email-code sign-in.
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  SMTP_SECURE: z.enum(['true', 'false']).optional(),
+  SMTP_REQUIRE_TLS: z.enum(['true', 'false']).optional(),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASSWORD: z.string().optional(),
+  SMTP_FROM: z.string().optional(),
+
   // Auth
   BETTER_AUTH_SECRET: z.string().min(16),
-  APPLE_CLIENT_ID: z.string().min(1),
-  APPLE_CLIENT_SECRET: z.string().min(1),
+  // Optional for email-only self-hosts; both must be set to enable Apple sign-in.
+  APPLE_CLIENT_ID: z.string().optional(),
+  APPLE_CLIENT_SECRET: z.string().optional(),
 
   // AI providers (optional — extraction route gates on this)
   ANTHROPIC_API_KEY: z.string().optional().transform((v) => v?.trim() || undefined),
@@ -64,6 +78,28 @@ const schema = z.object({
     .union([z.boolean(), z.literal('true'), z.literal('false')])
     .default(false)
     .transform((v) => v === true || v === 'true'),
+}).superRefine((value, ctx) => {
+  if (Boolean(value.APPLE_CLIENT_ID) !== Boolean(value.APPLE_CLIENT_SECRET)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['APPLE_CLIENT_SECRET'],
+      message: 'APPLE_CLIENT_ID and APPLE_CLIENT_SECRET must be configured together.',
+    });
+  }
+  if (Boolean(value.SMTP_USER) !== Boolean(value.SMTP_PASSWORD)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['SMTP_PASSWORD'],
+      message: 'SMTP_USER and SMTP_PASSWORD must be configured together.',
+    });
+  }
+  if (value.SMTP_HOST && !value.SMTP_FROM) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['SMTP_FROM'],
+      message: 'SMTP_FROM is required when SMTP_HOST is configured.',
+    });
+  }
 });
 
 export type Env = z.infer<typeof schema>;

@@ -1,14 +1,108 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../index';
-import { getAuth } from '../lib/auth';
+import { getAuth, type Auth } from '../lib/auth';
 import { requireAuth } from '../middleware/auth';
 import { dbGet, isUniqueViolation } from '../db/helpers';
 import { getSql } from '../db/client';
+import { reserveEmailOtpSend } from '../lib/emailOtpRateLimit';
+import { isWebOriginAllowed } from '../lib/webOrigins';
 import { deletePhoto } from '../lib/storage';
 import { TRANSFER_PHASE_SOURCE_DELETED } from './account-deletion-transfers';
 
 export const authRoutes = new Hono<AppEnv>();
+
+const OTP_DELIVERY_ENDPOINTS = new Map<string, string[]>([
+  ['/api/auth/email-otp/send-verification-otp', ['email']],
+  ['/api/auth/email-otp/request-password-reset', ['email']],
+  ['/api/auth/forget-password/email-otp', ['email']],
+  ['/api/auth/email-otp/request-email-change', ['newEmail']],
+]);
+const MAX_OTP_REQUEST_BYTES = 4096;
+
+async function readBoundedJson(request: Request): Promise<{ value?: unknown; oversized: boolean }> {
+  const declaredLength = Number(request.headers.get('content-length') ?? 0);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_OTP_REQUEST_BYTES) {
+    return { oversized: true };
+  }
+  const reader = request.clone().body?.getReader();
+  if (!reader) return { value: undefined, oversized: false };
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_OTP_REQUEST_BYTES) {
+        const originalBody = request.body?.cancel().catch(() => undefined);
+        await reader.cancel();
+        await originalBody;
+        return { oversized: true };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return { value: JSON.parse(new TextDecoder().decode(bytes)), oversized: false };
+  } catch {
+    return { value: undefined, oversized: false };
+  }
+}
+
+/** Dispatch a Better Auth request; the optional instance is a fake-delivery test seam. */
+export async function handleBetterAuthRequest(
+  request: Request,
+  env: AppEnv['Bindings'],
+  auth: Auth = getAuth(env),
+): Promise<Response> {
+  const url = new URL(request.url);
+  const emailFields = OTP_DELIVERY_ENDPOINTS.get(url.pathname);
+  if (request.method.toUpperCase() === 'POST' && emailFields) {
+    if (!isWebOriginAllowed(env, request.headers.get('origin') ?? undefined)) {
+      return Response.json({ message: 'Request origin is not allowed.' }, { status: 403 });
+    }
+    const contentType = request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+    if (contentType !== 'application/json') {
+      return Response.json({ message: 'Content-Type must be application/json.' }, { status: 415 });
+    }
+    let email: string | undefined;
+    const body = await readBoundedJson(request);
+    if (body.oversized) {
+      return Response.json({ message: 'Sign-in request is too large.' }, { status: 413 });
+    }
+    if (body.value && typeof body.value === 'object') {
+      for (const field of emailFields) {
+        const value = Reflect.get(body.value, field);
+        if (typeof value === 'string') {
+          const candidate = value.trim().toLowerCase();
+          if (candidate.length > 0 && candidate.length <= 320) {
+            email = candidate;
+            break;
+          }
+        }
+      }
+    }
+    try {
+      const limit = await reserveEmailOtpSend(getSql(env), env.BETTER_AUTH_SECRET, email);
+      if (limit.limited) {
+        return Response.json({ message: 'Too many sign-in code requests. Please try again later.' }, { status: 429 });
+      }
+    } catch {
+      // If durable throttling is unavailable, do not send an email without it.
+      return Response.json({ message: 'Sign-in code delivery is temporarily unavailable.' }, { status: 503 });
+    }
+  }
+  return auth.handler(request);
+}
 
 /**
  * What the client did about its CloudKit garden before asking us to erase
@@ -60,8 +154,7 @@ const deleteAccountBody = z
  * Bearer token in the response body.
  */
 authRoutes.all('/auth/*', async (c) => {
-  const auth = getAuth(c.env);
-  return auth.handler(c.req.raw);
+  return handleBetterAuthRequest(c.req.raw, c.env);
 });
 
 /**

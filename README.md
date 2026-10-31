@@ -45,7 +45,7 @@ bun run dev
 - **Runtime**: [Bun](https://bun.sh) ≥ 1.1
 - **HTTP**: [Hono](https://hono.dev) — runtime-agnostic router
 - **Database**: PostgreSQL 16+ (`postgres` driver)
-- **Auth**: [better-auth](https://www.better-auth.com) with Sign in with Apple
+- **Auth**: [better-auth](https://www.better-auth.com) with browser email codes and optional Sign in with Apple
 - **Object storage**: any S3-compatible service via `@aws-sdk/client-s3` (R2, AWS S3, MinIO, Backblaze B2, Wasabi, …)
 
 ## Self-hosting
@@ -55,10 +55,13 @@ Seedkeep is designed for self-hosting as a first-class workflow:
 1. Set `DATABASE_URL` to your Postgres instance.
 2. Set `S3_*` to your object storage of choice (MinIO, R2, AWS S3, etc.).
 3. Set `BETTER_AUTH_SECRET` to a random 32+ byte string.
-4. Set `APPLE_CLIENT_ID` and `APPLE_CLIENT_SECRET` to your Apple Sign-In credentials.
-5. Run migrations once: `bun run migrate`.
-6. Run the server: `bun run start` (or build a container with the included `Dockerfile`).
-7. Point your iOS Seedkeep app at your URL via Settings → Server.
+4. Set `AUTH_BASE_URL` to the server's public URL and `WEB_ORIGINS` to the exact HTTPS origin(s) serving the browser app (comma-separated). Development defaults allow only localhost origins.
+5. Configure generic SMTP (`SMTP_HOST`, `SMTP_FROM`, and TLS settings; credentials only when required) to deliver browser sign-in codes. Without SMTP, code delivery fails closed. Apple sign-in remains available when both `APPLE_CLIENT_ID` and `APPLE_CLIENT_SECRET` are configured.
+6. Run migrations once: `bun run migrate`.
+7. Run the server: `bun run start` (or build a container with the included `Dockerfile`).
+8. Point your iOS Seedkeep app at your URL via Settings → Server.
+
+Browser sessions use Better Auth's HttpOnly cookie and require an exact configured origin for unsafe API requests. Native clients continue using their existing Bearer-token flow. No SMTP provider is required by the project; any compatible SMTP service or self-hosted mail relay can be configured.
 
 The repo ships a multi-stage `Dockerfile` and a working `docker-compose.yml` you can drop on any Docker host.
 

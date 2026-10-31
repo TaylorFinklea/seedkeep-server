@@ -24,6 +24,7 @@ import { mcpTokenRoutes, mcpTransportRoutes } from './routes/mcp';
 import { oauthPublicRoutes, oauthApiRoutes } from './routes/oauth';
 import { adminRoutes } from './routes/admin';
 import { accountDeletionTransferRoutes } from './routes/account-deletion-transfers';
+import { getWebOrigins } from './lib/webOrigins';
 
 /**
  * Hono app shape. Bindings carry the validated `Env`; per-request
@@ -47,21 +48,27 @@ export function createApp(env: Env): Hono<AppEnv> {
     await next();
   });
 
-  // Native iOS clients send no Origin header so they bypass the CORS gate.
-  // Allow localhost dev hosts for the eventual web companion; refuse the rest.
+  // Native iOS clients send no Origin header. Browser origins are an exact
+  // configured allowlist (localhost defaults are development-only).
   app.use('*', cors({
     origin: (origin) => {
       if (!origin) return origin;
-      if (origin.startsWith('http://localhost:')) return origin;
-      return null;
+      return getWebOrigins(env).includes(origin) ? origin : null;
     },
     credentials: true,
-    allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Household-Id', 'If-Match'],
     exposeHeaders: ['x-request-id'],
   }));
 
   app.use('*', envelope());
+
+  // API and Better Auth responses may contain private user/session data.
+  // Prevent browser/CDN/shared caches from reusing them across users.
+  app.use('/api/*', async (c, next) => {
+    await next();
+    c.header('Cache-Control', 'no-store');
+  });
 
   // Public + auth-handler routes (no auth middleware required for these).
   app.route('/api', healthRoutes);

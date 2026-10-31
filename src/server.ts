@@ -7,13 +7,19 @@
 import { loadEnv } from './env';
 import { createApp } from './index';
 import { closeDb } from './db/client';
+import { prepareRequestPeer } from './lib/requestPeer';
 
 const env = loadEnv();
 const app = createApp(env);
 
 const server = Bun.serve({
   port: env.PORT,
-  fetch: app.fetch,
+  fetch: (request, bunServer) => {
+    const peerAddress = bunServer.requestIP(request)?.address;
+    const prepared = prepareRequestPeer(request, peerAddress);
+    if (prepared instanceof Response) return prepared;
+    return app.fetch(prepared, env);
+  },
   // 16 MB ceiling: large enough for a direct-bytes photo (iOS resizes to
   // well under 10 MB) but well below the 256 MB Fly VM RAM. Without this
   // Bun buffers up to its 128 MB default before the route handler sees
