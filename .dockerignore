@@ -1,0 +1,12 @@
+**
+!package.json
+!bun.lock
+!tsconfig.json
+!src
+!src/**
+!migrations
+!migrations/**
+!scripts
+!scripts/**
+!data
+!data/**

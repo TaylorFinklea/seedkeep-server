@@ -1,0 +1,43 @@
+# Isolated website API replacement; keep existing fly.toml/app untouched.
+app = 'seedkeep-web-api'
+primary_region = 'iad'
+kill_timeout = 120
+
+# This config intentionally has no release_command. Apply any pending Neon
+# migrations separately as an operator before deployment; never put the
+# database owner credential in this app's runtime secrets. Provision the
+# runtime role and its explicit table DML grants separately after migrations.
+# Do not use scripts/deploy.sh; it targets the legacy fly.toml and migrates.
+
+[build]
+
+[env]
+  APP_ENV = 'production'
+  AUTH_BASE_URL = 'https://api.seedkeep.finklea.dev'
+  WEB_ORIGINS = 'https://seedkeep.finklea.dev'
+
+[processes]
+  app = "bun run src/server.ts"
+  worker = "bun run src/worker.ts"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    grace_period = '10s'
+    interval = '15s'
+    method = 'GET'
+    path = '/api/health'
+    port = 8787
+    timeout = '5s'
+    tls_skip_verify = false
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1

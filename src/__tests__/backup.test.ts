@@ -26,6 +26,7 @@ let uploadDoneImpl: () => Promise<void> = () =>
   new Promise<void>((r) => setImmediate(r));
 
 let capturedUploadBody: unknown = null;
+let capturedSpawnCall: { command: string; args: string[]; env: NodeJS.ProcessEnv | undefined } | null = null;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -68,7 +69,12 @@ function makeFakeChild(exitCode: number, emitError?: Error) {
 
 vi.mock('node:child_process', () => ({
   spawn: (...args: Parameters<typeof import('node:child_process').spawn>) => {
-    void args;
+    const [command, commandArgs, options] = args;
+    capturedSpawnCall = {
+      command: String(command),
+      args: [...commandArgs],
+      env: options?.env as NodeJS.ProcessEnv | undefined,
+    };
     return spawnImpl();
   },
 }));
@@ -112,6 +118,7 @@ const stubEnv = {
 
 beforeEach(() => {
   capturedUploadBody = null;
+  capturedSpawnCall = null;
   // Default: clean pg_dump, Upload resolves immediately.
   spawnImpl = () => makeFakeChild(0);
   uploadDoneImpl = () => new Promise<void>((r) => setImmediate(r));
@@ -139,6 +146,61 @@ describe('runBackup — streaming upload', () => {
         typeof (capturedUploadBody as { pipe?: unknown }).pipe === 'function'
       );
     expect(isReadable).toBe(true);
+  });
+});
+
+describe('runBackup — PostgreSQL credential handling', () => {
+  it('keeps the connection URL out of pg_dump argv and passes libpq settings through env', async () => {
+    const syntheticUrl = 'postgresql://seedkeep:synthetic-only-pass@db.example:5432/seedkeep?sslmode=require&channel_binding=require&hostaddr=192.0.2.10';
+    const { runBackup } = await import('../../scripts/backup');
+
+    await runBackup({ ...stubEnv, DATABASE_URL: syntheticUrl });
+
+    expect(capturedSpawnCall?.command).toBe('pg_dump');
+    expect(capturedSpawnCall?.args).toEqual(['--format=custom', '--no-password']);
+    expect(capturedSpawnCall?.args.join(' ')).not.toContain('synthetic-only-pass');
+    expect(capturedSpawnCall?.args.join(' ')).not.toContain(syntheticUrl);
+    expect(capturedSpawnCall?.env?.DATABASE_URL).toBeUndefined();
+    expect(capturedSpawnCall?.env?.PGHOST).toBe('db.example');
+    expect(capturedSpawnCall?.env?.PGPORT).toBe('5432');
+    expect(capturedSpawnCall?.env?.PGUSER).toBe('seedkeep');
+    expect(capturedSpawnCall?.env?.PGPASSWORD).toBe('synthetic-only-pass');
+    expect(capturedSpawnCall?.env?.PGDATABASE).toBe('seedkeep');
+    expect(capturedSpawnCall?.env?.PGSSLMODE).toBe('require');
+    expect(capturedSpawnCall?.env?.PGCHANNELBINDING).toBe('require');
+    expect(capturedSpawnCall?.env?.PGHOSTADDR).toBe('192.0.2.10');
+    expect(capturedSpawnCall?.env?.PGPASSFILE).toBe('/dev/null');
+  });
+
+  it('does not inherit unrelated secrets or ambient libpq connection settings', async () => {
+    const { pgDumpLaunchOptions } = await import('../../scripts/backup');
+    const options = pgDumpLaunchOptions(
+      'postgres://seedkeep:synthetic-only-pass@db.example/seedkeep',
+      {
+        PATH: '/custom/bin',
+        AWS_SECRET_ACCESS_KEY: 'synthetic-aws-only',
+        SMTP_PASSWORD: 'synthetic-mail-only',
+        PGHOSTADDR: '192.0.2.99',
+        PGSSLMODE: 'disable',
+        PGOPTIONS: '-c search_path=public',
+      },
+    );
+
+    expect(options.env.PATH).toBe('/custom/bin');
+    expect(options.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(options.env.SMTP_PASSWORD).toBeUndefined();
+    expect(options.env.PGHOSTADDR).toBeUndefined();
+    expect(options.env.PGSSLMODE).toBeUndefined();
+    expect(options.env.PGOPTIONS).toBeUndefined();
+  });
+
+  it('fails closed on unsupported connection URL parameters', async () => {
+    const { pgDumpLaunchOptions } = await import('../../scripts/backup');
+
+    expect(() => pgDumpLaunchOptions(
+      'postgres://seedkeep:synthetic-only-pass@db.example/seedkeep?unexpected=1',
+      {},
+    )).toThrow('Unsupported DATABASE_URL connection parameter: unexpected');
   });
 });
 

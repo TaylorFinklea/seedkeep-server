@@ -63,6 +63,95 @@ import { createGzip } from 'node:zlib';
 const RETENTION_DAYS = 30;
 const BACKUP_PREFIX = 'backups/';
 
+const PG_URL_PARAMETERS: Record<string, string> = {
+  sslmode: 'PGSSLMODE',
+  sslrootcert: 'PGSSLROOTCERT',
+  sslcert: 'PGSSLCERT',
+  sslkey: 'PGSSLKEY',
+  connect_timeout: 'PGCONNECT_TIMEOUT',
+  application_name: 'PGAPPNAME',
+  options: 'PGOPTIONS',
+  target_session_attrs: 'PGTARGETSESSIONATTRS',
+  channel_binding: 'PGCHANNELBINDING',
+  hostaddr: 'PGHOSTADDR',
+};
+
+
+/**
+ * Convert a PostgreSQL URL into libpq environment variables. Keeping the
+ * connection URL out of argv avoids exposing its password through process
+ * listings. Only explicitly supported URL parameters are forwarded.
+ */
+export function pgDumpLaunchOptions(
+  databaseUrl: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    throw new Error('DATABASE_URL is not a valid PostgreSQL URL');
+  }
+
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    throw new Error('DATABASE_URL must use the PostgreSQL protocol');
+  }
+
+  let username: string;
+  let password: string;
+  let database: string;
+  try {
+    username = decodeURIComponent(url.username);
+    password = decodeURIComponent(url.password);
+    database = decodeURIComponent(url.pathname.replace(/^\//, ''));
+  } catch {
+    throw new Error('DATABASE_URL contains malformed URL encoding');
+  }
+  const host = url.hostname.replace(/^\[(.*)\]$/, '$1');
+  if (!host || !username || !database) {
+    throw new Error('DATABASE_URL must include a host, user, and database');
+  }
+
+  // Do not inherit S3/SMTP/app secrets or ambient libpq connection settings.
+  // Use only process discovery/locale values plus parameters parsed above.
+  const childEnv: NodeJS.ProcessEnv = {
+    PATH: baseEnv.PATH ?? '/usr/bin:/bin',
+    LANG: 'C',
+    PGPASSFILE: '/dev/null',
+  };
+  childEnv.PGHOST = host;
+  if (url.port) childEnv.PGPORT = url.port;
+  childEnv.PGUSER = username;
+  childEnv.PGPASSWORD = password;
+  childEnv.PGDATABASE = database;
+
+  const seenParameters = new Set<string>();
+  for (const [name, value] of url.searchParams) {
+    const envName = PG_URL_PARAMETERS[name];
+    if (!envName) {
+      throw new Error(`Unsupported DATABASE_URL connection parameter: ${name}`);
+    }
+    if (seenParameters.has(name)) {
+      throw new Error(`Duplicate DATABASE_URL connection parameter: ${name}`);
+    }
+    seenParameters.add(name);
+    childEnv[envName] = value;
+  }
+
+  return { args: ['--format=custom', '--no-password'], env: childEnv };
+}
+
+function redactPgDumpError(stderr: string, databaseUrl: string): string {
+  let safe = stderr.split(databaseUrl).join('[redacted database URL]');
+  try {
+    const password = decodeURIComponent(new URL(databaseUrl).password);
+    if (password) safe = safe.split(password).join('[redacted]');
+  } catch {
+    // The launch validation reports malformed URLs without including them.
+  }
+  return safe;
+}
+
 function getS3Client(env: ReturnType<typeof loadEnv>): S3Client {
   return new S3Client({
     region: env.S3_REGION,
@@ -82,7 +171,9 @@ export async function runBackup(env: ReturnType<typeof loadEnv>): Promise<void> 
   console.log(`[backup] starting pg_dump → ${key}`);
 
   // pg_dump -Fc writes custom format to stdout; pipe through gzip.
-  const dumpProcess = spawn('pg_dump', ['--format=custom', env.DATABASE_URL], {
+  const pgDumpOptions = pgDumpLaunchOptions(env.DATABASE_URL);
+  const dumpProcess = spawn('pg_dump', pgDumpOptions.args, {
+    env: pgDumpOptions.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -121,7 +212,10 @@ export async function runBackup(env: ReturnType<typeof loadEnv>): Promise<void> 
   await Promise.race([
     Promise.all([upload.done(), exitCodePromise]).then(([, exitCode]) => {
       if (exitCode !== 0) {
-        const stderr = Buffer.concat(stderrChunks).toString();
+        const stderr = redactPgDumpError(
+          Buffer.concat(stderrChunks).toString(),
+          env.DATABASE_URL,
+        );
         throw new Error(`pg_dump exited with code ${exitCode}: ${stderr}`);
       }
     }),

@@ -199,10 +199,7 @@ const BACKUP_ATTEMPT_KEY = 'backup_last_attempt_ymd';
 // Written only on success — read by /api/health to compute backup_stale.
 const BACKUP_SUCCESS_KEY = 'backup_last_success_ymd';
 
-async function upsertHeartbeat(sql: Sql): Promise<void> {
-  await sql.unsafe(
-    `CREATE TABLE IF NOT EXISTS _seedkeep_kv (k TEXT PRIMARY KEY, v TEXT)`,
-  );
+export async function upsertHeartbeat(sql: Sql): Promise<void> {
   await sql.unsafe(
     `INSERT INTO _seedkeep_kv (k, v) VALUES ($1, $2)
      ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,

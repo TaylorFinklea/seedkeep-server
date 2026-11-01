@@ -23,16 +23,19 @@ COPY data ./data
 # original lines.
 
 # ─── Runtime stage: slimmer image with only what's needed at run time ──────
-FROM oven/bun:1.3-alpine AS runtime
+FROM alpine:3.24 AS runtime
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
 
 WORKDIR /app
 
-# PostgreSQL 17 client tools (pg_dump) for nightly backups.
-# Keep this major version aligned with the Fly Postgres cluster: pg_dump
-# refuses to dump a newer server with an older client.
-RUN apk add --no-cache postgresql17-client
+# Keep the Bun 1.3 executable while using Alpine 3.24's PostgreSQL 18
+# client. Neon is PostgreSQL 18; pg_dump refuses a newer server with an
+# older client. Bun's Alpine runtime needs libgcc and libstdc++.
+RUN apk add --no-cache ca-certificates libgcc libstdc++ postgresql18-client
+COPY --from=builder /usr/local/bin/bun /usr/local/bin/bun
+RUN bun --version && pg_dump --version | grep -E '^pg_dump \(PostgreSQL\) 18\.'
 
 # Copy deps + source from builder.
 COPY --from=builder /app/node_modules ./node_modules

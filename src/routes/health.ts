@@ -19,7 +19,9 @@ healthRoutes.get('/health', async (c) => {
   // Worker heartbeat lag from _seedkeep_kv. Missing key → worker never
   // started (newly deployed); stale → worker may be wedged. Both cases
   // return HTTP 200 so a temporarily-missing worker doesn't take the web
-  // process down; ops monitors the stale flag separately.
+  // process down; ops monitors the stale flag separately. The table itself is
+  // required by migration 0030, so missing permissions or an unapplied
+  // migration must fail readiness.
   let workerLastTick: number | null = null;
   let workerStale = false;
   let backupLastSuccessYmd: string | null = null;
@@ -43,7 +45,15 @@ healthRoutes.get('/health', async (c) => {
     // No row for backup_last_success_ymd → never succeeded → stale.
     if (backupLastSuccessYmd === null) backupStale = true;
   } catch {
-    // _seedkeep_kv may not exist in fresh deploys — treat as missing, not error.
+    // A missing table or insufficient runtime-role grant makes the API
+    // unready. Keep database diagnostics out of the public health response.
+    return c.json({
+      ok: false,
+      error: {
+        code: 'worker_state_unavailable',
+        message: 'Required worker state is unavailable',
+      },
+    }, 503);
   }
 
   return c.json({

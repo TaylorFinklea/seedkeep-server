@@ -775,15 +775,8 @@ async function firstUnauthorizedAt(sql: Sql, correctionId: string): Promise<numb
 const SWEEP_SENTINEL_KEY = 'corrections_audit_sweep_last_utc_day';
 
 async function maybeSweep(sql: Sql, now: number): Promise<void> {
-  // Cheap once-per-UTC-day gate using a sentinel row in a tiny table.
-  // We piggyback _seedkeep_migrations to avoid a new table; key is
-  // recognizable so it can't collide.
-  await sql.unsafe(
-    `CREATE TABLE IF NOT EXISTS _seedkeep_kv (
-       k TEXT PRIMARY KEY,
-       v TEXT
-     )`,
-  );
+  // Cheap once-per-UTC-day gate using a sentinel row in the table
+  // provisioned by migration 0030.
   const today = new Date(now).toISOString().slice(0, 10);
   const row = await dbGet<{ v: string | null }>(
     sql,
