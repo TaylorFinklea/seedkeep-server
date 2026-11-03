@@ -12,31 +12,30 @@ Beads is issue tracking that lives in your repo, making it perfect for AI coding
 
 ### Essential Commands
 
+This repository's Beads store is local-only. Pass `--sandbox` to every command so Beads does not sync or push to a Dolt remote.
+
 ```bash
-# Create new issues
-bd create "Add user authentication"
+# Find available local work
+bd --sandbox ready
 
-# View all issues
-bd list
+# Create an issue
+bd --sandbox create --title="Add user authentication" --type=task --priority=2
 
-# View issue details
-bd show <issue-id>
+# View issues and details
+bd --sandbox list
+bd --sandbox show <issue-id>
 
-# Update issue status
-bd update <issue-id> --claim
-bd update <issue-id> --status done
-
-# Sync with Dolt remote
-bd dolt push
+# Claim and complete an issue
+bd --sandbox update <issue-id> --claim
+bd --sandbox close <issue-id> --reason="Completed"
 ```
 
 ### Working with Issues
 
 Issues in Beads are:
-- **Git-native**: Stored in Dolt database with version control and branching
-- **AI-friendly**: CLI-first design works perfectly with AI coding agents
-- **Branch-aware**: Issues can follow your branch workflow
-- **Sync-ready**: Uses Dolt remotes for backup and team sharing
+- **Local-only here**: Stored in this repository's embedded Dolt database; no remote is configured
+- **AI-friendly**: CLI-first design works with AI coding agents
+- **Offline-ready**: The local queue works without a network connection
 
 ## Why Beads?
 
@@ -46,34 +45,23 @@ Issues in Beads are:
 - No context switching to web UIs
 
 🚀 **Developer Focused**
-- Issues live in your repo, right next to your code
-- Works offline, syncs when you push
+- The issue database lives under `.beads/` beside the code
+- Works offline and stays local to this checkout
 - Fast, lightweight, and stays out of your way
 
-🔧 **Git Integration**
-- Dolt-native sync via bd dolt push / bd dolt pull
-- Branch-aware issue tracking
-- Dolt-native three-way merge resolution
+🔧 **Local Storage**
+- The embedded Dolt database is ignored by Git
+- No Dolt remote is configured for this repository
+- Use `bd --sandbox` for every issue command
 
 ## Get Started with Beads
 
-Try Beads in your own projects:
-
-```bash
-# Install Beads
-curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-
-# Initialize in your repo
-bd init
-
-# Create your first issue
-bd create "Try out Beads"
-```
+This checkout already has its local store initialized. Run `bd --sandbox quickstart` for CLI usage; keep `--sandbox` on all Beads commands.
 
 ## Learn More
 
 - **Documentation**: [github.com/steveyegge/beads/docs](https://github.com/steveyegge/beads/tree/main/docs)
-- **Quick Start Guide**: Run `bd quickstart`
+- **Quick Start Guide**: Run `bd --sandbox quickstart`
 - **Examples**: [github.com/steveyegge/beads/examples](https://github.com/steveyegge/beads/tree/main/examples)
 
 ---
