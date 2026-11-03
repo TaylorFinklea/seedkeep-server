@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "seedkeep_server",
+  "project_id": "c27e609e-d64a-4300-9e1e-ebaa6417d8ed"
+}
