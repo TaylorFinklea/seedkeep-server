@@ -43,6 +43,34 @@ interface InviteRow {
 const INVITE_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
 const INVITE_CODE_BYTES = 12;                   // ~16 chars urlsafe; collision-safe
 
+/**
+ * GET /api/households — all active households the signed-in user belongs to.
+ *
+ * This collection endpoint intentionally uses auth-only middleware: users
+ * with no household receive an empty list so first-sign-in onboarding can
+ * create one. The order matches `requireHousehold` (newest membership first)
+ * with household id as a stable tie-breaker.
+ */
+householdRoutes.get('/households', authOnly, async (c) => {
+  const userId = c.get('userId');
+  const sql = getSql(c.env);
+  const households = await dbAll<{
+    id: string;
+    name: string;
+    role: 'owner' | 'member';
+    joined_at: number;
+  }>(
+    sql,
+    `SELECT h.id, h.name, m.role, m.joined_at
+       FROM memberships m
+       JOIN households h ON h.id = m.household_id
+      WHERE m.user_id = $1 AND h.deleted_at IS NULL
+      ORDER BY m.joined_at DESC, h.id ASC`,
+    [userId],
+  );
+  return c.json({ ok: true, data: { households } });
+});
+
 const createHouseholdSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
 });
