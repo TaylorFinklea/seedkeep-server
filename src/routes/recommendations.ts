@@ -366,23 +366,23 @@ recommendationRoutes.post('/recommendations/bulk', ...auth, async (c) => {
         cache = await writeCache(sql, id, signature, 'rule',
           ruleBase.confidence, ruleBase, null, ruleBase.inputsUsed, loc.regionId);
       } else {
-        // Low-confidence: enqueue job and return an unknown stub. Do NOT
-        // write the cache — a stale rule-based entry would prevent the worker
-        // from ever being the source of truth.
-        // Include 'running' jobs older than 10 min (stranded) so the
-        // re-enqueue can revive them; fresh 'running' rows are untouched.
-        await dbRun(
-          sql,
-          `INSERT INTO recommendation_jobs (id, catalog_seed_id, location_signature, created_at)
-           VALUES ($1,$2,$3,$4)
-           ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE
-             SET status = 'pending', attempts = 0, last_error = NULL, started_at = NULL
-             WHERE recommendation_jobs.status IN ('done', 'failed')
-                OR (recommendation_jobs.status = 'running'
-                    AND recommendation_jobs.started_at < $5)`,
-          [nanoid(), id, signature, Date.now(), Date.now() - 10 * 60_000],
-        );
-        pending.push(id);
+        // Without a configured provider, keep a truthful unknown result and
+        // do not enqueue work that no worker can complete. With AI configured,
+        // preserve the existing bounded worker flow.
+        if (c.env.ANTHROPIC_API_KEY) {
+          await dbRun(
+            sql,
+            `INSERT INTO recommendation_jobs (id, catalog_seed_id, location_signature, created_at)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (catalog_seed_id, location_signature) DO UPDATE
+               SET status = 'pending', attempts = 0, last_error = NULL, started_at = NULL
+               WHERE recommendation_jobs.status IN ('done', 'failed')
+                  OR (recommendation_jobs.status = 'running'
+                      AND recommendation_jobs.started_at < $5)`,
+            [nanoid(), id, signature, Date.now(), Date.now() - 10 * 60_000],
+          );
+          pending.push(id);
+        }
         recommendations.push({
           catalogSeedId: id,
           locationSignature: signature,

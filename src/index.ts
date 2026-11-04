@@ -11,6 +11,7 @@ import { seedRoutes } from './routes/seeds';
 import { randomRoutes } from './routes/random';
 import { photoRoutes } from './routes/photos';
 import { catalogRoutes } from './routes/catalog';
+import { freshCatalogRoutes } from './routes/catalog-fresh';
 import { extractionRoutes } from './routes/extractions';
 import { subscriptionRoutes } from './routes/subscriptions';
 import { bedRoutes } from './routes/beds';
@@ -57,7 +58,10 @@ export function createApp(env: Env): Hono<AppEnv> {
     },
     credentials: true,
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'X-Household-Id', 'If-Match'],
+    allowHeaders: [
+      'Content-Type', 'Authorization', 'X-Household-Id', 'If-Match',
+      'Idempotency-Key', 'X-Photo-Width', 'X-Photo-Height',
+    ],
     exposeHeaders: ['x-request-id'],
   }));
 
@@ -84,6 +88,8 @@ export function createApp(env: Env): Hono<AppEnv> {
   app.route('/api', locationRoutes);
   app.route('/api', tagRoutes);
   app.route('/api', photoRoutes);
+  // Static catalog paths must precede the existing /catalog/:id detail route.
+  app.route('/api', freshCatalogRoutes);
   app.route('/api', catalogRoutes);
   app.route('/api', extractionRoutes);
   app.route('/api', subscriptionRoutes);

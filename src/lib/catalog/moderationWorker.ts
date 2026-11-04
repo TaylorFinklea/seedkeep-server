@@ -120,7 +120,9 @@ export async function reapOrphanedClaims(sql: Sql, now: number = Date.now()): Pr
 export async function sweepAuditLog(sql: Sql, now: number = Date.now()): Promise<number> {
   const cutoff = now - AUDIT_LOG_RETENTION_MS;
   const result = await sql.unsafe(
-    `DELETE FROM catalog_audit_log WHERE created_at < $1 AND source != 'manual_revert'`,
+    `DELETE FROM catalog_audit_log
+      WHERE created_at < $1 AND source != 'manual_revert'
+        AND field_name != '__manual_publication__'`,
     [cutoff],
   );
   return Number((result as { count?: number }).count ?? 0);

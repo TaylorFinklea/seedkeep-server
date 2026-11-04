@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { TransactionSql } from 'postgres';
 import { nanoid } from 'nanoid';
 import type { AppEnv } from '../index';
 import { getSql } from '../db/client';
@@ -200,26 +201,72 @@ journalRoutes.post('/', ...auth, async (c) => {
     return c.json({ ok: false, error: { code: 'bad_request', message: v.reason } }, 400);
   }
   const occurredOn = typeof body.occurred_on === 'string' ? body.occurred_on : null;
-  if (!occurredOn || !/^\d{4}-\d{2}-\d{2}$/.test(occurredOn)) {
+  if (!occurredOn || !isRealDate(occurredOn)) {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'occurred_on must be YYYY-MM-DD' } }, 400);
   }
 
-  const id = nanoid();
+  if (body.id !== undefined && (typeof body.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(body.id))) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'id must be 1-128 URL-safe characters' } }, 400);
+  }
+  if (body.body !== undefined && (typeof body.body !== 'string' || body.body.length > 20_000)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'body must be text of at most 20000 characters' } }, 400);
+  }
+  for (const key of ['seed_id', 'bed_id', 'planting_event_id'] as const) {
+    if (body[key] !== undefined && body[key] !== null && (typeof body[key] !== 'string' || body[key].length < 1 || body[key].length > 128)) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: `${key} must be a bounded id or null` } }, 400);
+    }
+  }
+
+  const seedId = body.seed_id ?? null;
+  const bedId = body.bed_id ?? null;
+  const plantingEventId = body.planting_event_id ?? null;
+
+  const id = body.id ?? nanoid();
+  const bodyText = body.body ?? '';
   const now = Date.now();
   try {
-    await dbRun(
-      sql,
-      `INSERT INTO journal_entries
-         (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
-          created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
-      [
-        id, householdId, occurredOn, body.body ?? '',
-        body.seed_id ?? null, body.bed_id ?? null, body.planting_event_id ?? null,
-        now,
-      ],
-    );
+    await sql.begin(async (tx) => {
+      const prior = await tx.unsafe<EntryRow[]>(
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
+                planting_event_id, created_at, updated_at, deleted_at
+           FROM journal_entries WHERE id = $1 FOR UPDATE`, [id]);
+      if (prior[0]) {
+        if (prior[0].household_id === householdId && prior[0].occurred_on === occurredOn && prior[0].body === bodyText &&
+            prior[0].seed_id === seedId && prior[0].bed_id === bedId && prior[0].planting_event_id === plantingEventId && prior[0].deleted_at === null) return;
+        throw Object.assign(new Error('id_conflict'), { code: 'id_conflict' });
+      }
+      if (!await journalReferencesAreLive(tx, householdId, seedId, bedId, plantingEventId)) {
+        throw Object.assign(new Error('invalid_reference'), { code: 'invalid_reference' });
+      }
+      await tx.unsafe(
+        `INSERT INTO journal_entries
+           (id, household_id, occurred_on, body, seed_id, bed_id, planting_event_id,
+            created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+        [id, householdId, occurredOn, bodyText, seedId, bedId, plantingEventId, now],
+      );
+    });
   } catch (err) {
+    if ((err as { code?: string }).code === 'id_conflict') {
+      return c.json({ ok: false, error: { code: 'id_conflict', message: 'id is already used by a different journal entry' } }, 409);
+    }
+    if (typeof err === 'object' && err !== null && (err as { code?: string }).code === '23505') {
+      const replay = await dbGet<EntryRow>(
+        sql,
+        `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
+                planting_event_id, created_at, updated_at, deleted_at
+           FROM journal_entries WHERE id = $1`,
+        [id],
+      );
+      if (replay && replay.household_id === householdId && replay.occurred_on === occurredOn && replay.body === bodyText &&
+          replay.seed_id === seedId && replay.bed_id === bedId && replay.planting_event_id === plantingEventId && replay.deleted_at === null) {
+        return c.json({ ok: true, data: { entry: rowToDto(replay) } });
+      }
+      return c.json({ ok: false, error: { code: 'id_conflict', message: 'id is already used by a different journal entry' } }, 409);
+    }
+    if ((err as { code?: string }).code === 'invalid_reference') {
+      return c.json({ ok: false, error: { code: 'invalid_reference', message: 'Attached record must be live in the selected garden' } }, 400);
+    }
     if (isFkViolation(err)) {
       return c.json({
         ok: false,
@@ -243,6 +290,35 @@ journalRoutes.post('/', ...auth, async (c) => {
   return c.json({ ok: true, data: { entry: rowToDto(row!) } });
 });
 
+function isRealDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  if (value.startsWith('0000-')) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+async function journalReferencesAreLive(
+  tx: TransactionSql, householdId: string,
+  seedId: unknown, bedId: unknown, plantingEventId: unknown,
+): Promise<boolean> {
+  if (seedId != null) {
+    const rows = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [String(seedId), householdId]);
+    if (!rows[0]) return false;
+  }
+  if (bedId != null) {
+    const rows = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM beds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [String(bedId), householdId]);
+    if (!rows[0]) return false;
+  }
+  if (plantingEventId != null) {
+    const rows = await tx.unsafe<{ id: string }[]>(
+      `SELECT id FROM planting_events WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL FOR SHARE`, [String(plantingEventId), householdId]);
+    if (!rows[0]) return false;
+  }
+  return true;
+}
+
 // PATCH /api/journal/:id — update body / occurred_on / parent ref
 journalRoutes.patch('/:id', ...auth, async (c) => {
   const sql = getSql(c.env);
@@ -252,80 +328,68 @@ journalRoutes.patch('/:id', ...auth, async (c) => {
   if (!body || typeof body !== 'object') {
     return c.json({ ok: false, error: { code: 'bad_request', message: 'JSON body required' } }, 400);
   }
-  if ('occurred_on' in body && body.occurred_on != null) {
-    if (typeof body.occurred_on !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.occurred_on)) {
-      return c.json(
-        { ok: false, error: { code: 'bad_request', message: 'occurred_on must be YYYY-MM-DD' } },
-        400,
-      );
-    }
-  }
-
-  // Validate at-most-one-attach against the MERGED row state, not just the
-  // request payload — switching an attachment without nulling the other one
-  // would otherwise pass the payload check but hit the DB CHECK as a 500.
-  const existing = await dbGet<Pick<EntryRow, 'seed_id' | 'bed_id' | 'planting_event_id'>>(
-    sql,
-    `SELECT seed_id, bed_id, planting_event_id
-       FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
-    [id, householdId],
-  );
-  if (!existing) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
-  }
-  const mergedSeedId = 'seed_id' in body ? (body.seed_id ?? null) : existing.seed_id;
-  const mergedBedId = 'bed_id' in body ? (body.bed_id ?? null) : existing.bed_id;
-  const mergedEventId = 'planting_event_id' in body ? (body.planting_event_id ?? null) : existing.planting_event_id;
-  const v = validateAtMostOneAttach({
-    seed_id: mergedSeedId, bed_id: mergedBedId, planting_event_id: mergedEventId,
-  });
-  if (!v.ok) {
-    return c.json({ ok: false, error: { code: 'bad_request', message: v.reason } }, 400);
-  }
-
-  const sets: string[] = ['updated_at = $1'];
-  const params: unknown[] = [Date.now()];
-  let p = 2;
-
-  if ('body' in body) { sets.push(`body = $${p++}`); params.push(body.body ?? ''); }
-  if ('occurred_on' in body) { sets.push(`occurred_on = $${p++}`); params.push(body.occurred_on); }
-  if ('seed_id' in body) { sets.push(`seed_id = $${p++}`); params.push(body.seed_id ?? null); }
-  if ('bed_id' in body) { sets.push(`bed_id = $${p++}`); params.push(body.bed_id ?? null); }
-  if ('planting_event_id' in body) { sets.push(`planting_event_id = $${p++}`); params.push(body.planting_event_id ?? null); }
-
-  params.push(id, householdId);
-  try {
-    await dbRun(
-      sql,
-      `UPDATE journal_entries SET ${sets.join(', ')}
-         WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL`,
-      params,
+  if ('occurred_on' in body && (typeof body.occurred_on !== 'string' || !isRealDate(body.occurred_on))) {
+    return c.json(
+      { ok: false, error: { code: 'bad_request', message: 'occurred_on must be YYYY-MM-DD' } },
+      400,
     );
-  } catch (err) {
-    if (isFkViolation(err)) {
-      return c.json({
-        ok: false,
-        error: {
-          code: 'invalid_reference',
-          message:
-            'A referenced seed, bed, or planting event does not exist on the server. Sync the parent records first, then retry this update.',
-        },
-      }, 400);
+  }
+  if ('body' in body && (typeof body.body !== 'string' || body.body.length > 20_000)) {
+    return c.json({ ok: false, error: { code: 'bad_request', message: 'body must be text of at most 20000 characters' } }, 400);
+  }
+  for (const key of ['seed_id', 'bed_id', 'planting_event_id'] as const) {
+    if (key in body && body[key] != null && (typeof body[key] !== 'string' || body[key].length < 1 || body[key].length > 128)) {
+      return c.json({ ok: false, error: { code: 'bad_request', message: `${key} must be a bounded id or null` } }, 400);
     }
+  }
+
+  let updated: EntryRow;
+  try {
+    updated = await sql.begin(async (tx) => {
+      // Keep the parent row locked through the journal write so a concurrent
+      // soft-delete cannot race the live-reference check.
+      const matches = await tx.unsafe<Pick<EntryRow, 'seed_id' | 'bed_id' | 'planting_event_id'>[]>(
+        `SELECT seed_id, bed_id, planting_event_id
+           FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL
+           FOR UPDATE`, [id, householdId]);
+      const existing = matches[0];
+      if (!existing) throw Object.assign(new Error('not_found'), { code: 'not_found' });
+      const mergedSeedId = 'seed_id' in body ? (body.seed_id ?? null) : existing.seed_id;
+      const mergedBedId = 'bed_id' in body ? (body.bed_id ?? null) : existing.bed_id;
+      const mergedEventId = 'planting_event_id' in body ? (body.planting_event_id ?? null) : existing.planting_event_id;
+      const attach = validateAtMostOneAttach({
+        seed_id: mergedSeedId, bed_id: mergedBedId, planting_event_id: mergedEventId,
+      });
+      if (!attach.ok) throw Object.assign(new Error(attach.reason), { code: 'bad_attach' });
+      if (!await journalReferencesAreLive(tx, householdId, mergedSeedId, mergedBedId, mergedEventId)) {
+        throw Object.assign(new Error('invalid_reference'), { code: 'invalid_reference' });
+      }
+
+      const sets: string[] = ['updated_at = $1'];
+      const params: unknown[] = [Date.now()];
+      let p = 2;
+      if ('body' in body) { sets.push(`body = $${p++}`); params.push(body.body); }
+      if ('occurred_on' in body) { sets.push(`occurred_on = $${p++}`); params.push(body.occurred_on); }
+      if ('seed_id' in body) { sets.push(`seed_id = $${p++}`); params.push(body.seed_id ?? null); }
+      if ('bed_id' in body) { sets.push(`bed_id = $${p++}`); params.push(body.bed_id ?? null); }
+      if ('planting_event_id' in body) { sets.push(`planting_event_id = $${p++}`); params.push(body.planting_event_id ?? null); }
+      params.push(id, householdId);
+      const result = await tx.unsafe<EntryRow[]>(
+        `UPDATE journal_entries SET ${sets.join(', ')}
+           WHERE id = $${p++} AND household_id = $${p} AND deleted_at IS NULL
+         RETURNING id, household_id, occurred_on::text, body, seed_id, bed_id,
+                   planting_event_id, created_at, updated_at, deleted_at`, params as never);
+      if (!result[0]) throw Object.assign(new Error('not_found'), { code: 'not_found' });
+      return result[0];
+    });
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === 'not_found') return c.json({ ok: false, error: { code, message: 'entry not found' } }, 404);
+    if (code === 'bad_attach') return c.json({ ok: false, error: { code: 'bad_request', message: (err as Error).message } }, 400);
+    if (code === 'invalid_reference' || code === '23503') return c.json({ ok: false, error: { code: 'invalid_reference', message: 'Attached record must be live in the selected garden' } }, 400);
     throw err;
   }
-
-  const row = await dbGet<EntryRow>(
-    sql,
-    `SELECT id, household_id, occurred_on::text, body, seed_id, bed_id,
-            planting_event_id, created_at, updated_at, deleted_at
-       FROM journal_entries WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL`,
-    [id, householdId],
-  );
-  if (!row) {
-    return c.json({ ok: false, error: { code: 'not_found', message: 'entry not found' } }, 404);
-  }
-  return c.json({ ok: true, data: { entry: rowToDto(row) } });
+  return c.json({ ok: true, data: { entry: rowToDto(updated) } });
 });
 
 // DELETE /api/journal/:id — soft-delete
