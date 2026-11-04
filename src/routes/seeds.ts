@@ -29,6 +29,7 @@ interface SeedRow {
   custom_name: string | null;
   custom_variety: string | null;
   custom_company: string | null;
+  custom_type: string | null;
   notes: string | null;
   created_at: number;
   updated_at: number;
@@ -70,6 +71,7 @@ const createSchema = z.object({
   custom_name: z.string().trim().max(120).nullish(),
   custom_variety: z.string().trim().max(120).nullish(),
   custom_company: z.string().trim().max(120).nullish(),
+  custom_type: z.string().trim().max(120).nullish(),
   notes: z.string().trim().max(2000).nullish(),
   tag_ids: z.array(z.string()).max(50).optional(),
 });
@@ -189,7 +191,7 @@ seedRoutes.get('/seeds', ...auth, async (c) => {
     sql,
     `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
             s.location_id, s.year_packed, s.source, s.custom_name,
-            s.custom_variety, s.custom_company, s.notes,
+            s.custom_variety, s.custom_company, s.custom_type, s.notes,
             s.created_at, s.updated_at, s.deleted_at,
             ${TAG_IDS_AGG}
        FROM seeds s
@@ -217,7 +219,7 @@ seedRoutes.get('/seeds/:id', ...auth, async (c) => {
     sql,
     `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
             s.location_id, s.year_packed, s.source, s.custom_name,
-            s.custom_variety, s.custom_company, s.notes,
+            s.custom_variety, s.custom_company, s.custom_type, s.notes,
             s.created_at, s.updated_at, s.deleted_at,
             ${TAG_IDS_AGG}
        FROM seeds s
@@ -269,14 +271,14 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
         sql: `INSERT INTO seeds (
            id, household_id, catalog_id, state, packet_count,
            location_id, year_packed, source, custom_name,
-           custom_variety, custom_company, notes,
+           custom_variety, custom_company, custom_type, notes,
            created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         params: [
           id, householdId, data.catalog_id ?? null, data.state, data.packet_count,
           data.location_id ?? null, data.year_packed ?? null, data.source,
           data.custom_name ?? null, data.custom_variety ?? null,
-          data.custom_company ?? null, data.notes ?? null,
+          data.custom_company ?? null, data.custom_type ?? null, data.notes ?? null,
           now, now,
         ],
       },
@@ -293,7 +295,7 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
         sql,
         `SELECT s.id, s.household_id, s.catalog_id, s.state, s.packet_count,
                 s.location_id, s.year_packed, s.source, s.custom_name,
-                s.custom_variety, s.custom_company, s.notes,
+                s.custom_variety, s.custom_company, s.custom_type, s.notes,
                 s.created_at, s.updated_at, s.deleted_at,
                 ${TAG_IDS_AGG}
            FROM seeds s
@@ -337,6 +339,7 @@ seedRoutes.post('/seeds', ...auth, async (c) => {
         custom_name: data.custom_name ?? null,
         custom_variety: data.custom_variety ?? null,
         custom_company: data.custom_company ?? null,
+        custom_type: data.custom_type ?? null,
         notes: data.notes ?? null,
         created_at: now,
         updated_at: now,
@@ -365,7 +368,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     sql,
     `SELECT id, household_id, catalog_id, state, packet_count, location_id,
             year_packed, source, custom_name, custom_variety, custom_company,
-            notes, created_at, updated_at, deleted_at
+            custom_type, notes, created_at, updated_at, deleted_at
        FROM seeds WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL LIMIT 1`,
     [id, householdId],
   );
@@ -385,6 +388,7 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
     custom_name: data.custom_name !== undefined ? data.custom_name ?? null : existing.custom_name,
     custom_variety: data.custom_variety !== undefined ? data.custom_variety ?? null : existing.custom_variety,
     custom_company: data.custom_company !== undefined ? data.custom_company ?? null : existing.custom_company,
+    custom_type: data.custom_type !== undefined ? data.custom_type ?? null : existing.custom_type,
     notes: data.notes !== undefined ? data.notes ?? null : existing.notes,
     updated_at: Date.now(),
   };
@@ -395,12 +399,12 @@ seedRoutes.patch('/seeds/:id', ...auth, async (c) => {
       `UPDATE seeds SET
          catalog_id = $1, state = $2, packet_count = $3, location_id = $4,
          year_packed = $5, source = $6, custom_name = $7, custom_variety = $8,
-         custom_company = $9, notes = $10, updated_at = $11
-       WHERE id = $12 AND household_id = $13`,
+         custom_company = $9, custom_type = $10, notes = $11, updated_at = $12
+       WHERE id = $13 AND household_id = $14`,
       [
         merged.catalog_id, merged.state, merged.packet_count, merged.location_id,
         merged.year_packed, merged.source, merged.custom_name, merged.custom_variety,
-        merged.custom_company, merged.notes, merged.updated_at,
+        merged.custom_company, merged.custom_type, merged.notes, merged.updated_at,
         id, householdId,
       ],
     );

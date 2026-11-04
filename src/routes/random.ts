@@ -22,6 +22,7 @@ interface SeedDetailRow {
   custom_name: string | null;
   custom_variety: string | null;
   custom_company: string | null;
+  custom_type: string | null;
   notes: string | null;
   created_at: number;
   updated_at: number;
@@ -67,7 +68,7 @@ randomRoutes.get('/seeds/random', ...auth, async (c) => {
     sql,
     `SELECT id, household_id, catalog_id, state, packet_count, location_id,
             year_packed, source, custom_name, custom_variety, custom_company,
-            notes, created_at, updated_at
+            custom_type, notes, created_at, updated_at
        FROM seeds WHERE id = $1 AND household_id = $2 LIMIT 1`,
     [chosen.id, householdId],
   );
