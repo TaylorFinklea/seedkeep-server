@@ -140,3 +140,29 @@ When a user converts to hosted tier, their submissions automatically route throu
 **Alternatives considered**: `SELECT … FOR UPDATE` around preview+apply (rejected — preview happens during streaming, holding a row lock for ~minutes); accept the race (rejected — destructive ops deserve the re-check); compare hashes of the full row (rejected — works but obscures which field changed; key-by-key is easier to debug).
 
 **Rationale**: The shallow compare is conservative (treats null/undefined as equal so JSON round-tripping doesn't trip the check) and only fires when the row genuinely changed. The error code is distinct so the iOS client can surface a "Refresh and ask Sprout again" UX rather than the generic execution_error string.
+
+## [2026-11-04] Authenticated household list and explicit household selection
+
+**Context**: The web client bootstraps its garden picker from an authenticated
+membership collection. Users may belong to more than one garden, while
+`requireHousehold` historically chose the newest membership implicitly. Once
+the UI lists all memberships, an explicit selection must govern both reads and
+writes without exposing another user's garden.
+
+**Decision**: `GET /api/households` returns the authenticated user's active
+memberships only, ordered by `joined_at DESC, household_id ASC`. When
+`X-Household-Id` is present, `requireHousehold` validates that the id belongs
+to the authenticated user and that its household is not deleted before setting
+request context. Missing, foreign, deleted, and empty explicit ids all receive
+the same 403 response. When the header is absent, the existing newest-membership
+selection remains for native-client compatibility.
+
+**Alternatives considered**: Continue returning only the implicit current
+garden (does not support the web picker); trust the caller-supplied id without
+membership validation (would allow cross-garden access); require every existing
+native caller to send a new header (unnecessary compatibility change).
+
+**Rationale**: Authentication and membership jointly scope the collection and
+selected request context. Uniform rejection prevents id enumeration and keeps
+the selected garden consistent across reads and writes, while preserving the
+existing default for clients that do not select a garden explicitly.
