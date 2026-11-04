@@ -16,6 +16,8 @@ const auth = [requireAuth(), requireHousehold()] as const;
 
 const STATES = ['active', 'wishlist', 'saved', 'archived'] as const;
 const SOURCES = ['store', 'saved', 'gift', 'swap'] as const;
+const packetCountSchema = z.number().int().min(0).max(10_000);
+const sourceSchema = z.enum(SOURCES);
 
 interface SeedRow {
   id: string;
@@ -64,10 +66,10 @@ const createSchema = z.object({
   id: z.string().min(1).max(80).optional(),
   catalog_id: z.string().nullish(),
   state: z.enum(STATES),
-  packet_count: z.number().int().min(0).max(10_000).default(1),
+  packet_count: packetCountSchema.default(1),
   location_id: z.string().nullish(),
   year_packed: z.number().int().min(1900).max(2200).nullish(),
-  source: z.enum(SOURCES).default('store'),
+  source: sourceSchema.default('store'),
   custom_name: z.string().trim().max(120).nullish(),
   custom_variety: z.string().trim().max(120).nullish(),
   custom_company: z.string().trim().max(120).nullish(),
@@ -76,7 +78,11 @@ const createSchema = z.object({
   tag_ids: z.array(z.string()).max(50).optional(),
 });
 
-const updateSchema = createSchema.partial();
+const updateSchema = createSchema.partial().extend({
+  // Reuse the create bounds without carrying create-time defaults into PATCH.
+  packet_count: packetCountSchema.optional(),
+  source: sourceSchema.optional(),
+});
 
 const listFiltersSchema = z.object({
   state: z.enum(STATES).optional(),

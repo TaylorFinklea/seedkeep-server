@@ -84,9 +84,11 @@ describe('seed custom type persistence', () => {
 
   it('persists custom_type through create, idempotent replay, list, detail, update, and clear', async () => {
     const seedId = `custom-type-seed-${crypto.randomUUID()}`;
-    const created = await postSeed(seedId, { custom_type: '  Tomato  ' });
+    const created = await postSeed(seedId, { custom_type: '  Tomato  ', packet_count: 7, source: 'gift' });
     expect(created.status).toBe(200);
-    expect(((await created.json()) as any).data.seed.custom_type).toBe('Tomato');
+    expect(((await created.json()) as any).data.seed).toMatchObject({
+      custom_type: 'Tomato', packet_count: 7, source: 'gift',
+    });
 
     const replay = await postSeed(seedId, { custom_type: 'Pea' });
     expect(replay.status).toBe(200);
@@ -99,7 +101,9 @@ describe('seed custom type persistence', () => {
 
     const detail = await app.request(`/api/seeds/${seedId}`, { headers: authHeaders }, env);
     expect(detail.status).toBe(200);
-    expect(((await detail.json()) as any).data.seed.custom_type).toBe('Tomato');
+    expect(((await detail.json()) as any).data.seed).toMatchObject({
+      custom_type: 'Tomato', packet_count: 7, source: 'gift',
+    });
 
     const random = await app.request('/api/seeds/random', { headers: authHeaders }, env);
     expect(random.status).toBe(200);
@@ -108,10 +112,20 @@ describe('seed custom type persistence', () => {
     const omitted = await app.request(`/api/seeds/${seedId}`, {
       method: 'PATCH',
       headers: { ...authHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notes: 'Leave type unchanged' }),
+      body: JSON.stringify({ state: 'saved', notes: 'Leave packet count and source unchanged' }),
     }, env);
     expect(omitted.status).toBe(200);
-    expect(((await omitted.json()) as any).data.seed.custom_type).toBe('Tomato');
+    expect(((await omitted.json()) as any).data.seed).toMatchObject({
+      custom_type: 'Tomato', packet_count: 7, source: 'gift', state: 'saved',
+    });
+
+    const explicit = await app.request(`/api/seeds/${seedId}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ packet_count: 3, source: 'swap' }),
+    }, env);
+    expect(explicit.status).toBe(200);
+    expect(((await explicit.json()) as any).data.seed).toMatchObject({ packet_count: 3, source: 'swap' });
 
     const updated = await app.request(`/api/seeds/${seedId}`, {
       method: 'PATCH',
@@ -134,7 +148,9 @@ describe('seed custom type persistence', () => {
     const seedId = `custom-type-seed-${crypto.randomUUID()}`;
     const created = await postSeed(seedId, {});
     expect(created.status).toBe(200);
-    expect(((await created.json()) as any).data.seed.custom_type).toBeNull();
+    expect(((await created.json()) as any).data.seed).toMatchObject({
+      custom_type: null, packet_count: 1, source: 'store',
+    });
 
     const invalid = await postSeed(`custom-type-seed-${crypto.randomUUID()}`, {
       custom_type: 'T'.repeat(121),
