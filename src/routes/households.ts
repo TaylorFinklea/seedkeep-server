@@ -22,6 +22,35 @@ interface HouseholdRow {
   updated_at: number;
 }
 
+interface HouseholdLocationRow extends HouseholdRow {
+  home_zip: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  usda_zone: string | null;
+  avg_last_frost: string | null;
+  avg_first_frost: string | null;
+  region_id: string | null;
+}
+
+function householdWithLocation(row: HouseholdLocationRow) {
+  const {
+    home_zip, latitude, longitude, usda_zone,
+    avg_last_frost, avg_first_frost, region_id, ...household
+  } = row;
+  return {
+    ...household,
+    location: home_zip ? {
+      zip: home_zip,
+      latitude,
+      longitude,
+      usdaZone: usda_zone,
+      avgLastFrost: avg_last_frost,
+      avgFirstFrost: avg_first_frost,
+      regionId: region_id,
+    } : null,
+  };
+}
+
 interface MembershipRow {
   household_id: string;
   user_id: string;
@@ -157,9 +186,11 @@ householdRoutes.post('/households', authOnly, async (c) => {
 householdRoutes.get('/households/me', ...auth, async (c) => {
   const householdId = c.get('householdId');
   const sql = getSql(c.env);
-  const household = await dbGet<HouseholdRow>(
+  const household = await dbGet<HouseholdLocationRow>(
     sql,
-    `SELECT id, name, created_at, updated_at FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+    `SELECT id, name, created_at, updated_at, home_zip, latitude, longitude,
+            usda_zone, avg_last_frost, avg_first_frost, region_id
+       FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
     [householdId],
   );
   if (!household) {
@@ -177,7 +208,7 @@ householdRoutes.get('/households/me', ...auth, async (c) => {
       ORDER BY m.joined_at ASC`,
     [householdId],
   );
-  return c.json({ ok: true, data: { household, members } });
+  return c.json({ ok: true, data: { household: householdWithLocation(household), members } });
 });
 
 /**
@@ -492,13 +523,15 @@ householdRoutes.get('/households/:id', authOnly, async (c) => {
       403,
     );
   }
-  const household = await dbGet<HouseholdRow>(
+  const household = await dbGet<HouseholdLocationRow>(
     sql,
-    `SELECT id, name, created_at, updated_at FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+    `SELECT id, name, created_at, updated_at, home_zip, latitude, longitude,
+            usda_zone, avg_last_frost, avg_first_frost, region_id
+       FROM households WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
     [householdId],
   );
   if (!household) {
     return c.json({ ok: false, error: { code: 'not_found', message: 'Household missing' } }, 404);
   }
-  return c.json({ ok: true, data: { household, role: membership.role } });
+  return c.json({ ok: true, data: { household: householdWithLocation(household), role: membership.role } });
 });
