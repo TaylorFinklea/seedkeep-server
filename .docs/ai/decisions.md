@@ -166,3 +166,22 @@ native caller to send a new header (unnecessary compatibility change).
 selected request context. Uniform rejection prevents id enumeration and keeps
 the selected garden consistent across reads and writes, while preserving the
 existing default for clients that do not select a garden explicitly.
+
+## [2026-11-04] Manual web inventory and partial updates
+
+**Context**: Production browser QA found that the website's manual seed type
+was dropped by the server and that Zod 4 retained creation defaults inside a
+partial schema, resetting packet count/source during unrelated PATCH edits.
+Garden reads also omitted the location persisted by the settings write route.
+
+**Decision**: Store nullable `seeds.custom_type` through additive migration
+0031 and return it consistently across seed response paths. Share validators
+between POST and PATCH while applying packet/source defaults only to POST;
+omitted PATCH fields preserve stored values. Household read DTOs include the
+same saved location fields as writes, using null when no location is set and
+retaining membership authorization for exact/selected reads.
+
+**Rationale**: Manual inventory must survive reload, and an edit to one cell
+must not overwrite another cell. Existing clients may omit the new type field;
+no catalog data or existing seed values need conversion. Focused real
+PostgreSQL tests and Sol/DeepSeek reviews cover the resulting contracts.

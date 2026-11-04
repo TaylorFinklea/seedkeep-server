@@ -4,6 +4,33 @@
 
 `main`
 
+## Website production QA — 2026-11-04
+
+Current API source is `8283d84` (manual seed type `8430c77`, household location
+readback `235a793`, PATCH-default preservation `8283d84`), deployed as Fly
+release 5 to the same two trial machines. Image digest:
+`sha256:b49a1f91fb3b7f4763d3fc2e51340d4071c8a857ea90baca5741c45171fcb294`.
+Migration `0031_seed_custom_type.sql` and its canonical ledger row were applied
+and read back on the selected Neon production branch. Existing reference-data
+scripts populated 33,751 ZIP rows, 53 regions, 30 aliases and 38 calendar
+entries. ZIP 66109 resolves Zone 6b; no user inventory was replaced.
+
+Each of the three server slices passed focused PostgreSQL 18 tests (2/2),
+`bun run typecheck`, `bun run build`, read-only Sol and direct text-only
+DeepSeek V4.1 Flash reviews. The final PATCH check covers preserved packet
+count/source, explicit updates and unchanged POST defaults. These are focused
+checks, not a new full-suite result. Disposable test containers were removed.
+
+Authenticated production browser checks passed manual seed edits, tags,
+locations, private photos including reload, search, CSV export, beds, planting
+edits and Today task completion. Packet count 7 survived an unrelated status
+edit and full reload. Owner-approved synthetic fixtures were removed through
+normal UI/API routes; the exact Finklea garden and ZIP 66109 remained intact.
+Final scoped counts were zero for QA seeds/beds/locations/tags and household
+photos/active plantings. API health, worker heartbeat and backup freshness pass.
+See umbrella `phases/2026-11-04-website-e2e.md` for scope and limitations. The
+trial monitor remains active; no additional resources or source pushes occurred.
+
 ## Plan
 
 - [ ] Website email-code auth bridge (2026-10-30): local implementation adds Better Auth email OTP + generic SMTP, exact browser-origin allowlist, HttpOnly cookie sessions for web, existing Bearer sessions for native, durable per-email/global OTP-send limits, bounded request parsing, and socket-peer-backed Better Auth IP limits. Server typecheck/build and focused tests pass (28/28). Synthetic Neon `production` E2E used a fake sender, rejected a wrong OTP, verified a valid cookie session and `/api/me`, exercised cookie refresh propagation and OTP throttling, then verified exact synthetic account/session/OTP/per-email-limit cleanup; the shared global throttle bucket expires naturally. It also confirmed `verification` timestamps are TIMESTAMPTZ and limiter parameters use Date values. That E2E preceded the final Origin-before-quota and `Cache-Control: no-store` middleware fixes; focused tests cover those final changes. Web client/session tests pass (15/15); isolated Svelte check/build pass. Full server unit suite: 319 passed, 13 skipped, 5 failed in DB-dependent suites because localhost:5432 refused connections. Neon `production` migrations 0001–0029 were previously applied/read back; the extensionless `0030` ledger entry and migration were corrected in a Sol-reviewed guarded transaction on 2026-11-04. The reviewed `seedkeep_web_runtime` role was provisioned on that branch; login and ACL checks passed. Its generated password is stored in Keychain service `com.seedkeep.neon.production`, account `seedkeep_web_runtime`. Reviewed helper staged the Fly runtime secrets through stdin. The live email-code path now authenticates and reaches the garden onboarding page. The household list and explicit selection repair passed focused PostgreSQL 18 integration tests (5/5), server typecheck and build, Sol review, and direct DeepSeek review. The conservative socket-peer rate limiter remains in place; forwarded-IP trust remains unchanged. Review note: Better Auth's conservative 3/min peer limit may be shared when a reverse proxy presents one socket peer for many clients; forwarded IP headers are deliberately not trusted.
@@ -23,8 +50,8 @@ cookie/origin configuration for `api.seedkeep.finklea.dev` and
 household-list repair added `GET /api/households` scoped to active memberships
 and made `X-Household-Id` select only a live membership, with a non-enumerating
 403 for empty, foreign, or deleted ids. Requests without the header retain the
-newest-membership default. Release `rel_76njzdk5rx7k2ko3` is running image
-`sha256:42b0b65fc3f10f913945232d808b3f72788fae03a6611213e8e3b1d9eb9f099f`.
+newest-membership default. The initial repair ran as release 2; current
+release 5 and its source/digest are recorded above.
 API machine `185770e2cd02e8` and worker `8654d92a0261e8` run in `iad`, each
 shared 1 CPU / 256 MB. The app has no volumes and only shared IPv4
 `66.241.125.112`; both selected custom domains have working HTTPS. Worker
