@@ -6,7 +6,7 @@
 
 ## Plan
 
-- [ ] Website email-code auth bridge (2026-10-30): local implementation adds Better Auth email OTP + generic SMTP, exact browser-origin allowlist, HttpOnly cookie sessions for web, existing Bearer sessions for native, durable per-email/global OTP-send limits, bounded request parsing, and socket-peer-backed Better Auth IP limits. Server typecheck/build and focused tests pass (28/28). Synthetic Neon `production` E2E used a fake sender, rejected a wrong OTP, verified a valid cookie session and `/api/me`, exercised cookie refresh propagation and OTP throttling, then verified exact synthetic account/session/OTP/per-email-limit cleanup; the shared global throttle bucket expires naturally. It also confirmed `verification` timestamps are TIMESTAMPTZ and limiter parameters use Date values. That E2E preceded the final Origin-before-quota and `Cache-Control: no-store` middleware fixes; focused tests cover those final changes. Web client/session tests pass (15/15); isolated Svelte check/build pass. Full server unit suite: 319 passed, 13 skipped, 5 failed in DB-dependent suites because localhost:5432 refused connections. Production SMTP configuration/delivery and deployment remain unconfigured and unverified. Existing Neon migrations 0001–0029 were already applied/read back; local migration 0030 for worker state is pending and has not been applied. Independent reviews found no additional material blockers. Review note: Better Auth's conservative 3/min peer limit may be shared when a reverse proxy presents one socket peer for many clients; forwarded IP headers are deliberately not trusted.
+- [ ] Website email-code auth bridge (2026-10-30): local implementation adds Better Auth email OTP + generic SMTP, exact browser-origin allowlist, HttpOnly cookie sessions for web, existing Bearer sessions for native, durable per-email/global OTP-send limits, bounded request parsing, and socket-peer-backed Better Auth IP limits. Server typecheck/build and focused tests pass (28/28). Synthetic Neon `production` E2E used a fake sender, rejected a wrong OTP, verified a valid cookie session and `/api/me`, exercised cookie refresh propagation and OTP throttling, then verified exact synthetic account/session/OTP/per-email-limit cleanup; the shared global throttle bucket expires naturally. It also confirmed `verification` timestamps are TIMESTAMPTZ and limiter parameters use Date values. That E2E preceded the final Origin-before-quota and `Cache-Control: no-store` middleware fixes; focused tests cover those final changes. Web client/session tests pass (15/15); isolated Svelte check/build pass. Full server unit suite: 319 passed, 13 skipped, 5 failed in DB-dependent suites because localhost:5432 refused connections. Neon `production` migrations 0001–0029 were previously applied/read back; the extensionless `0030` ledger entry and migration were corrected in a Sol-reviewed guarded transaction on 2026-11-04. The reviewed `seedkeep_web_runtime` role was provisioned on that branch; login and ACL checks passed. Its generated password is stored in Keychain service `com.seedkeep.neon.production`, account `seedkeep_web_runtime`. Reviewed helper staged the Fly runtime secrets through stdin. Production API release and worker are running; domains have HTTPS and the worker/backup health checks passed. A production sign-in code request was accepted; owner entry of the code is pending, so authenticated production acceptance is not yet established. The conservative socket-peer rate limiter remains in place; Sol approved leaving forwarded-IP trust unchanged without a proxy experiment. Independent reviews found no additional material blockers. Review note: Better Auth's conservative 3/min peer limit may be shared when a reverse proxy presents one socket peer for many clients; forwarded IP headers are deliberately not trusted.
 - [x] `seedkeep-27d.12` Task 1 server state machine: migrations 0025/0026 + authenticated transfer routes + typed final-delete disposition (`9fa6ac5`, review fixes `712bacf`). Sol adversarial re-review CLEAN. Full gate: 322 unit + 199 integration, typecheck clean. **DO NOT DEPLOY** until iOS Tasks 3–5 send `cloudkit_disposition`.
 - [x] `seedkeep-27d.12` Task 4 hardening extended the server contract (`addcd5f`, enumeration fix `6e80dac`): atomic `source_deleting` lease, cancellation fence, non-consuming handoff inspection, token rotation, hashed deletion receipts and unauthenticated committed-delete lookup. Sol review CLEAN. Fresh gate: typecheck + 322 unit + 221 integration. **DO NOT DEPLOY** until Task 5 iOS UI ships the full contract.
 - [x] Task 5 exact-household contract (`7ea703a`): authenticated `GET /api/households/:id`, membership non-enumeration, deterministic generic-household ordering. Matching iOS handoff UI is complete. Fresh gate: typecheck + 322 unit + 228 integration.
@@ -15,14 +15,33 @@
 - [x] Task 6 server deployed to Fly on 2026-07-26 with migrations 0024–0029, healthy worker, transfer/delete routes registered, and `GARDEN_TOOLS_ENABLED` absent (fail-closed). Fresh Production backup created; restored into disposable PostgreSQL 17; all six migrations applied; deletion suites 108/108. Docker runtime now carries PostgreSQL 17 client so scheduled backups match Production.
 - [x] Re-sign-in regression fixed and deployed (`6742676`): custom account deletion now returns Better Auth's cookie-expiration headers after deleting the DB session. Full deploy gate 322 unit + 238 integration, typecheck clean; Production health green. Build-52 solo-owner Gate 2 then proved immediate Apple sign-in succeeds without reinstalling and deleted data does not return.
 
-## Production-prep (2026-10-31, local only)
+## Website trial deployment (2026-11-04)
 
-`fly.web.toml` targets a separate `seedkeep-web-api` app, sets production
+`fly.web.toml` targets the separate `seedkeep-web-api` app, sets production
 cookie/origin configuration for `api.seedkeep.finklea.dev` and
-`seedkeep.finklea.dev`, and has no release migration command. Migration 0030
-moves `_seedkeep_kv` creation out of runtime worker paths; it is still pending
-on Neon. `scripts/provision-runtime-role.sql` is a separate operator step for
-a non-owner runtime role after migrations; it is not executed. Health readiness
+`seedkeep.finklea.dev`, and has no release migration command. Release
+`rel_q534y1mrd64gy7v9` is running image `sha256:f702710b8ea2ad8a5acdbc50a1c6b25e39c85b8533d22128f83eda149bfe97ac`.
+API machine `185770e2cd02e8` and worker `8654d92a0261e8` run in `iad`, each
+shared 1 CPU / 256 MB. The app has no volumes and only shared IPv4
+`66.241.125.112`; both selected custom domains have working HTTPS. Worker
+health and a successful backup were verified on 2026-11-04. The production
+sign-in code request was accepted through the real UI; the owner still needs
+to enter the code to complete authenticated acceptance.
+
+Migration 0030
+moves `_seedkeep_kv` creation out of runtime worker paths; it and its ledger
+entry were applied and read back on the selected Neon `production` branch on
+2026-11-03. The hosted ledger originally recorded the migration as
+`0030_worker_state_kv`; a Sol-reviewed guarded transaction corrected its key
+to the canonical filename `0030_worker_state_kv.sql` on 2026-11-04.
+The reviewed `scripts/provision-runtime-role.sql` grant set was
+applied to create `seedkeep_web_runtime`; login succeeded through Neon CLI.
+The role is non-superuser, cannot create databases/roles or bypass RLS, has no
+public-schema CREATE privilege, and has SELECT-only access to the migration
+ledger. ACL spot checks confirmed DML on `_seedkeep_kv`. Its generated password
+is held in Keychain service `com.seedkeep.neon.production`, account
+`seedkeep_web_runtime`; the reviewed helper staged the runtime secrets to Fly
+via stdin. Health readiness
 now returns 503 if that table is absent or unreadable. The backup child receives
 libpq connection fields via environment, not the URL in argv, and its URL is
 removed from the child environment.
@@ -37,14 +56,18 @@ operator role grants succeeded; `seedkeep_web_runtime` produced a full dump
 that restored into an empty database with matching 44-table and 30-ledger-row
 counts. This did not contact Neon or validate a Neon/S3 backup. The temporary
 container, anonymous volume, image tag, env files, and build context were
-removed. DNS and
-certificate setup, production database role/migration, proxy-peer validation,
-Fly app availability, deployment, and production runtime checks remain pending.
+removed. Production SMTP accepted the email-code request. DNS and TLS are
+working for both custom domains. Runtime API/worker deployment, health and
+backup checks passed. Full authenticated sign-in acceptance remains pending
+owner entry of the code. The conservative socket-peer limiter remains; no
+forwarded-IP headers are trusted. Migration 0030 and the runtime role are no
+longer pending on Neon.
 Do not use `scripts/deploy.sh`; it targets legacy `fly.toml` and applies
 migrations.
 
 Read-only Neon preflight confirmed `neondb_owner` is not a superuser and has
-`CREATEROLE`; no production role or schema change was made. The attempt to read
+`CREATEROLE`; the later approved migration and restricted runtime-role
+provisioning are recorded above. The attempt to read
 the Neon connection string solely to extract query-parameter names was blocked
 by local approval review because that CLI response contains the owner
 credential. It was not retried, so the selected URL's parameter names and
