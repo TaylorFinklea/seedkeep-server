@@ -4,9 +4,29 @@
 
 `main`
 
-## Website production QA — 2026-11-04
+## Journal and fresh catalog — deployed 2026-11-04
 
-Current API source is `8283d84` (manual seed type `8430c77`, household location
+Server `4d5fb8f` is deployed as Fly release 6 to the existing two trial
+machines. Image digest:
+`sha256:a1faaed6f824ed2a680fa8c3122bfeca3403085ef501bf382ee87a3edf1a3676`.
+Authenticated bounded catalog search, confirmed owner publication, origin-owner
+correction review, durable audit/quota/replay, and journal parent validation /
+retry-safe creation are implemented without a migration. No-key recommendation
+requests no longer enqueue impossible paid jobs. Publication audit rows survive
+the routine sweep. No legacy catalog import or paid AI keys were enabled.
+
+Five focused real PostgreSQL 18 integration tests passed, including concurrent
+quota/replay and stale/foreign/deleted-parent cases. The 139 relevant catalog /
+recommendation unit tests, typecheck and build passed. Independent read-only
+Sol and direct text-only DeepSeek V4.1 Flash reviews completed. Full browser
+flows used real local Hono/PostgreSQL with synthetic S3; production verification
+is read-only. The disposable QA stack was removed. Contract/results: umbrella
+`phases/2026-11-04-journal-fresh-catalog.md`; tracking `seedkeep-server-im1` /
+`seedkeep-0nz.2`. The trial monitor stays active.
+
+## Earlier inventory production QA — 2026-11-04
+
+Inventory QA ran on `8283d84` (manual seed type `8430c77`, household location
 readback `235a793`, PATCH-default preservation `8283d84`), deployed as Fly
 release 5 to the same two trial machines. Image digest:
 `sha256:b49a1f91fb3b7f4763d3fc2e51340d4071c8a857ea90baca5741c45171fcb294`.
@@ -51,7 +71,7 @@ household-list repair added `GET /api/households` scoped to active memberships
 and made `X-Household-Id` select only a live membership, with a non-enumerating
 403 for empty, foreign, or deleted ids. Requests without the header retain the
 newest-membership default. The initial repair ran as release 2; current
-release 5 and its source/digest are recorded above.
+release 6 and its source/digest are recorded above.
 API machine `185770e2cd02e8` and worker `8654d92a0261e8` run in `iad`, each
 shared 1 CPU / 256 MB. The app has no volumes and only shared IPv4
 `66.241.125.112`; both selected custom domains have working HTTPS. Worker

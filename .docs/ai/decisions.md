@@ -185,3 +185,19 @@ retaining membership authorization for exact/selected reads.
 must not overwrite another cell. Existing clients may omit the new type field;
 no catalog data or existing seed values need conversion. Focused real
 PostgreSQL tests and Sol/DeepSeek reviews cover the resulting contracts.
+
+## [2026-11-04] Manual catalog provenance and journal write integrity
+
+**Decision**: Keep the existing shared catalog schema and introduce a separate
+explicit human-publication route. The selected live garden owner publishes;
+only current owners of that origin garden review its corrections. Preserve
+`__manual_publication__` audit rows as durable creator/payload, replay and
+quota evidence. Serialize per-user quota checks and correction decisions in
+PostgreSQL transactions; reject stale current-value evidence rather than
+replace newer data. No global admin permission or paid AI fallback is added.
+
+Journal creation accepts optional client IDs for ambiguous retry while retaining
+legacy callers and response status. Validate real dates and lock live same-garden
+attachments through the write transaction. With no provider key, recommendations
+return existing rule evidence or unknown without creating paid jobs. These
+choices reuse the existing 31 migrations; no schema conversion is needed.
