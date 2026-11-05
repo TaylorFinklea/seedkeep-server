@@ -12,8 +12,9 @@ experiment; API `185770e2cd02e8` and worker `8654d92a0261e8` in
 comparison shows only that autostart change. The trial monitor was deleted.
 Sol preflight/outcome and completed direct DeepSeek reviews cover this bounded
 stop. No source deploy, data purge, migration or legacy-resource change occurred.
-The owner waived website-data retention; exact permanent-removal confirmation
-is pending (`seedkeep-xz4`). See umbrella `phases/2026-11-05-return-to-native.md`.
+The owner confirmed exact website-only permanent deletion. Execution awaits
+a scoped DNS-policy exception and explicit Git/workflow authority (`seedkeep-xz4`);
+no permanent removal has begun. See umbrella `phases/2026-11-05-return-to-native.md`.
 The deployment/health results below are historical; do not probe/restart the
 trial app. Stopped Machines can retain storage costs until removed.
 
