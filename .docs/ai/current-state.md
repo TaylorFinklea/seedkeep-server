@@ -4,19 +4,21 @@
 
 `main`
 
-## Website trial stopped — November 5
+## Website trial retired — November 5
 
-Native iOS/iPadOS/macOS is the product direction. The owner ended the website
-experiment; API `185770e2cd02e8` and worker `8654d92a0261e8` in
-`seedkeep-web-api` are stopped, with API autostart disabled. Before/after config
-comparison shows only that autostart change. The trial monitor was deleted.
-Sol preflight/outcome and completed direct DeepSeek reviews cover this bounded
-stop. No source deploy, data purge, migration or legacy-resource change occurred.
-The owner confirmed exact website-only permanent deletion. The scoped DNS exception is merged and validated. Exact saved plan
-`42063513897` awaits its required owner apply approval (`seedkeep-xz4`); no
-permanent removal has begun. See umbrella `phases/2026-11-05-return-to-native.md`.
-The deployment/health results below are historical; do not probe/restart the
-trial app. Stopped Machines can retain storage costs until removed.
+The owner restored native iOS/iPadOS/macOS-only direction and approved exact
+website-only removal. Fly `seedkeep-web-api`, Neon project `falling-sea-61884978`
+(database/photos/backups), Pages `seedkeep-web` and the three app DNS records
+are deleted; provider readbacks confirm absence. The trial monitor is removed.
+Legacy Fly apps, stopped machine configs, IPs and the attached 1-GB database
+volume are preserved. Native iCloud data, Git, mail and Resend were excluded.
+
+DNS apply `42070938051` succeeded once through the reviewed workflow; its apply
+flag is false. Post-plan `42071257237` has 41 no-ops. Independent Sol outcome
+review passed; DNS source passed 69 safety tests, CI and Sol/DeepSeek reviews.
+Application source was not deployed or pushed. Earlier results below are
+historical. Receipts: umbrella `phases/2026-11-05-return-to-native.md`
+(`seedkeep-xz4`). Native guard/release work remains open.
 
 ## Journal and fresh catalog — deployed 2026-11-04
 
