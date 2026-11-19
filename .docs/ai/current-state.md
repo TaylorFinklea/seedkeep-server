@@ -4,6 +4,19 @@
 
 `main`
 
+## Legacy accounts retired — November 19
+
+Runbook steps 0–4 ran (umbrella `phases/2026-10-22-server-retirement-runbook.md`;
+decision 2026-11-19). `seedkeep-server` public IPs are released and its
+hostname no longer resolves. The `seedkeep-db` `postgres` database was
+exported (checksum-verified, restore-verified in PostgreSQL 17, all 44 table
+counts equal) to the owner's protected folder, kept until 2027-11-19. The one
+Apple account had no tokens, so nothing was revocable. Users, households,
+accounts, sessions, memberships and expired verification rows were deleted in
+one transaction rehearsed on the restored copy first. All machines are
+stopped. Fly teardown, S3 objects and Apple key/capability/IAP retirement
+remain post-1.0.
+
 ## Website trial retired — November 5
 
 The owner restored native iOS/iPadOS/macOS-only direction and approved exact
